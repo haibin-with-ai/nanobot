@@ -359,24 +359,27 @@ class AgentRunner:
 
     @staticmethod
     def _last_message_preview(messages: list[dict[str, Any]]) -> tuple[str, str]:
-        """Return (role, preview) for the last message in the chain."""
+        """Return (role, one-line preview) for the last message in the chain."""
         if not messages:
             return ("?", "")
         msg = messages[-1]
         role = msg.get("role", "?")
         content = msg.get("content", "")
+
+        def _oneline(s: str) -> str:
+            return " ".join(s.split())[:256]
+
         if role == "tool":
             name = msg.get("name", "?")
             text = content if isinstance(content, str) else str(content)
-            return (role, f"{name}: {text[:1024]}")
+            return (role, f"{name}: {_oneline(text)}")
         if isinstance(content, str):
-            return (role, content[:1024])
+            return (role, _oneline(content))
         if isinstance(content, list):
-            # 多 block 消息，取第一个 text block
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    return (role, block.get("text", "")[:1024])
-        return (role, str(content)[:1024])
+                    return (role, _oneline(block.get("text", "")))
+        return (role, _oneline(str(content)))
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:
