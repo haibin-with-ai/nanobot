@@ -59,6 +59,7 @@ class SubagentManager:
         pruner: ContextPruner | None = None,
         context_window_tokens: int | None = None,
         default_timeout_seconds: float = 900.0,
+        config: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -74,18 +75,52 @@ class SubagentManager:
         self.reasoning_effort = reasoning_effort
         self.max_tokens = max_tokens
         self.max_iterations = max_iterations
-        # 与主 loop 对齐：共享同一套 context pruning + window 设置，
-        # 让 subagent 每轮 prompt 不随 tool_result 线性膨胀。
         self._pruner = pruner
         self._context_window_tokens = context_window_tokens
-        # wall-clock 硬超时：防止单次 LLM 流式响应卡死拖垮整个调度器。
-        # <= 0 表示不限制，内部转为 None 交给 asyncio.wait_for。
         self._default_timeout_seconds: float | None = (
             default_timeout_seconds if default_timeout_seconds and default_timeout_seconds > 0 else None
         )
+        self._config = config
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+
+    def _resolve_model(self, alias: str) -> tuple[LLMProvider, str]:
+        """解析模型别名，返回 (provider, full_model_name)。
+
+        匹配逻辑：exact → contains。有歧义时报 ValueError。
+        """
+        from nanobot.nanobot import _make_single_provider
+
+        if self._config is None:
+            raise ValueError("No config available — cannot resolve model alias")
+
+        # 候选列表：default model + fallback models
+        defaults = self._config.agents.defaults
+        candidates = [defaults.model] + list(defaults.fallback_models or [])
+
+        # exact match
+        if alias in candidates:
+            p = _make_single_provider(self._config, alias)
+            p.generation = self.provider.generation
+            return p, alias
+
+        # contains match
+        matches = [c for c in candidates if alias in c]
+        if len(matches) == 1:
+            full_name = matches[0]
+            p = _make_single_provider(self._config, full_name)
+            p.generation = self.provider.generation
+            return p, full_name
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous model alias '{alias}', matches: {matches}"
+            )
+
+        # 没匹配到候选——当作完整 model name 直接尝试创建
+        p = _make_single_provider(self._config, alias)
+        p.generation = self.provider.generation
+        return p, alias
 
     def _compose_hook(self, task_id: str) -> AgentHook:
         """Build the hook chain for a subagent run.
@@ -107,13 +142,15 @@ class SubagentManager:
         session_key: str | None = None,
         log_dir: Path | None = None,
         timeout_seconds: float | None = None,
+        model: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background.
 
         ``timeout_seconds`` overrides the manager's default wall-clock timeout
-        for this single spawn. Pass ``None`` (default) to use
-        ``self._default_timeout_seconds``; pass ``0`` or a negative value to
-        disable the timeout for this spawn (not recommended).
+        for this single spawn.
+
+        ``model`` overrides the default subagent model for this spawn.
+        Supports partial names (e.g. 'gpt-5.5' → 'openai-codex/gpt-5.5').
         """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
@@ -124,11 +161,31 @@ class SubagentManager:
         else:
             effective_timeout = timeout_seconds if timeout_seconds > 0 else None
 
+        # 解析 model override
+        runner_override: AgentRunner | None = None
+        model_override: str | None = None
+        if model:
+            try:
+                provider, resolved = self._resolve_model(model)
+                runner_override = AgentRunner(provider)
+                model_override = resolved
+                logger.info(
+                    "Subagent [{}] using model override: {} (resolved from '{}')",
+                    task_id, resolved, model,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Subagent [{}] model override '{}' failed: {}, using default",
+                    task_id, model, e,
+                )
+
         bg_task = asyncio.create_task(
             self._run_subagent(
                 task_id, task, display_label, origin, log_dir,
                 session_key=session_key,
                 timeout_seconds=effective_timeout,
+                runner_override=runner_override,
+                model_override=model_override,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -156,18 +213,22 @@ class SubagentManager:
         log_dir: Path | None = None,
         session_key: str | None = None,
         timeout_seconds: float | None = None,
+        runner_override: AgentRunner | None = None,
+        model_override: str | None = None,
     ) -> None:
         """Execute the subagent task with an optional wall-clock timeout."""
         if timeout_seconds is None or timeout_seconds <= 0:
             await self._run_subagent_inner(
-                task_id, task, label, origin, log_dir, session_key
+                task_id, task, label, origin, log_dir, session_key,
+                runner_override=runner_override, model_override=model_override,
             )
             return
 
         try:
             await asyncio.wait_for(
                 self._run_subagent_inner(
-                    task_id, task, label, origin, log_dir, session_key
+                    task_id, task, label, origin, log_dir, session_key,
+                    runner_override=runner_override, model_override=model_override,
                 ),
                 timeout=timeout_seconds,
             )
@@ -193,6 +254,8 @@ class SubagentManager:
         origin: dict[str, str],
         log_dir: Path | None = None,
         session_key: str | None = None,
+        runner_override: AgentRunner | None = None,
+        model_override: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -244,10 +307,11 @@ class SubagentManager:
             base_hook = self._compose_hook(task_id)
             composed_hook = CompositeHook([base_hook, subagent_trace])
 
-            result = await self.runner.run(AgentRunSpec(
+            runner = runner_override or self.runner
+            result = await runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
-                model=self.model,
+                model=model_override or self.model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=composed_hook,

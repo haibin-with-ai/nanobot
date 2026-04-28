@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import NumberSchema, StringSchema, tool_parameters_schema
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
@@ -13,6 +13,17 @@ if TYPE_CHECKING:
     tool_parameters_schema(
         task=StringSchema("The task for the subagent to complete"),
         label=StringSchema("Optional short label for the task (for display)"),
+        timeout_seconds=NumberSchema(
+            description="Optional wall-clock timeout in seconds for this subagent. "
+            "Omit to use the default (900s). Pass 0 or a negative value to disable timeout entirely.",
+            minimum=0,
+        ),
+        model=StringSchema(
+            "Optional LLM model to use for this subagent "
+            "(e.g., 'anthropic/claude-3-haiku'). "
+            "Supports partial names like 'gpt-5.5'. "
+            "Uses the default subagent model if not specified."
+        ),
         required=["task"],
     )
 )
@@ -47,7 +58,14 @@ class SpawnTool(Tool):
             "and use a dedicated subdirectory when helpful."
         )
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        task: str,
+        label: str | None = None,
+        timeout_seconds: float | None = None,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
@@ -56,4 +74,6 @@ class SpawnTool(Tool):
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
             log_dir=self._log_dir,
+            timeout_seconds=timeout_seconds,
+            model=model,
         )

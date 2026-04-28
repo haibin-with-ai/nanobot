@@ -304,6 +304,7 @@ class AgentLoop:
             pruner=self._pruner,
             context_window_tokens=self.context_window_tokens,
             default_timeout_seconds=subagent_timeout_seconds,
+            config=self._config,
         )
 
         self._running = False
