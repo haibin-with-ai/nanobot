@@ -368,15 +368,15 @@ class AgentRunner:
         if role == "tool":
             name = msg.get("name", "?")
             text = content if isinstance(content, str) else str(content)
-            return (role, f"{name}: {text[:120]}")
+            return (role, f"{name}: {text[:1024]}")
         if isinstance(content, str):
-            return (role, content[:120])
+            return (role, content[:1024])
         if isinstance(content, list):
             # 多 block 消息，取第一个 text block
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    return (role, block.get("text", "")[:120])
-        return (role, str(content)[:120])
+                    return (role, block.get("text", "")[:1024])
+        return (role, str(content)[:1024])
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:
@@ -464,7 +464,7 @@ class AgentRunner:
             event = {
                 "name": tool_call.name,
                 "status": "error",
-                "detail": prep_error.split(": ", 1)[-1][:120],
+                "detail": prep_error.split(": ", 1)[-1][:1024],
             }
             return prep_error + _HINT, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
         try:
@@ -488,7 +488,7 @@ class AgentRunner:
             event = {
                 "name": tool_call.name,
                 "status": "error",
-                "detail": result.replace("\n", " ").strip()[:120],
+                "detail": result.replace("\n", " ").strip()[:1024],
             }
             if spec.fail_on_tool_error:
                 return result + _HINT, event, RuntimeError(result)
@@ -498,8 +498,8 @@ class AgentRunner:
         detail = detail.replace("\n", " ").strip()
         if not detail:
             detail = "(empty)"
-        elif len(detail) > 120:
-            detail = detail[:120] + "..."
+        elif len(detail) > 1024:
+            detail = detail[:1024] + "..."
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
 
     async def _emit_checkpoint(
