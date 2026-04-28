@@ -230,6 +230,12 @@ def _make_single_provider(config: Any, model: str) -> Any:
             default_model=model,
             extra_headers=p.extra_headers,
         )
+    elif backend == "openai_codex":
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        return OpenAICodexProvider(default_model=model)
+    elif backend == "github_copilot":
+        from nanobot.providers.github_copilot_provider import GithubCopilotProvider
+        return GithubCopilotProvider(default_model=model)
     else:
         from nanobot.providers.openai_compat_provider import OpenAICompatProvider
         return OpenAICompatProvider(
