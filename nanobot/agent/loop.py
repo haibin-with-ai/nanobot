@@ -175,6 +175,7 @@ class AgentLoop:
         context_window_tokens: int = 65_536,
         context_block_limit: int | None = None,
         max_tool_result_chars: int | None = None,
+        consolidation_trigger_ratio: float = 1.0,
         provider_retry_mode: str = "standard",
         web_config: WebToolsConfig | None = None,
         web_proxy: str | None = None,
@@ -210,6 +211,7 @@ class AgentLoop:
         self._config_provider = self.provider    # config 中的默认 provider（含 fallback），不可变
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
+        self.consolidation_trigger_ratio = consolidation_trigger_ratio
         self.context_block_limit = context_block_limit
         self.max_tool_result_chars = max_tool_result_chars or self._TOOL_RESULT_MAX_CHARS
         self.provider_retry_mode = provider_retry_mode
@@ -331,6 +333,7 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+            trigger_ratio=self.consolidation_trigger_ratio,
         )
         self.dream = Dream(
             store=self._memory_store,

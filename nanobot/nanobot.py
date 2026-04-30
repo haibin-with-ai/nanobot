@@ -79,6 +79,7 @@ class Nanobot:
             model=defaults.model,
             max_iterations=defaults.max_tool_iterations,
             context_window_tokens=ctx_tokens,
+            consolidation_trigger_ratio=defaults.consolidation_trigger_ratio,
             context_block_limit=defaults.context_block_limit,
             max_tool_result_chars=defaults.max_tool_result_chars,
             provider_retry_mode=defaults.provider_retry_mode,

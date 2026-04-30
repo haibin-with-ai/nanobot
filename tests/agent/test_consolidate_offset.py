@@ -523,7 +523,7 @@ class TestNewCommandArchival:
             call_count += 1
             return False
 
-        loop.consolidator.archive = _failing_summarize  # type: ignore[method-assign]
+        loop.memory_consolidator.archive = _failing_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
@@ -556,7 +556,7 @@ class TestNewCommandArchival:
             archived_count = len(messages)
             return True
 
-        loop.consolidator.archive = _fake_summarize  # type: ignore[method-assign]
+        loop.memory_consolidator.archive = _fake_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
@@ -581,7 +581,7 @@ class TestNewCommandArchival:
         async def _ok_summarize(_messages) -> bool:
             return True
 
-        loop.consolidator.archive = _ok_summarize  # type: ignore[method-assign]
+        loop.memory_consolidator.archive = _ok_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         response = await loop._process_message(new_msg)
@@ -609,7 +609,7 @@ class TestNewCommandArchival:
             archived.set()
             return True
 
-        loop.consolidator.archive = _slow_summarize  # type: ignore[method-assign]
+        loop.memory_consolidator.archive = _slow_summarize  # type: ignore[method-assign]
 
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         await loop._process_message(new_msg)

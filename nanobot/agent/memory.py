@@ -369,6 +369,7 @@ class Consolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        trigger_ratio: float = 1.0,
     ):
         self.store = store
         self.provider = provider
@@ -376,6 +377,7 @@ class Consolidator:
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
+        self.trigger_ratio = max(0.0, trigger_ratio)
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
@@ -468,8 +470,14 @@ class Consolidator:
 
         lock = self.get_lock(session.key)
         async with lock:
-            budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+            ratio = self.trigger_ratio if self.trigger_ratio > 0 else 1.0
+            trigger_threshold = int(self.context_window_tokens * ratio)
+
+            budget = trigger_threshold - self.max_completion_tokens - self._SAFETY_BUFFER
+            if budget <= 0:
+                return
             target = budget // 2
+
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
@@ -478,7 +486,7 @@ class Consolidator:
                     "Token consolidation idle {}: {}/{} via {}",
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    trigger_threshold,
                     source,
                 )
                 return
@@ -506,7 +514,7 @@ class Consolidator:
                     round_num,
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    trigger_threshold,
                     source,
                     len(chunk),
                 )

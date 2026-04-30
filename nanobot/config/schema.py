@@ -104,6 +104,7 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 16384
     context_window_tokens: int = 0  # 0 = auto-detect at startup
+    consolidation_trigger_ratio: float = 1.0  # 0.0-1.0; budget = context_window * ratio
     context_block_limit: int | None = None
     temperature: float = 0.1
     max_tool_iterations: int = 200

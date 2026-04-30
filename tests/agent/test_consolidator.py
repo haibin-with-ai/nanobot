@@ -76,3 +76,89 @@ class TestConsolidatorTokenBudget:
         consolidator.archive = AsyncMock(return_value=True)
         await consolidator.maybe_consolidate_by_tokens(session)
         consolidator.archive.assert_not_called()
+
+
+class TestConsolidatorTriggerRatio:
+    async def test_ratio_0_5_lowers_trigger_and_does_not_fire(self, consolidator):
+        """With ratio=0.5 on a 1000-token window, budget=400; estimated=300 stays idle."""
+        consolidator.trigger_ratio = 0.5
+        consolidator.context_window_tokens = 1000
+        consolidator.max_completion_tokens = 100
+        consolidator._SAFETY_BUFFER = 0
+
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.key = "test:key"
+        session.messages = [
+            {"role": "user", "content": "x" * 200},
+            {"role": "assistant", "content": "y" * 200},
+        ]
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(300, "test"))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        # 300 < budget(400) -> should NOT consolidate
+        consolidator.archive.assert_not_called()
+
+    async def test_ratio_0_5_fires_when_estimated_exceeds_budget(self, consolidator):
+        """With ratio=0.5, consolidation fires when estimated >= budget."""
+        consolidator.trigger_ratio = 0.5
+        consolidator.context_window_tokens = 1000
+        consolidator.max_completion_tokens = 100
+        consolidator._SAFETY_BUFFER = 0
+
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.key = "test:key"
+        session.messages = [
+            {"role": "user", "content": "x" * 400},
+            {"role": "assistant", "content": "y" * 400},
+            {"role": "user", "content": "z" * 400},
+        ]
+        # budget = 500 - 100 = 400; target = 200
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(450, "test"))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        # 450 >= 400 -> fire; 450 > 200 -> need consolidation
+        consolidator.archive.assert_called_once()
+
+    async def test_ratio_zero_treated_as_one(self, consolidator):
+        """ratio=0 should be treated as 1.0 (backward compatible)."""
+        consolidator.trigger_ratio = 0.0
+        consolidator.context_window_tokens = 1000
+        consolidator.max_completion_tokens = 100
+        consolidator._SAFETY_BUFFER = 0
+
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.key = "test:key"
+        session.messages = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+        ]
+        # budget = 1000 - 100 = 900
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(950, "test"))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        consolidator.archive.assert_called_once()
+
+    async def test_negative_budget_returns_early(self, consolidator):
+        """If ratio is so low that budget <= 0, return without archiving."""
+        consolidator.trigger_ratio = 0.05
+        consolidator.context_window_tokens = 1000
+        consolidator.max_completion_tokens = 100
+        consolidator._SAFETY_BUFFER = 0
+
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.key = "test:key"
+        session.messages = [{"role": "user", "content": "hi"}]
+        # trigger_threshold = 50; budget = 50 - 100 = -50 -> <= 0 -> return early
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(1000, "test"))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        consolidator.archive.assert_not_called()
