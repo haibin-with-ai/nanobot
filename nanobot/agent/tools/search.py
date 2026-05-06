@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
 
@@ -12,6 +15,8 @@ from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
 
 _DEFAULT_HEAD_LIMIT = 250
 T = TypeVar("T")
+_RG_BIN: str | None = shutil.which("rg")
+
 _TYPE_GLOB_MAP = {
     "py": ("*.py", "*.pyi"),
     "python": ("*.py", "*.pyi"),
@@ -374,6 +379,217 @@ class GrepTool(_SearchTool):
             block.append(f"{marker} {line_no}| {lines[line_no - 1]}")
         return "\n".join(block)
 
+    # ---- ripgrep fast path ------------------------------------------------
+
+    def _build_rg_cmd(
+        self,
+        pattern: str,
+        target: Path,
+        *,
+        glob_filter: str | None,
+        type_filter: str | None,
+        case_insensitive: bool,
+        fixed_strings: bool,
+        output_mode: str,
+    ) -> list[str]:
+        """Translate grep-tool parameters into an rg command line."""
+        assert _RG_BIN is not None
+        cmd: list[str] = [
+            _RG_BIN,
+            "--hidden",
+            "--max-filesize", str(self._MAX_FILE_BYTES),
+        ]
+        for d in self._IGNORE_DIRS:
+            cmd.extend(["--glob", f"!{d}/"])
+        if case_insensitive:
+            cmd.append("-i")
+        if fixed_strings:
+            cmd.append("-F")
+        # File type filter (AND-ed with glob via --type-add/--type)
+        if type_filter:
+            lowered = type_filter.strip().lower()
+            pats = _TYPE_GLOB_MAP.get(lowered, (f"*.{lowered}",))
+            for p in pats:
+                cmd.extend(["--type-add", f"custom:{p}"])
+            cmd.extend(["--type", "custom"])
+        if glob_filter:
+            cmd.extend(["--glob", glob_filter])
+        # Output mode
+        if output_mode == "files_with_matches":
+            cmd.append("-l")
+        elif output_mode == "count":
+            cmd.append("-c")
+        else:  # content – use JSON for reliable parsing
+            cmd.append("--json")
+        cmd.extend(["--", pattern, str(target)])
+        return cmd
+
+    def _run_rg(
+        self,
+        pattern: str,
+        target: Path,
+        display_root: str,
+        *,
+        glob_filter: str | None,
+        type_filter: str | None,
+        case_insensitive: bool,
+        fixed_strings: bool,
+        output_mode: str,
+        context_before: int,
+        context_after: int,
+        limit: int | None,
+        offset: int,
+    ) -> str:
+        """Run ripgrep and return formatted output matching the Python path."""
+        cmd = self._build_rg_cmd(
+            pattern, target,
+            glob_filter=glob_filter, type_filter=type_filter,
+            case_insensitive=case_insensitive, fixed_strings=fixed_strings,
+            output_mode=output_mode,
+        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode == 2:
+            raise RuntimeError(proc.stderr.strip())
+        stdout = proc.stdout
+        root = target if target.is_dir() else target.parent
+
+        # ---------- files_with_matches ----------
+        if output_mode == "files_with_matches":
+            paths = [p.strip() for p in stdout.splitlines() if p.strip()]
+            if not paths:
+                return f"No matches found for pattern '{pattern}' in {display_root}"
+            entries: list[tuple[str, float]] = []
+            for p in paths:
+                fp = Path(p)
+                display = self._display_path(fp, root)
+                try:
+                    mtime = fp.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                entries.append((display, mtime))
+            entries.sort(key=lambda item: (-item[1], item[0]))
+            ordered = [name for name, _ in entries]
+            paged, trunc = _paginate(ordered, limit, offset)
+            result = "\n".join(paged)
+            if note := _pagination_note(limit, offset, trunc):
+                result += f"\n\n{note}"
+            return result
+
+        # ---------- count ----------
+        if output_mode == "count":
+            if not stdout.strip():
+                return f"No matches found for pattern '{pattern}' in {display_root}"
+            counts: dict[str, int] = {}
+            file_mtimes: dict[str, float] = {}
+            matching_files: list[str] = []
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                sep = line.rfind(":")
+                if sep < 0:
+                    continue
+                fpath_str, cnt_str = line[:sep], line[sep + 1 :]
+                try:
+                    cnt = int(cnt_str)
+                except ValueError:
+                    continue
+                fp = Path(fpath_str)
+                display = self._display_path(fp, root)
+                counts[display] = cnt
+                matching_files.append(display)
+                try:
+                    file_mtimes[display] = fp.stat().st_mtime
+                except OSError:
+                    file_mtimes[display] = 0.0
+            if not counts:
+                return f"No matches found for pattern '{pattern}' in {display_root}"
+            ordered_files = sorted(
+                matching_files,
+                key=lambda n: (-file_mtimes.get(n, 0.0), n),
+            )
+            paged, trunc = _paginate(ordered_files, limit, offset)
+            lines_out = [f"{name}: {counts[name]}" for name in paged]
+            result = "\n".join(lines_out)
+            notes: list[str] = []
+            if trunc:
+                notes.append(f"(pagination: limit={limit}, offset={offset})")
+            elif offset > 0:
+                notes.append(f"(pagination: offset={offset})")
+            if counts:
+                notes.append(
+                    f"(total matches: {sum(counts.values())} in {len(counts)} files)"
+                )
+            if notes:
+                result += "\n\n" + "\n".join(notes)
+            return result
+
+        # ---------- content (--json) ----------
+        match_records: list[tuple[Path, int]] = []
+        for raw_line in stdout.splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                record = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") == "match":
+                fpath = Path(record["data"]["path"]["text"])
+                lno = record["data"]["line_number"]
+                match_records.append((fpath, lno))
+
+        if not match_records:
+            return f"No matches found for pattern '{pattern}' in {display_root}"
+
+        blocks: list[str] = []
+        result_chars = 0
+        seen = 0
+        truncated = False
+        size_truncated = False
+        file_cache: dict[str, list[str]] = {}
+
+        for fpath, lno in match_records:
+            seen += 1
+            if seen <= offset:
+                continue
+            if limit is not None and len(blocks) >= limit:
+                truncated = True
+                break
+            key = str(fpath)
+            if key not in file_cache:
+                try:
+                    file_cache[key] = fpath.read_text("utf-8").splitlines()
+                except Exception:
+                    continue
+            display = self._display_path(fpath, root)
+            block = self._format_block(
+                display, file_cache[key], lno, context_before, context_after,
+            )
+            extra_sep = 2 if blocks else 0
+            if result_chars + extra_sep + len(block) > self._MAX_RESULT_CHARS:
+                size_truncated = True
+                break
+            blocks.append(block)
+            result_chars += extra_sep + len(block)
+
+        result = (
+            "\n\n".join(blocks)
+            if blocks
+            else f"No matches found for pattern '{pattern}' in {display_root}"
+        )
+        notes: list[str] = []
+        if truncated:
+            notes.append(f"(pagination: limit={limit}, offset={offset})")
+        elif size_truncated:
+            notes.append("(output truncated due to size)")
+        elif offset > 0 and blocks:
+            notes.append(f"(pagination: offset={offset})")
+        if notes:
+            result += "\n\n" + "\n".join(notes)
+        return result
+
+    # ---- main entry point -------------------------------------------------
+
     async def execute(
         self,
         pattern: str,
@@ -413,6 +629,23 @@ class GrepTool(_SearchTool):
                 limit = max_results
             else:
                 limit = _DEFAULT_HEAD_LIMIT
+
+            # Fast path: use ripgrep when available
+            if _RG_BIN:
+                try:
+                    return self._run_rg(
+                        pattern, target, path or ".",
+                        glob_filter=glob, type_filter=type,
+                        case_insensitive=case_insensitive,
+                        fixed_strings=fixed_strings,
+                        output_mode=output_mode,
+                        context_before=context_before,
+                        context_after=context_after,
+                        limit=limit, offset=offset,
+                    )
+                except Exception:
+                    pass  # Fall through to Python implementation
+
             blocks: list[str] = []
             result_chars = 0
             seen_content_matches = 0
