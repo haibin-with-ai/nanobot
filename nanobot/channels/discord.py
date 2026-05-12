@@ -442,20 +442,32 @@ class DiscordChannel(BaseChannel):
 
     def _should_respond_in_group(self, payload: dict[str, Any], content: str) -> bool:
         """Check if bot should respond in a group channel based on policy."""
+        mentions = payload.get("mentions") or []
+        self_mentioned = False
+        if self._bot_user_id:
+            self_mentioned = any(str(mention.get("id")) == self._bot_user_id for mention in mentions)
+            self_mentioned = self_mentioned or f"<@{self._bot_user_id}>" in content or f"<@!{self._bot_user_id}>" in content
+
+        # In open channels, still stay silent when the user explicitly mentions
+        # another bot but not this bot.  This lets multiple agents share a
+        # channel without nanobot stealing messages addressed to Hermes, etc.
+        other_bot_mentioned = any(
+            bool(mention.get("bot")) and str(mention.get("id")) != self._bot_user_id
+            for mention in mentions
+        )
+        if other_bot_mentioned and not self_mentioned:
+            logger.debug(
+                "Discord message in {} ignored (other bot mentioned, nanobot not mentioned)",
+                payload.get("channel_id"),
+            )
+            return False
+
         if self.config.group_policy == "open":
             return True
 
         if self.config.group_policy == "mention":
-            # Check if bot was mentioned in the message
-            if self._bot_user_id:
-                # Check mentions array
-                mentions = payload.get("mentions") or []
-                for mention in mentions:
-                    if str(mention.get("id")) == self._bot_user_id:
-                        return True
-                # Also check content for mention format <@USER_ID>
-                if f"<@{self._bot_user_id}>" in content or f"<@!{self._bot_user_id}>" in content:
-                    return True
+            if self_mentioned:
+                return True
             logger.debug("Discord message in {} ignored (bot not mentioned)", payload.get("channel_id"))
             return False
 

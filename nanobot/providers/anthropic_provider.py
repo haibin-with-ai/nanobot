@@ -23,6 +23,26 @@ def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
 
 
+# Anthropic requires tool_use IDs to be alphanumeric (plus underscore/hyphen).
+# Their error message says ^[a-zA-Z0-9-]+$ but their own IDs use underscores.
+_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _sanitize_tool_id(tid: Any) -> str:
+    """Ensure a tool ID is Anthropic-safe (alphanumeric + hyphens only).
+
+    IDs from other providers (e.g. OpenAI's ``call_xxx|fc_xxx``) contain
+    pipe characters that Anthropic rejects.  Hash them into a stable,
+    provider-prefixed replacement.
+    """
+    if not isinstance(tid, str) or not tid:
+        return _gen_tool_id()
+    if _TOOL_ID_RE.match(tid):
+        return tid
+    import hashlib
+    return "toolu_" + hashlib.sha1(tid.encode()).hexdigest()[:22]
+
+
 # Beta headers for OAuth tokens (sk-ant-oat...) from Claude Code subscriptions.
 # Only targeting opus-4-6 / sonnet-4-6+ which use adaptive thinking — no interleaved-thinking beta needed.
 # Context-1m beta excluded: Anthropic rejects it with OAuth auth.
@@ -243,7 +263,7 @@ class AnthropicProvider(LLMProvider):
         content = msg.get("content")
         block: dict[str, Any] = {
             "type": "tool_result",
-            "tool_use_id": msg.get("tool_call_id", ""),
+            "tool_use_id": _sanitize_tool_id(msg.get("tool_call_id", "")),
         }
         if isinstance(content, (str, list)):
             block["content"] = content
@@ -279,7 +299,7 @@ class AnthropicProvider(LLMProvider):
                 args = json_repair.loads(args)
             blocks.append({
                 "type": "tool_use",
-                "id": tc.get("id") or _gen_tool_id(),
+                "id": _sanitize_tool_id(tc.get("id")),
                 "name": func.get("name", ""),
                 "input": args,
             })
