@@ -6,6 +6,7 @@ import pytest
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.runner import AgentRunResult
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
@@ -525,16 +526,16 @@ async def test_process_message_persists_media_only_turn_without_text(tmp_path: P
 async def test_process_message_does_not_duplicate_early_persisted_user_message(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
-    loop._run_agent_loop = AsyncMock(return_value=(
-        "done",
-        None,
-        [
+    loop._run_agent_loop = AsyncMock(return_value=AgentRunResult(
+        final_content="done",
+        messages=[
             {"role": "system", "content": "system"},
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "done"},
         ],
-        "stop",
-        False,
+        tools_used=[],
+        stop_reason="stop",
+        had_injections=False,
     ))  # type: ignore[method-assign]
 
     result = await loop._process_message(
@@ -564,16 +565,16 @@ async def test_process_message_uses_context_chat_id_for_runtime_prompt(tmp_path:
             {"role": "user", "content": "runtime + hello"},
         ]
     )
-    loop._run_agent_loop = AsyncMock(return_value=(  # type: ignore[method-assign]
-        "done",
-        [],
-        [
+    loop._run_agent_loop = AsyncMock(return_value=AgentRunResult(  # type: ignore[method-assign]
+        final_content="done",
+        messages=[
             {"role": "system", "content": "system"},
             {"role": "user", "content": "runtime + hello"},
             {"role": "assistant", "content": "done"},
         ],
-        "stop",
-        False,
+        tools_used=[],
+        stop_reason="stop",
+        had_injections=False,
     ))
 
     result = await loop._process_message(
@@ -615,16 +616,16 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
             {"role": "user", "content": "runtime + heartbeat"},
         ]
     )
-    loop._run_agent_loop = AsyncMock(return_value=(  # type: ignore[method-assign]
-        "ok",
-        [],
-        [
+    loop._run_agent_loop = AsyncMock(return_value=AgentRunResult(  # type: ignore[method-assign]
+        final_content="ok",
+        messages=[
             {"role": "system", "content": "system"},
             {"role": "user", "content": "runtime + heartbeat"},
             {"role": "assistant", "content": "ok"},
         ],
-        "stop",
-        False,
+        tools_used=[],
+        stop_reason="stop",
+        had_injections=False,
     ))
 
     result = await loop._process_message(
@@ -672,18 +673,18 @@ async def test_next_turn_after_crash_closes_pending_user_turn_before_new_input(t
     session.metadata[AgentLoop._PENDING_USER_TURN_KEY] = True
     loop.sessions.save(session)
 
-    loop._run_agent_loop = AsyncMock(return_value=(
-        "new answer",
-        None,
-        [
+    loop._run_agent_loop = AsyncMock(return_value=AgentRunResult(
+        final_content="new answer",
+        messages=[
             {"role": "system", "content": "system"},
             {"role": "user", "content": "old question"},
             {"role": "assistant", "content": "Error: Task interrupted before a response was generated."},
             {"role": "user", "content": "new question"},
             {"role": "assistant", "content": "new answer"},
         ],
-        "stop",
-        False,
+        tools_used=[],
+        stop_reason="stop",
+        had_injections=False,
     ))  # type: ignore[method-assign]
 
     result = await loop._process_message(
@@ -776,12 +777,12 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
     assert interrupted.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is not None
 
     async def resumed_run_agent_loop(initial_messages, **_kwargs):
-        return (
-            "next answer",
-            None,
-            [*initial_messages, {"role": "assistant", "content": "next answer"}],
-            "stop",
-            False,
+        return AgentRunResult(
+            final_content="next answer",
+            messages=[*initial_messages, {"role": "assistant", "content": "next answer"}],
+            tools_used=[],
+            stop_reason="stop",
+            had_injections=False,
         )
 
     loop._run_agent_loop = resumed_run_agent_loop  # type: ignore[method-assign]
@@ -827,12 +828,12 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
 
     async def fake_run_agent_loop(initial_messages, **_kwargs):
         seen["initial_messages"] = initial_messages
-        return (
-            "done",
-            [],
-            [*initial_messages, {"role": "assistant", "content": "done"}],
-            "stop",
-            False,
+        return AgentRunResult(
+            final_content="done",
+            messages=[*initial_messages, {"role": "assistant", "content": "done"}],
+            tools_used=[],
+            stop_reason="stop",
+            had_injections=False,
         )
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
@@ -883,12 +884,12 @@ async def test_multiple_subagent_followups_all_persist_as_standalone_history(tmp
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
     async def fake_run_agent_loop(initial_messages, **_kwargs):
-        return (
-            "ack",
-            [],
-            [*initial_messages, {"role": "assistant", "content": "ack"}],
-            "stop",
-            False,
+        return AgentRunResult(
+            final_content="ack",
+            messages=[*initial_messages, {"role": "assistant", "content": "ack"}],
+            tools_used=[],
+            stop_reason="stop",
+            had_injections=False,
         )
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
@@ -1009,12 +1010,12 @@ async def test_system_subagent_followup_uses_thread_session_and_slack_metadata(t
 
     async def fake_run_agent_loop(initial_messages, **_kwargs):
         seen["initial_messages"] = initial_messages
-        return (
-            "done",
-            [],
-            [*initial_messages, {"role": "assistant", "content": "done"}],
-            "stop",
-            False,
+        return AgentRunResult(
+            final_content="done",
+            messages=[*initial_messages, {"role": "assistant", "content": "done"}],
+            tools_used=[],
+            stop_reason="stop",
+            had_injections=False,
         )
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
@@ -1042,3 +1043,104 @@ async def test_system_subagent_followup_uses_thread_session_and_slack_metadata(t
     loop.sessions.invalidate("slack:C123:1700.42")
     persisted = loop.sessions.get_or_create("slack:C123:1700.42")
     assert any(m.get("subagent_task_id") == "sub-1" for m in persisted.messages)
+
+
+def test_save_turn_writes_metrics_on_last_assistant() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:metrics")
+
+    from nanobot.agent.loop import AssistantTurnMetrics
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ],
+        skip=0,
+        turn_latency_ms=100,
+        metrics=AssistantTurnMetrics(
+            model="gpt-4o",
+            usage={"prompt_tokens": 10, "completion_tokens": 2},
+            latency_ms=100,
+            elapsed_ms=200,
+            llm_elapsed_ms=150,
+        ),
+    )
+
+    assert session.messages[-1]["role"] == "assistant"
+    assert session.messages[-1]["content"] == "second"
+    assert session.messages[-1]["model"] == "gpt-4o"
+    assert session.messages[-1]["usage"] == {"prompt_tokens": 10, "completion_tokens": 2}
+    assert session.messages[-1]["latency_ms"] == 100
+    assert session.messages[-1]["elapsed_ms"] == 200
+    assert session.messages[-1]["llm_elapsed_ms"] == 150
+
+
+def test_save_turn_metrics_none_does_not_write_keys() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:no-metrics")
+
+    loop._save_turn(
+        session,
+        [{"role": "assistant", "content": "hello"}],
+        skip=0,
+    )
+
+    assert "model" not in session.messages[0]
+    assert "usage" not in session.messages[0]
+    assert "elapsed_ms" not in session.messages[0]
+    assert "llm_elapsed_ms" not in session.messages[0]
+
+
+def test_persist_user_message_early_writes_sender_id_and_sender_name(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = Session(key="test:sender")
+
+    msg = InboundMessage(
+        channel="discord",
+        sender_id="12345",
+        chat_id="c1",
+        content="hello",
+        metadata={"sender_name": "Alice"},
+    )
+    persisted = loop._persist_user_message_early(msg, session)
+
+    assert persisted is True
+    assert session.messages[0]["sender_id"] == "12345"
+    assert session.messages[0]["sender_name"] == "Alice"
+
+
+def test_persist_user_message_early_omits_sender_name_when_missing(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = Session(key="test:sender-id-only")
+
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="67890",
+        chat_id="c1",
+        content="hi",
+        metadata={},
+    )
+    persisted = loop._persist_user_message_early(msg, session)
+
+    assert persisted is True
+    assert session.messages[0]["sender_id"] == "67890"
+    assert "sender_name" not in session.messages[0]
+
+
+def test_persist_user_message_early_skips_empty_message(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = Session(key="test:empty")
+
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="u1",
+        chat_id="c1",
+        content="",
+        metadata={"sender_name": "Bob"},
+    )
+    persisted = loop._persist_user_message_early(msg, session)
+
+    assert persisted is False
+    assert session.messages == []

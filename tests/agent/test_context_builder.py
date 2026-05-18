@@ -347,3 +347,41 @@ class TestBuildMessages:
         user_msg = messages[-1]["content"]
         assert isinstance(user_msg, list)
         assert any(b.get("type") == "image_url" for b in user_msg)
+
+    def test_with_channel_name(self):
+        ctx = ContextBuilder._build_runtime_context("discord", "c1", channel_name="general")
+        assert "Channel Name: general" in ctx
+
+    def test_with_sender_name(self):
+        ctx = ContextBuilder._build_runtime_context("discord", "c1", sender_name="Alice")
+        assert "Sender Name: Alice" in ctx
+
+    def test_channel_name_and_sender_name_together(self):
+        ctx = ContextBuilder._build_runtime_context(
+            "discord", "c1", channel_name="general", sender_name="Alice"
+        )
+        assert "Channel Name: general" in ctx
+        assert "Sender Name: Alice" in ctx
+
+    def test_channel_name_omitted_when_none(self):
+        ctx = ContextBuilder._build_runtime_context("discord", "c1")
+        assert "Channel Name:" not in ctx
+
+    def test_sender_name_omitted_when_none(self):
+        ctx = ContextBuilder._build_runtime_context("discord", "c1")
+        assert "Sender Name:" not in ctx
+
+    def test_build_messages_passes_channel_name_and_sender_name(self, tmp_path):
+        builder = _builder(tmp_path)
+        messages = builder.build_messages(
+            [],
+            "hello",
+            channel="discord",
+            chat_id="c1",
+            channel_name="general",
+            sender_name="Alice",
+        )
+        user_content = messages[-1]["content"]
+        assert isinstance(user_content, str)
+        assert "Channel Name: general" in user_content
+        assert "Sender Name: Alice" in user_content

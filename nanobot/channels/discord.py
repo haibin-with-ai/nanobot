@@ -742,10 +742,13 @@ class DiscordChannel(BaseChannel):
             if message.reference and message.reference.message_id
             else None
         )
+        channel_name = getattr(message.channel, "name", None)
         return {
             "message_id": str(message.id),
             "guild_id": str(message.guild.id) if message.guild else None,
             "reply_to": reply_to,
+            "channel_name": channel_name,
+            "sender_name": message.author.display_name,
         }
 
     def _resolve_bot_user_id(self) -> str | None:

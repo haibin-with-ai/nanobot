@@ -198,7 +198,7 @@ def _make_message(
         else None
     )
     return SimpleNamespace(
-        author=SimpleNamespace(id=author_id, bot=author_bot),
+        author=SimpleNamespace(id=author_id, bot=author_bot, display_name=str(author_id)),
         channel=_FakeChannel(channel_id, parent_channel_id),
         content=content,
         guild=guild,
@@ -357,7 +357,7 @@ async def test_on_message_accepts_allowlisted_dm() -> None:
 
     assert len(handled) == 1
     assert handled[0]["chat_id"] == "456"
-    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None}
+    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None, "channel_name": None, "sender_name": "123"}
 
 
 @pytest.mark.asyncio
@@ -415,6 +415,38 @@ async def test_on_message_accepts_thread_when_parent_channel_in_allow_channels()
     assert handled[0]["metadata"]["context_chat_id"] == "456"
     assert handled[0]["metadata"]["thread_id"] == "777"
     assert handled[0]["session_key"] == "discord:456:thread:777"
+
+
+def test_build_inbound_metadata_guild_message() -> None:
+    """Guild messages include channel_name and sender_name."""
+    channel = SimpleNamespace(id=100, name="general")
+    message = SimpleNamespace(
+        id=12345,
+        reference=None,
+        guild=SimpleNamespace(id=1),
+        author=SimpleNamespace(display_name="Alice"),
+        channel=channel,
+    )
+    metadata = DiscordChannel._build_inbound_metadata(message)
+    assert metadata["channel_name"] == "general"
+    assert metadata["sender_name"] == "Alice"
+    assert metadata["guild_id"] == "1"
+
+
+def test_build_inbound_metadata_dm_message() -> None:
+    """DM messages omit channel_name but include sender_name."""
+    channel = SimpleNamespace(id=200, name=None)
+    message = SimpleNamespace(
+        id=12346,
+        reference=None,
+        guild=None,
+        author=SimpleNamespace(display_name="Bob"),
+        channel=channel,
+    )
+    metadata = DiscordChannel._build_inbound_metadata(message)
+    assert metadata["channel_name"] is None
+    assert metadata["sender_name"] == "Bob"
+    assert metadata["guild_id"] is None
 
 
 @pytest.mark.asyncio

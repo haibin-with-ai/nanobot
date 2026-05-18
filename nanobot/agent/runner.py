@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,8 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    elapsed_ms: int = 0
+    llm_elapsed_ms: int = 0
 
 
 class AgentRunner:
@@ -244,6 +247,7 @@ class AgentRunner:
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
+        run_started = time.monotonic()
         messages = list(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
@@ -258,6 +262,7 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        llm_elapsed_ms = 0
 
         for iteration in range(spec.max_iterations):
             try:
@@ -286,7 +291,8 @@ class AgentRunner:
                     messages_for_model = messages
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            response, call_elapsed_ms = await self._request_model(spec, messages_for_model, hook, context)
+            llm_elapsed_ms += call_elapsed_ms
             raw_usage = self._usage_dict(response.usage)
             context.response = response
             context.usage = dict(raw_usage)
@@ -425,7 +431,8 @@ class AgentRunner:
                 )
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=False)
-                response = await self._request_finalization_retry(spec, messages_for_model)
+                response, retry_elapsed_ms = await self._request_finalization_retry(spec, messages_for_model)
+                llm_elapsed_ms += retry_elapsed_ms
                 retry_usage = self._usage_dict(response.usage)
                 self._accumulate_usage(usage, retry_usage)
                 raw_usage = self._merge_usage(raw_usage, retry_usage)
@@ -562,6 +569,7 @@ class AgentRunner:
             if drained_after_max_iterations:
                 had_injections = True
 
+        elapsed_ms = max(0, int((time.monotonic() - run_started) * 1000))
         return AgentRunResult(
             final_content=final_content,
             messages=messages,
@@ -571,6 +579,8 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
+            elapsed_ms=elapsed_ms,
+            llm_elapsed_ms=llm_elapsed_ms,
         )
 
     def _build_request_kwargs(
@@ -684,26 +694,29 @@ class AgentRunner:
         # LLM timeout here, or healthy long reasoning streams can be killed just
         # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
         outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
+        start = time.monotonic()
         try:
             response = (
                 await coro if outer_timeout_s is None
                 else await asyncio.wait_for(coro, timeout=outer_timeout_s)
             )
         except asyncio.TimeoutError:
+            elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
             if outer_timeout_s is None:
                 return LLMResponse(
                     content="Error calling LLM: stream stalled",
                     finish_reason="error",
                     error_kind="timeout",
-                )
+                ), elapsed_ms
             return LLMResponse(
                 content=f"Error calling LLM: timed out after {outer_timeout_s:g}s",
                 finish_reason="error",
                 error_kind="timeout",
-            )
+            ), elapsed_ms
+        call_elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
         if progress_state and progress_state.get("reasoning_open"):
             await hook.emit_reasoning_end()
-        return response
+        return response, call_elapsed_ms
 
     async def _request_finalization_retry(
         self,
@@ -713,7 +726,10 @@ class AgentRunner:
         retry_messages = list(messages)
         retry_messages.append(build_finalization_retry_message())
         kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
-        return await self.provider.chat_with_retry(**kwargs)
+        start = time.monotonic()
+        response = await self.provider.chat_with_retry(**kwargs)
+        elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
+        return response, elapsed_ms
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:

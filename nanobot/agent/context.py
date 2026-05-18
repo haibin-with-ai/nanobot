@@ -95,14 +95,20 @@ class ContextBuilder:
         chat_id: str | None,
         timezone: str | None = None,
         sender_id: str | None = None,
+        channel_name: str | None = None,
+        sender_name: str | None = None,
         supplemental_lines: Sequence[str] | None = None,
     ) -> str:
         """Build untrusted runtime metadata block appended after user content."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if channel_name:
+            lines += [f"Channel Name: {channel_name}"]
         if sender_id:
             lines += [f"Sender ID: {sender_id}"]
+        if sender_name:
+            lines += [f"Sender Name: {sender_name}"]
         if supplemental_lines:
             lines.extend(supplemental_lines)
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
@@ -152,6 +158,8 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         sender_id: str | None = None,
+        channel_name: str | None = None,
+        sender_name: str | None = None,
         session_summary: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
@@ -162,6 +170,8 @@ class ContextBuilder:
             chat_id,
             self.timezone,
             sender_id=sender_id,
+            channel_name=channel_name,
+            sender_name=sender_name,
             supplemental_lines=extra or None,
         )
         user_content = self._build_user_content(current_message, media)

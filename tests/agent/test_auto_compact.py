@@ -168,7 +168,8 @@ class TestAgentLoopTTLParam:
         session = loop.sessions.get_or_create("cli:direct")
         session.get_history = MagicMock(return_value=[])
         loop.context.build_messages = MagicMock(return_value=[])
-        loop._run_agent_loop = AsyncMock(return_value=("ok", [], [], "stop", False))
+        from nanobot.agent.runner import AgentRunResult
+        loop._run_agent_loop = AsyncMock(return_value=AgentRunResult(final_content="ok", messages=[], tools_used=[], stop_reason="stop", had_injections=False))
         loop._save_turn = MagicMock()
 
         msg = InboundMessage(

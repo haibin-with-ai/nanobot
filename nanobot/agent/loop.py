@@ -20,7 +20,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.progress_hook import AgentProgressHook
-from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
@@ -83,6 +83,15 @@ class StateTraceEntry:
 
 
 @dataclass
+class AssistantTurnMetrics:
+    model: str | None = None
+    usage: dict[str, int] | None = None
+    latency_ms: int | None = None
+    elapsed_ms: int | None = None
+    llm_elapsed_ms: int | None = None
+
+
+@dataclass
 class TurnContext:
     msg: InboundMessage
     session_key: str
@@ -98,6 +107,7 @@ class TurnContext:
     all_messages: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     had_injections: bool = False
+    run_result: AgentRunResult | None = None
 
     user_persisted_early: bool = False
     save_skip: int = 0
@@ -573,6 +583,11 @@ class AgentLoop:
         if has_text or media_paths:
             extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
             extra.update(kwargs)
+            if msg.sender_id:
+                extra["sender_id"] = msg.sender_id
+            sender_name = msg.metadata.get("sender_name")
+            if sender_name:
+                extra["sender_name"] = sender_name
             text = msg.content if isinstance(msg.content, str) else ""
             session.add_message("user", text, **extra)
             self._mark_pending_user_turn(session)
@@ -595,6 +610,8 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=self._runtime_chat_id(msg),
             sender_id=msg.sender_id,
+            channel_name=msg.metadata.get("channel_name"),
+            sender_name=msg.metadata.get("sender_name"),
             session_summary=pending_summary,
             session_metadata=session.metadata,
         )
@@ -660,7 +677,7 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
-    ) -> tuple[str | None, list[str], list[dict], str, bool]:
+    ) -> AgentRunResult:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -668,7 +685,7 @@ class AgentLoop:
         ``resuming=True`` means tool calls follow (spinner should restart);
         ``resuming=False`` means this is the final response.
 
-        Returns (final_content, tools_used, messages, stop_reason, had_injections).
+        Returns AgentRunResult.""
         """
         self._sync_subagent_runtime_limits()
 
@@ -787,7 +804,7 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+        return result
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1064,7 +1081,7 @@ class AgentLoop:
             session_metadata=session.metadata,
         )
         t_wall = time.time()
-        final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
+        result = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,
             message_id=msg.metadata.get("message_id"),
             metadata=msg.metadata,
@@ -1073,7 +1090,14 @@ class AgentLoop:
         )
         wall_done = time.time()
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
-        self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
+        metrics = AssistantTurnMetrics(
+            model=self.model,
+            usage=result.usage,
+            latency_ms=latency_ms,
+            elapsed_ms=result.elapsed_ms,
+            llm_elapsed_ms=result.llm_elapsed_ms,
+        )
+        self._save_turn(session, result.messages, 1 + len(history), turn_latency_ms=latency_ms, metrics=metrics)
         if channel == "websocket":
             self._pending_turn_latency_ms[key] = latency_ms
         session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
@@ -1085,7 +1109,7 @@ class AgentLoop:
                 replay_max_messages=self._max_messages,
             )
         )
-        content = final_content or "Background task completed."
+        content = result.final_content or "Background task completed."
         outbound_metadata: dict[str, Any] = {}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
             outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
@@ -1341,12 +1365,12 @@ class AgentLoop:
             session_key=ctx.session_key,
             pending_queue=ctx.pending_queue,
         )
-        final_content, tools_used, all_msgs, stop_reason, had_injections = result
-        ctx.final_content = final_content
-        ctx.tools_used = tools_used
-        ctx.all_messages = all_msgs
-        ctx.stop_reason = stop_reason
-        ctx.had_injections = had_injections
+        ctx.run_result = result
+        ctx.final_content = result.final_content
+        ctx.tools_used = result.tools_used
+        ctx.all_messages = result.messages
+        ctx.stop_reason = result.stop_reason
+        ctx.had_injections = result.had_injections
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
@@ -1361,9 +1385,18 @@ class AgentLoop:
         merge_turn_media_into_last_assistant(ctx.all_messages, ctx.generated_media, extra)
 
         ctx.turn_latency_ms = max(0, int((time.time() - ctx.turn_wall_started_at) * 1000))
+        run_result = ctx.run_result
+        metrics = AssistantTurnMetrics(
+            model=self.model,
+            usage=run_result.usage if run_result else None,
+            latency_ms=ctx.turn_latency_ms,
+            elapsed_ms=run_result.elapsed_ms if run_result else None,
+            llm_elapsed_ms=run_result.llm_elapsed_ms if run_result else None,
+        )
         self._save_turn(
             ctx.session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
+            metrics=metrics,
         )
         if ctx.msg.channel == "websocket":
             self._pending_turn_latency_ms[ctx.session_key] = ctx.turn_latency_ms
@@ -1443,6 +1476,7 @@ class AgentLoop:
         skip: int,
         *,
         turn_latency_ms: int | None = None,
+        metrics: AssistantTurnMetrics | None = None,
     ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
@@ -1479,8 +1513,21 @@ class AgentLoop:
             session.messages.append(entry)
             if role == "assistant":
                 last_assistant_idx = len(session.messages) - 1
-        if turn_latency_ms is not None and last_assistant_idx is not None:
-            session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+        if last_assistant_idx is not None:
+            if turn_latency_ms is not None:
+                session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+            if metrics is not None:
+                assistant_msg = session.messages[last_assistant_idx]
+                if metrics.model is not None:
+                    assistant_msg["model"] = metrics.model
+                if metrics.usage is not None:
+                    assistant_msg["usage"] = metrics.usage
+                if metrics.latency_ms is not None:
+                    assistant_msg["latency_ms"] = metrics.latency_ms
+                if metrics.elapsed_ms is not None:
+                    assistant_msg["elapsed_ms"] = metrics.elapsed_ms
+                if metrics.llm_elapsed_ms is not None:
+                    assistant_msg["llm_elapsed_ms"] = metrics.llm_elapsed_ms
         session.updated_at = datetime.now()
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
