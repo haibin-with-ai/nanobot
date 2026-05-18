@@ -19,7 +19,7 @@
 |---|---|---|
 | 2.1 | Discord 消息触发时，runtime context 的 `[Runtime Context]` 块包含 `Channel Name: <name>`（DM 时省略）。 | P0 |
 | 2.2 | Discord 消息触发时，runtime context 包含 `Sender Name: <name>`（无法获取时省略）。 | P0 |
-| 2.3 | 每个持久化的 user message 包含 `sender_id`；能获取到 sender name 时同时包含 `sender_name`。 | P0 |
+| 2.3 | 每个持久化的 user message 包含 `sender_id`；能获取到 sender name 时同时包含 `sender_name`。 | P0（`sender_id` 在 runtime context 中 **upstream 已有**：`ContextBuilder._build_runtime_context()` 已接收 `sender_id`，`AgentLoop` 已传入。无需 replay runtime context 部分。持久化到 user message 仍需 replay。） |
 | 2.4 | 每个持久化的 assistant message 包含 `model`（字符串，如 `gpt-4o`）。 | P0 |
 | 2.5 | 每个持久化的 assistant message 包含 `usage`（JSON object，如 `{"prompt_tokens": 10, "completion_tokens": 2}`）。 | P0 |
 | 2.6 | 每个持久化的 assistant message 包含 `latency_ms`（单轮 wall-clock 延迟，已存在于 upstream）。 | P0（复用） |
@@ -390,12 +390,14 @@ loop.sessions.invalidate(session.key)
 
 ### 4.6 Session identity 与日期解耦的策略
 
+> **Upstream 已有**：upstream 使用 `key → safe_filename(key)` 作文件名，不依赖日期。无需 replay，仅补验收测试。
+
 Upstream 已经解耦：
 - `Session.key` 格式为 `{channel}:{chat_id}`（如 `discord:123456`）。
 - `SessionManager` 使用 `safe_filename(key)` 将 key 映射为文件名，文件名不包含日期。
 - `created_at` 和 `updated_at` 存储在 JSONL header 中，仅用于列表排序和显示，不参与 identity 计算。
 
-**本 spec 不需要任何修改**。验收标准：确认 `SessionManager.save()` 和 `load()` 不基于日期做任何 session 路由或命名决策。
+**本 spec 不需要任何代码修改**。仅补验收测试确认行为正确。
 
 ## 5. 最小侵入评估
 

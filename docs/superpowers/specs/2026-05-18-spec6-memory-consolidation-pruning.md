@@ -255,6 +255,8 @@ if spec.context_pruning is not None and spec.context_pruning.enabled:
 
 ### 4.4 consolidation_ratio 数据流
 
+> **Upstream 已有**：`consolidation_ratio` 已在 upstream 全链路实现（schema → AgentLoop → Consolidator → `maybe_consolidate_by_tokens()`），无需任何代码修改。仅需运行已有回归测试确认行为正确。从实现计划中删除 consolidation_ratio 相关实现步骤，仅保留验证步骤。
+
 upstream 已实现完整链路，Pack6 只需**确认**并**补测试**。
 
 ```
@@ -409,8 +411,8 @@ async def test_runner_applies_pruning_before_governance(monkeypatch):
 10. 修改 `AgentLoop.from_config()` 从 `defaults.context_pruning` 读取并传入。
 11. 修改 AgentLoop 中构造 `AgentRunSpec` 的位置，将 `context_pruning` 传入。
 
-**Phase 4 — Consolidation Ratio 回归确认**
-12. 运行已有 `tests/agent/test_consolidation_ratio.py`、`test_consolidator.py`、`test_loop_consolidation_tokens.py`、`test_auto_compact.py`、`test_autocompact_unit.py`。
+**Phase 4 — Consolidation Ratio 已有测试验证**
+12. 运行已有 `tests/agent/test_consolidation_ratio.py`、`test_consolidator.py`、`test_loop_consolidation_tokens.py`、`test_auto_compact.py`、`test_autocompact_unit.py`，验证 upstream 已有 consolidation_ratio 功能行为正确。
 13. 若有失败，定位是否为 Pack6 集成导致（如 `AgentLoop` 新增参数影响了 mock 构造），修复调用方而非被调用方。
 
 **Phase 5 — 编译检查与收尾**

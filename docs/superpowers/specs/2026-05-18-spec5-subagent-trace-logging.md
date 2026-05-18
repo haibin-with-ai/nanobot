@@ -299,6 +299,7 @@ if not self._subagent_has_independent_provider:
 #### 4.3.3 model_alias_resolver 的构造与注入
 
 - resolver 的职责是：把用户传入的字符串（可能是 exact model name、preset name、或 model 的 unique prefix）解析为最终 model 字符串。
+- **Upstream 新增能力**：upstream 已新增 `nanobot/agent/model_presets.py` 模块。`model_alias_resolver` 的实现应优先复用 upstream 的 preset resolution 机制（`config.resolve_preset()`），而不是自建 alias 解析。这进一步简化了 SubagentManager 的依赖。
 - **复用已有逻辑**：`Config.resolve_preset()` 已支持 exact match 和 unique prefix match（plan 确认 upstream 有此语义）。
 - 在 `AgentLoop.from_config()` 中构造 resolver：
   ```python
@@ -569,7 +570,7 @@ logger.debug("Attempting finalization retry for model={}", spec.model)
 | `AgentRunSpec` 传 `reasoning_effort`/`max_tokens` | upstream 已存在这两个字段 | 兼容。若未来 upstream 重命名，需同步调整 `SubagentManager._run_subagent()` 的赋值 |
 | 使用 `ProviderSnapshot` | `nanobot/providers/factory.py` 已在 replay branch 中存在 | 该文件在 `origin/main` 不存在，是 replay branch 引入。若 upstream main 后续以不同 API 引入 provider snapshot，需要 adapter 层 |
 | `build_provider_snapshot` / `make_provider` | 同上 | 同上。已增加 `ImportError` fallback：factory 不可用时独立 provider 退化为复用 main provider，行为等同于 upstream 默认 |
-| `config.resolve_preset()` 语义 | upstream `Config` 已有该方法，支持 exact + unique prefix | 兼容 |
+| `config.resolve_preset()` 语义 | upstream `Config` 已有该方法，支持 exact + unique prefix；upstream 同时新增 `nanobot/agent/model_presets.py` 模块提供独立 preset resolution | 兼容 |
 | `_apply_provider_snapshot()` 调用 `set_provider()` | upstream 已有该方法 | 兼容。条件化分支是新增逻辑，不影响未配置 `subagent_model` 的路径 |
 
 ### 7.2 nanobot 3.0/4.0 replay 建议

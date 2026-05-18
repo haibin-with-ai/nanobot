@@ -5,7 +5,7 @@
 本 spec 对应 Plan7（`2026-05-18-pack7-tools-workspace-behavior.md`），目标是在 upstream 工作树（`sync-upstream-2026-05-replay`）中 replay fork 的工具层与工作空间操作行为差异，同时保持最小侵入、面向复用、优雅实现。
 
 范围严格限定为：
-- `grep` 搜索工具（ripgrep 优先 + Python fallback）
+- `grep` 搜索工具（ripgrep 优先 + 系统 grep fallback）
 - `extra_allowed_paths` 公共配置的废弃与内部机制替代
 - `MessageTool` 的 deliver / suppress 语义补全
 - 工作空间 / 临时 / 输出路径策略的测试加固
@@ -16,13 +16,13 @@
 
 ## 2. 行为需求
 
-### 2.1 Grep — ripgrep 优先，Python fallback 无感
+### 2.1 Grep — ripgrep 优先，系统 grep fallback
 
 | # | 需求 | 优先级 |
 |---|------|--------|
 | G1 | 当系统存在可执行 `rg` 时，`grep` 工具优先调用 ripgrep（`rg --json`）进行内容搜索 | Must |
-| G2 | `rg` 不可用时，**无感 fallback** 到现有纯 Python 实现；grep 功能不得完全不可用 | Must |
-| G3 | ripgrep 输出与 Python fallback 输出在格式、分页、截断、统计注释上保持兼容 | Must |
+| G2 | `rg` 不可用时，fallback 到系统 `grep`（`/usr/bin/grep` 或 `grep` in PATH）；grep 功能不得完全不可用 | Must |
+| G3 | ripgrep 输出与系统 grep 输出在格式、分页、截断、统计注释上保持兼容 | Must |
 | G4 | 支持 `content` / `files_with_matches` / `count` 三种 `output_mode` | Must |
 | G5 | 支持 `glob` / `type` / `case_insensitive` / `fixed_strings` / `context_before` / `context_after` / `limit` / `offset` | Must |
 | G6 | 保持 `_MAX_FILE_BYTES`（2 MB）和 binary 跳过行为 | Must |
@@ -85,7 +85,7 @@
 
 以下文件在 replay worktree 中存在并已 inspect：
 
-- `nanobot/agent/tools/search.py` ✅ — 纯 Python grep，无 rg 支持
+- `nanobot/agent/tools/search.py` ✅ — 原有内联搜索实现，无 rg 支持
 - `nanobot/agent/tools/filesystem.py` ✅ — `_FsTool` 含 `extra_allowed_dirs`
 - `nanobot/agent/tools/message.py` ✅ — ContextVar 驱动的 per-turn tracking
 - `nanobot/agent/tools/spawn.py` ✅ — 无 `timeout_seconds`
@@ -123,7 +123,7 @@
 
 - 继承链：`GrepTool -> _SearchTool -> _FsTool -> Tool`
 - `_iter_files()` 使用 `os.walk()`，`_IGNORE_DIRS` 来自 `ListDirTool`
-- `execute()` 内联实现完整 Python 搜索逻辑：regex 编译、binary detection（`null_byte` heuristic）、大文件跳过、context lines、pagination、truncation notes
+- `execute()` 内联实现完整搜索逻辑：regex 编译、binary detection（`null_byte` heuristic）、大文件跳过、context lines、pagination、truncation notes
 - **无 subprocess / shutil.which / ripgrep 引用**
 - `_MAX_FILE_BYTES = 2_000_000`，`_MAX_RESULT_CHARS = 128_000`
 - `_display_path()` 优先用 `self._workspace` relative，否则用搜索 root relative
@@ -193,14 +193,15 @@ return cls(
 
 ## 4. 技术方案
 
-### 4.1 ripgrep 优先 + Python fallback
+### 4.1 ripgrep 优先 + 系统 grep fallback
 
 #### 4.1.1 设计原则
 
 - **不魔改工具架构**：`GrepTool` 保持继承 `_SearchTool -> _FsTool`，schema 不变。
-- **无感 fallback**：`rg` 检测在 `execute()` 入口完成；不可用或执行失败时立即回退到现有 Python 逻辑，不抛异常给上层。
-- **输出兼容**：ripgrep 的 `--json` 输出经解析后，复用与 Python 路径完全相同的格式化、分页、截断、统计注释逻辑。
-- **性能隔离**：rg 调用与 Python 搜索不在同一数据结构里混用；rg 负责产生 raw matches，Python 负责 format。
+- **系统 grep fallback**：`rg` 检测在 `execute()` 入口完成；不可用时调用系统 `grep`（通过 `asyncio.create_subprocess_exec`），不再维护纯 Python 搜索实现。系统 grep 在所有 POSIX 环境（Linux/macOS）标配，无需额外安装，性能远超纯 Python 逐行遍历。
+- **输出兼容**：ripgrep 的 `--json` 输出与系统 grep 的 `file:line:content` 输出，经解析后复用完全相同的格式化、分页、截断、统计注释逻辑。
+- **统一格式化**：rg 和 grep 都输出 `list[SearchMatch]`，由 `_format_search_results` 统一处理。只维护一套格式化逻辑。
+- **极端错误**：若系统 `rg` 和 `grep` 均不可用，raise 明确错误而不是静默 fallback。
 
 #### 4.1.2 实现位置
 
@@ -223,6 +224,9 @@ class SearchMatch:
 def _rg_available() -> bool:
     return shutil.which("rg") is not None
 
+def _grep_available() -> bool:
+    return shutil.which("grep") is not None
+
 def _rg_params_supported(type_key: str | None) -> bool:
     """Return True if all query parameters are within rg's supported subset."""
     if type_key and type_key not in _TYPE_GLOB_MAP:
@@ -235,7 +239,7 @@ def _format_search_results(
     limit: int,
     offset: int,
 ) -> str:
-    """Single formatter used by both rg and Python paths.
+    """Single formatter used by rg, grep, and any future search backend.
 
     mode: 'content' | 'files_with_matches' | 'count'
     Pagination, truncation notes, and sort order are applied here and only here.
@@ -253,8 +257,8 @@ async def _run_rg_search(
     fixed_strings: bool,
     context_before: int,
     context_after: int,
-) -> list[SearchMatch] | None:
-    """Return parsed SearchMatch list if rg succeeds, else None to trigger fallback."""
+) -> list[SearchMatch]:
+    """Return parsed SearchMatch list from rg --json output."""
 
 async def _parse_rg_json(
     self,
@@ -265,6 +269,42 @@ async def _parse_rg_json(
     context_after: int,
 ) -> list[SearchMatch]:
     """Parse rg --json lines into structured SearchMatch objects."""
+
+async def _run_grep_search(
+    self,
+    target: Path,
+    pattern: str,
+    root: Path,
+    *,
+    glob: str | None,
+    type_key: str | None,
+    case_insensitive: bool,
+    fixed_strings: bool,
+    context_before: int,
+    context_after: int,
+    limit: int,
+    offset: int,
+    output_mode: str,
+) -> list[SearchMatch]:
+    """Run system grep via asyncio subprocess and parse output into SearchMatch list.
+
+    grep args mapping:
+      -rn  -> recursive + line numbers
+      -i   -> case_insensitive
+      -l   -> files_with_matches mode
+      -c   -> count mode
+      --include -> glob filtering
+    Output format: file:line:content, parsed into SearchMatch shared with rg path.
+    """
+
+def _parse_grep_output(
+    self,
+    stdout: bytes,
+    root: Path,
+    *,
+    output_mode: str,
+) -> list[SearchMatch]:
+    """Parse grep `file:line:content` output into structured SearchMatch objects."""
 ```
 
 #### 4.1.3 rg 命令构造
@@ -291,7 +331,7 @@ cmd.append(pattern)
 cmd.append(str(target))
 ```
 
-**关键决策**：`type` 参数在 Python 实现中映射为 glob tuple；在 rg 中通过 `-g` 多传入实现相同过滤。rg 是否适用的判断在 `execute()` 入口处统一完成（`_rg_available() and _rg_params_supported(type_key)`），不在 rg 路径内部再做退出决策。
+**关键决策**：`type` 参数映射为 glob tuple；在 rg 中通过 `-g` 多传入实现相同过滤，在 grep 中通过 `--include` 实现。rg 是否适用的判断在 `execute()` 入口处统一完成（`_rg_available() and _rg_params_supported(type_key)`）；rg 不可用时直接进入 grep 路径，不在 rg 路径内部再做退出决策。
 
 #### 4.1.4 rg JSON 解析
 
@@ -300,7 +340,7 @@ rg `--json` 输出每行是一个 JSON object，type 包括 `begin`、`match`、
 `_parse_rg_json` 解析逻辑：
 1. 按 file 分组收集 matches
 2. 每个 match 的 lines.text 取匹配行，配合 `submatches` 中的 start/end 做高亮（可选）
-3. `context` 行与 Python 实现中 `context_before`/`context_after` 语义一致
+3. `context` 行与原有实现中 `context_before`/`context_after` 语义一致
 4. 跳过 binary files（rg 不会搜索 binary，但会输出 `binary` type，忽略即可）
 5. 大文件由 `--max-filesize` 控制，rg 自动跳过，需统计 skipped_large（从 summary 或 stderr 提取）
 
@@ -316,31 +356,49 @@ async def execute(self, pattern, path=".", ...):
     if not (target.is_dir() or target.is_file()):
         return f"Error: path is not a file or directory: {path}"
 
-    # 单一决策点：rg 可用且所有参数在 rg 支持范围内
+    # 决策点 1：rg 可用且参数支持
     use_rg = _rg_available() and _rg_params_supported(type_key)
     if use_rg:
-        rg_matches = await self._run_rg_search(
+        try:
+            rg_matches = await self._run_rg_search(
+                target, pattern, root,
+                glob=glob, type_key=type_key,
+                case_insensitive=case_insensitive,
+                fixed_strings=fixed_strings,
+                context_before=context_before,
+                context_after=context_after,
+            )
+            return _format_search_results(
+                rg_matches, mode=output_mode, limit=limit, offset=offset
+            )
+        except SearchBackendError:
+            pass  # fallback to grep
+
+    # 决策点 2：rg 不可用或失败，fallback 到系统 grep
+    if _grep_available():
+        grep_matches = await self._run_grep_search(
             target, pattern, root,
             glob=glob, type_key=type_key,
             case_insensitive=case_insensitive,
             fixed_strings=fixed_strings,
             context_before=context_before,
             context_after=context_after,
+            limit=limit,
+            offset=offset,
+            output_mode=output_mode,
         )
-        if rg_matches is not None:
-            return _format_search_results(
-                rg_matches, mode=output_mode, limit=limit, offset=offset
-            )
+        return _format_search_results(
+            grep_matches, mode=output_mode, limit=limit, offset=offset
+        )
 
-    # Python path：构建 list[SearchMatch] 后统一格式化
-    py_matches = []
-    ...existing Python search logic, emitting SearchMatch objects...
-    return _format_search_results(
-        py_matches, mode=output_mode, limit=limit, offset=offset
+    # 极端情况：rg 和 grep 均不可用
+    raise RuntimeError(
+        "No search backend available: install ripgrep (`rg`) or ensure "
+        "system `grep` is in PATH."
     )
 ```
 
-**向前兼容标注**：`_rg_available()` 使用模块级 `functools.lru_cache(maxsize=1)`，避免每次 grep 调用都 `which`。若用户环境中 `rg` 后续被卸载，进程生命周期内仍视为可用（直到重启）。这是可接受的 trade-off，因为工具实例通常在 loop 生命周期内复用。
+**向前兼容标注**：`_rg_available()` 和 `_grep_available()` 使用模块级 `functools.lru_cache(maxsize=1)`，避免每次搜索都 `which`。若用户环境中 `rg` 后续被卸载，进程生命周期内仍视为可用（直到重启）。这是可接受的 trade-off，因为工具实例通常在 loop 生命周期内复用。若 rg 在运行时消失，首次调用失败后会进入 grep fallback（`_run_rg_search` 内部捕获异常并 raise `SearchBackendError`，由 `execute()` 进入 grep 路径）。
 
 #### 4.1.6 错误处理
 
@@ -350,7 +408,9 @@ rg 调用可能失败的情况：
 - `FileNotFoundError`（rg 被删除）
 - JSON 解析失败
 
-以上任一情况，`_run_rg_search` 返回 `None`（`list[SearchMatch] | None`），由 `execute()` 中的统一 fallback 路径接管，无感 fallback。格式化失败（如 mode 不合法）不属于 rg 路径的错误，由 `_format_search_results` 统一处理。
+以上任一情况，`_run_rg_search` 捕获后 raise `SearchBackendError`，由 `execute()` 捕获并进入系统 grep fallback 路径。若 grep 同样失败或不可用，最终 raise 明确错误。格式化失败（如 mode 不合法）不属于搜索后端错误，由 `_format_search_results` 统一处理。
+
+系统 grep 调用失败的情况与 rg 类似，但输出解析更简单（`file:line:content` 格式）。grep 路径同样设置 60s timeout，返回码 1（无 match）视为正常空结果。
 
 ### 4.2 `extra_allowed_paths` 不复活的决策记录
 
@@ -364,6 +424,8 @@ rg 调用可能失败的情况：
 **决策**：Spec7 **不实现** `extra_allowed_paths` 公共配置，也不添加兼容别名。若未来有合法需求需要用户配置额外允许目录，应在独立的 config/security pack 中重新设计，而非复活 fork 已废弃的字段。
 
 ### 4.3 MessageTool deliver/suppress 语义和边界
+
+> **Upstream 已有**：`MessageTool._sent_in_turn_var` ContextVar 已在 upstream 实现（第 76 行），suppress 语义已正确。无需修改实现代码，仅补充缺失的边界测试（same-target、cross-target、callback failure、media 累加）。
 
 #### 4.3.1 当前语义矩阵
 
@@ -534,7 +596,7 @@ Upstream 已实现完整的 shell 边界：
 
 | 修改点 | 侵入度 | 说明 |
 |--------|--------|------|
-| `search.py` 新增 `SearchMatch`、`_format_search_results`、`_run_rg_search`、`_parse_rg_json`、`_rg_params_supported` | 中 | 纯新增，不删除现有方法；`execute()` 在单一决策点判断 rg 是否可用+参数是否支持，rg 与 Python 均输出 `list[SearchMatch]`，再由统一 formatter 生成字符串 |
+| `search.py` 新增 `SearchMatch`、`_format_search_results`、`_run_rg_search`、`_parse_rg_json`、`_run_grep_search`、`_parse_grep_output`、`_rg_params_supported` | 中 | 纯新增；`execute()` 先判断 rg，再判断 grep；rg/grep 均输出 `list[SearchMatch]`，由统一 formatter 生成字符串；删除纯 Python 内联搜索逻辑 |
 | `spawn.py` 新增 `timeout_seconds` 参数 | 低 | schema + execute 参数透传 |
 | `subagent.py` spawn / `_run_subagent` 新增 timeout | 低 | 签名扩展 + 外层 `asyncio.wait_for` |
 | `message.py` | **无修改**（仅补测试） | 当前实现已满足语义 |
@@ -549,7 +611,7 @@ Upstream 已实现完整的 shell 边界：
 
 | 测试文件 | 测试内容 | 动作 |
 |----------|----------|------|
-| `tests/tools/test_search_tools.py` | rg 可用时优先调用 rg；rg 不可用时 fallback；输出格式兼容；glob/type 过滤；context lines；pagination；binary/large skip | 追加 |
+| `tests/tools/test_search_tools.py` | rg 可用时优先调用 rg；rg 不可用时 fallback 到系统 grep；输出格式兼容；glob/type 过滤；context lines；pagination；binary/large skip；rg/grep 均不可用时报错 | 追加 |
 | `tests/tools/test_message_tool_suppress.py` | cross-target 不 suppress；callback fail 不 suppress；media tracking；default context；websocket chat_id mismatch | 追加 |
 | `tests/tools/test_exec_security.py` | benign device paths 显式允许 | 追加 |
 | `tests/config/test_config_paths.py` | logs/tmp/workspace explicit 路径策略 | 追加 |
@@ -557,12 +619,14 @@ Upstream 已实现完整的 shell 边界：
 
 ### 6.2 ripgrep 测试策略
 
-**问题**：CI / 开发环境可能无 `rg`。
+**问题**：CI / 开发环境可能无 `rg`，但 POSIX 环境通常有系统 `grep`。
 
 **方案**：
 1. 使用 `pytest.mark.skipif(not shutil.which("rg"), reason="ripgrep not installed")` 包裹 rg-specific 测试。
 2. 对于 rg 输出格式测试，可以 mock `subprocess.run` 返回预录的 `rg --json` 输出，验证 `_parse_rg_json` 正确性，这样无需真实 rg。
-3. fallback 测试：mock `_rg_available()` 返回 `False`（或 patch `shutil.which`），验证走 Python 路径。
+3. grep fallback 测试：mock `shutil.which` 让 `rg` 不可用但 `grep` 可用，验证 `_run_grep_search` 被调用且输出格式正确。
+4. 双不可用测试：mock `shutil.which` 让 `rg` 和 `grep` 都不可用，验证 `execute()` raise 明确错误。
+5. 所有后端（rg/grep）的格式化测试复用同一套 `_format_search_results` 断言。
 
 ### 6.3 MessageTool 测试策略
 
@@ -580,7 +644,7 @@ Upstream 已实现完整的 shell 边界：
 
 | 决策 | 兼容性影响 | 缓解措施 |
 |------|-----------|----------|
-| rg 输出格式与 Python 严格一致 | 未来 rg 版本 `--json` schema 变化可能破坏解析 | 解析逻辑集中在一个方法；rg 失败 fallback 到 Python；spec 要求在 rg 解析异常时返回 `None` fallback |
+| rg 输出格式与 grep 严格一致 | 未来 rg 版本 `--json` schema 变化可能破坏解析 | 解析逻辑集中在一个方法；rg 失败 fallback 到系统 grep；spec 要求在 rg 解析异常时进入 grep fallback |
 | `timeout_seconds` 新增为可选参数 | 旧调用（无 timeout）行为不变 | 参数默认 `None`，不传时不加 `asyncio.wait_for` |
 | `_rg_available()` 使用模块级 `lru_cache` | 进程生命周期内 rg 可用性不变 | 可接受；如需热切换，可改为无缓存检查，但性能有损 |
 
@@ -598,10 +662,11 @@ Upstream 已实现完整的 shell 边界：
    - 在 `tests/tools/test_exec_security.py` 追加 benign device path 测试
    - **运行测试，确认 baseline（部分新测试预期失败或跳过）**
 
-2. **Phase 2 — ripgrep 集成**
-   - 实现模块级 `_rg_available()`、`_format_search_results()`、`_run_rg_search()`、`_parse_rg_json()`、`_rg_params_supported()`
-   - 修改 `GrepTool.execute()` 统一 rg 决策点与 fallback 路径
-   - 在 `tests/tools/test_search_tools.py` 追加 rg 与 fallback 测试
+2. **Phase 2 — ripgrep 集成 + grep fallback**
+   - 实现模块级 `_rg_available()`、`_grep_available()`、`_format_search_results()`、`_run_rg_search()`、`_parse_rg_json()`、`_run_grep_search()`、`_parse_grep_output()`、`_rg_params_supported()`
+   - 修改 `GrepTool.execute()`：rg 优先，rg 不可用时 fallback 到系统 grep，两者均不可用时 raise 错误
+   - 删除原有的纯 Python 内联搜索逻辑
+   - 在 `tests/tools/test_search_tools.py` 追加 rg 优先、grep fallback、双不可用报错测试
    - 运行测试，修复输出格式差异
 
 3. **Phase 3 — Spawn timeout**
@@ -626,7 +691,7 @@ Upstream 已实现完整的 shell 边界：
 
 ## 9. 关键设计决策汇总
 
-1. **ripgrep 失败无感 fallback**：rg 调用任何异常（包括缺失、返回码非 1/0、JSON 解析失败）均返回 `None`，由 `execute()` 回退到 Python。这是"最小侵入"的核心体现。
+1. **ripgrep 失败 fallback 到系统 grep**：rg 调用任何异常（包括缺失、返回码非 1/0、JSON 解析失败）由 `execute()` 捕获并进入系统 grep 路径。系统 grep 在所有 POSIX 环境（Linux/macOS）标配，无需额外安装，性能远超纯 Python 逐行遍历。若 grep 同样不可用，raise 明确错误。不再维护纯 Python 搜索实现。
 2. **`extra_allowed_paths` 不复活**：fork 自己删了它，upstream 内部机制已覆盖。不添加公共配置，不添加兼容别名。
 3. **MessageTool 以补测试为主**：upstream 语义已实现正确，测试是主要的 deliverable。避免为测试而改实现。
 4. **Spawn timeout 是总超时，不是 LLM 超时**：通过 `_run_subagent` 外层 `asyncio.wait_for` 实现，与 `AgentRunSpec.llm_timeout_s` 保持独立。
@@ -638,4 +703,4 @@ Upstream 已实现完整的 shell 边界：
 1. **rg `--json` 的 `summary` 统计**：不同 rg 版本对 skipped large / binary 的 summary 字段格式是否一致？如果 summary 不可靠，可能需要用 `len(binary)` 和 `len(large)` 在 parse 阶段通过 heuristics 估算，而非精确数字。需在实现时验证。
 2. **Spawn timeout 与 subagent 内部 checkpoint 的交互**：如果 `asyncio.wait_for` 在 `_run_subagent` 外层触发 TimeoutError，subagent 的 `AgentRunner` 内部状态（如 file states、session）是否处于不一致状态？当前 upstream 无 subagent 事务回滚机制，timeout 后状态可能残留。需在测试中观察，并在注释中标注为已知限制。
 3. **MessageTool WebSocket `chat_id` mismatch 的具体错误返回**：当前 `message.py` 中对 `anon-` 前缀的检查逻辑是否存在？plan 提到此场景，但在当前 upstream 代码中未看到显式的 `anon-` 拒绝逻辑。需在实现阶段 inspect message.py 的 channel-specific 路径。如果 upstream 未实现，spec 要求"返回当前错误"可能意味着需要引入一个小检查，需评估其侵入度。
-4. **rg 的 `--max-filesize` 单位**：rg 使用 `--max-filesize` + suffix（如 `2M`），与 Python 实现中的 `_MAX_FILE_BYTES = 2_000_000` 不完全等价（`2M` = 2 * 1024 * 1024 = 2,097,152）。差异可接受，但需在测试中说明。
+4. **rg 的 `--max-filesize` 单位**：rg 使用 `--max-filesize` + suffix（如 `2M`），与原有实现中的 `_MAX_FILE_BYTES = 2_000_000` 不完全等价（`2M` = 2 * 1024 * 1024 = 2,097,152）。差异可接受，但需在测试中说明。
