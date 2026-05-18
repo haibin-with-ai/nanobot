@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates
@@ -80,6 +80,7 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        extra_hooks: list[AgentHook] | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -98,6 +99,7 @@ class SubagentManager:
         self.max_concurrent_subagents = defaults.max_concurrent_subagents
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
+        self._extra_hooks: list[AgentHook] = list(extra_hooks or [])
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -204,13 +206,19 @@ class SubagentManager:
                 if self._llm_wall_timeout_for_session
                 else None
             )
+            subagent_hook = _SubagentHook(task_id, status)
+            hook = (
+                CompositeHook([subagent_hook] + self._extra_hooks)
+                if self._extra_hooks
+                else subagent_hook
+            )
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
                 model=self.model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
-                hook=_SubagentHook(task_id, status),
+                hook=hook,
                 max_iterations_message="Task completed but no final response was generated.",
                 error_message=None,
                 fail_on_tool_error=True,

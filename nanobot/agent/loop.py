@@ -276,6 +276,7 @@ class AgentLoop:
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            extra_hooks=self._extra_hooks,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -354,6 +355,24 @@ class AgentLoop:
             config,
             provider_snapshot_loader,
         )
+
+        rewrite_cfg = config.tools.command_rewrite
+        if rewrite_cfg.enabled:
+            from nanobot.agent.hooks import CommandRewriteHook
+            hooks = extra.setdefault("hooks", [])
+            if not isinstance(hooks, list):
+                hooks = list(hooks) if hooks is not None else []
+                extra["hooks"] = hooks
+            hooks.append(
+                CommandRewriteHook(
+                    enabled=True,
+                    verbose=rewrite_cfg.verbose,
+                    timeout=rewrite_cfg.timeout,
+                    binary_path=rewrite_cfg.binary_path,
+                    path_append=config.tools.exec.path_append,
+                )
+            )
+
         return cls(
             bus=bus,
             provider=provider,

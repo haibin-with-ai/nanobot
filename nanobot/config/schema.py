@@ -264,6 +264,15 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class CommandRewriteConfig(Base):
+    """Configuration for the rtk command rewrite hook."""
+
+    enabled: bool = False
+    verbose: bool = False
+    timeout: float = 5.0
+    binary_path: str = "rtk"
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -278,6 +287,7 @@ class ToolsConfig(Base):
     image_generation: ImageGenerationToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
     )
+    command_rewrite: CommandRewriteConfig = Field(default_factory=CommandRewriteConfig)
     restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
