@@ -7,14 +7,25 @@ import os
 import re
 import secrets
 import string
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import json_repair
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 _ALNUM = string.ascii_letters + string.digits
+
+_CLAUDE_CODE_SYSTEM_BLOCK = {
+    "type": "text",
+    "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+}
+
+_CLAUDE_CODE_BETA_HEADERS = {
+    "anthropic-beta": "token-efficient-tools-2025-02-12",
+}
 
 
 def _gen_tool_id() -> str:
@@ -34,23 +45,34 @@ class AnthropicProvider(LLMProvider):
         api_base: str | None = None,
         default_model: str = "claude-sonnet-4-20250514",
         extra_headers: dict[str, str] | None = None,
+        auth_token: str | None = None,
+        product_mode: str | None = None,
+        credential_store: Any = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self._auth_token = auth_token
+        self._product_mode = product_mode
+        self._credential_store = credential_store
+        self._auth_mode = "oauth" if auth_token is not None else "api_key"
+        self._client = self._build_client()
 
+    def _build_client(self) -> Any:
         from anthropic import AsyncAnthropic
 
         client_kw: dict[str, Any] = {}
-        if api_key:
-            client_kw["api_key"] = api_key
-        if api_base:
-            client_kw["base_url"] = api_base
-        if extra_headers:
-            client_kw["default_headers"] = extra_headers
+        if self._auth_mode == "oauth":
+            client_kw["auth_token"] = self._auth_token
+        elif self.api_key:
+            client_kw["api_key"] = self.api_key
+        if self.api_base:
+            client_kw["base_url"] = self.api_base
+        if self.extra_headers:
+            client_kw["default_headers"] = self.extra_headers
         # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
         client_kw["max_retries"] = 0
-        self._client = AsyncAnthropic(**client_kw)
+        return AsyncAnthropic(**client_kw)
 
     @classmethod
     def _handle_error(cls, e: Exception) -> LLMResponse:
@@ -353,6 +375,16 @@ class AnthropicProvider(LLMProvider):
         return result
 
     @staticmethod
+    def _normalize_tool_names(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for tool in tools:
+            name = tool.get("name", "")
+            normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+            if normalized and normalized[0].isdigit():
+                normalized = "tool_" + normalized
+            tool["name"] = normalized
+        return tools
+
+    @staticmethod
     def _convert_tool_choice(
         tool_choice: str | dict[str, Any] | None,
         thinking_enabled: bool = False,
@@ -433,6 +465,16 @@ class AnthropicProvider(LLMProvider):
                 system, anthropic_msgs, anthropic_tools,
             )
 
+        if self._product_mode == "claude_code" and anthropic_tools:
+            anthropic_tools = self._normalize_tool_names(anthropic_tools)
+
+        if self._product_mode == "claude_code":
+            if not system:
+                system = []
+            elif isinstance(system, str):
+                system = [{"type": "text", "text": system}]
+            system.insert(0, _CLAUDE_CODE_SYSTEM_BLOCK)
+
         max_tokens = max(1, max_tokens)
         thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
 
@@ -472,8 +514,11 @@ class AnthropicProvider(LLMProvider):
             if tc:
                 kwargs["tool_choice"] = tc
 
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
+        extra_headers = dict(self.extra_headers) if self.extra_headers else {}
+        if self._product_mode == "claude_code":
+            extra_headers.update(_CLAUDE_CODE_BETA_HEADERS)
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         return kwargs
 
@@ -544,6 +589,39 @@ class AnthropicProvider(LLMProvider):
         on substring so a future SDK message tweak doesn't break detection."""
         return isinstance(e, ValueError) and "streaming is required" in str(e).lower()
 
+    # ------------------------------------------------------------------
+    # Token refresh
+    # ------------------------------------------------------------------
+
+    async def _ensure_valid_token(self) -> None:
+        """Refresh OAuth token if nearing expiry. Failures are logged, not raised."""
+        if self._auth_mode != "oauth" or self._credential_store is None:
+            return
+        credentials = self._credential_store.load()
+        if not credentials or not credentials.refresh_token:
+            return
+        now_ms = int(time.time() * 1000)
+        if credentials.expires_at - now_ms > 300_000:
+            return
+        try:
+            await asyncio.to_thread(self._update_oauth_token, credentials.refresh_token)
+        except Exception:
+            logger.warning("OAuth token refresh failed, continuing with existing token")
+
+    def _update_oauth_token(self, refresh_token: str) -> None:
+        """Refresh and persist a new OAuth token. On failure, rebuild client anyway."""
+        try:
+            from nanobot.providers.oauth_store import refresh_anthropic_token
+
+            new_credentials = refresh_anthropic_token(refresh_token)
+            self._auth_token = new_credentials.access_token
+            if self._credential_store is not None:
+                self._credential_store.save(new_credentials)
+            self._client = self._build_client()
+        except Exception:
+            logger.warning("OAuth token refresh failed, continuing with existing token")
+            self._client = self._build_client()
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -554,6 +632,7 @@ class AnthropicProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        await self._ensure_valid_token()
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
@@ -591,6 +670,7 @@ class AnthropicProvider(LLMProvider):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        await self._ensure_valid_token()
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,

@@ -71,12 +71,32 @@ def _make_provider_core(
     elif backend == "anthropic":
         from nanobot.providers.anthropic_provider import AnthropicProvider
 
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model, preset=resolved),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
+        if spec and spec.is_oauth:
+            from nanobot.providers.oauth_store import OAuthCredentialStore
+
+            store = OAuthCredentialStore()
+            credentials = store.load()
+            if not credentials:
+                raise ValueError(
+                    f"OAuth credentials not found for '{provider_name}'. "
+                    "Run: nanobot provider login anthropic-claude-code"
+                )
+            provider = AnthropicProvider(
+                api_key=None,
+                api_base=config.get_api_base(model, preset=resolved),
+                default_model=model,
+                extra_headers=p.extra_headers if p else None,
+                auth_token=credentials.access_token,
+                product_mode="claude_code",
+                credential_store=store,
+            )
+        else:
+            provider = AnthropicProvider(
+                api_key=p.api_key if p else None,
+                api_base=config.get_api_base(model, preset=resolved),
+                default_model=model,
+                extra_headers=p.extra_headers if p else None,
+            )
     elif backend == "bedrock":
         from nanobot.providers.bedrock_provider import BedrockProvider
 
