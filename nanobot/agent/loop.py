@@ -207,6 +207,7 @@ class AgentLoop:
         subagent_max_tokens: int | None = None,
         model_alias_resolver: Callable | None = None,
         subagent_provider_snapshot: Any | None = None,
+        context_pruning: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -331,6 +332,7 @@ class AgentLoop:
             model=self.model,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
+        self._context_pruning = context_pruning
         self._active_preset: str | None = None
         if model_preset:
             self.set_model_preset(model_preset, publish_update=False)
@@ -445,6 +447,7 @@ class AgentLoop:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
+            context_pruning=defaults.context_pruning,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
@@ -866,6 +869,7 @@ class AgentLoop:
                     session.key if session is not None else session_key,
                     metadata=(session.metadata if session is not None else None),
                 ),
+                context_pruning=self._context_pruning,
             ))
         finally:
             reset_file_states(file_state_token)

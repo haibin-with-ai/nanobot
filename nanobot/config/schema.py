@@ -107,6 +107,31 @@ class ModelPresetConfig(Base):
         )
 
 
+class SoftTrimConfig(Base):
+    """Configuration for soft trimming oversized tool results."""
+
+    enabled: bool = False
+    chunk_size: int = 16_000
+    chunk_count: int = 3
+
+
+class HardClearConfig(Base):
+    """Configuration for hard-clearing extremely large tool results."""
+
+    enabled: bool = True
+    ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class ContextPruningConfig(Base):
+    """Configuration for context pruning of transient tool results."""
+
+    enabled: bool = False
+    keep_last_assistants: int = 3
+    soft_trim: SoftTrimConfig = Field(default_factory=SoftTrimConfig)
+    hard_clear: HardClearConfig = Field(default_factory=HardClearConfig)
+    context_budget_multiplier: int = 4
+
+
 class SubagentDefaults(Base):
     """Default configuration for subagent spawns."""
 
@@ -165,6 +190,7 @@ class AgentDefaults(Base):
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
     subagent: SubagentDefaults = Field(default_factory=SubagentDefaults)
+    context_pruning: ContextPruningConfig = Field(default_factory=ContextPruningConfig)
 
 
 class AgentsConfig(Base):

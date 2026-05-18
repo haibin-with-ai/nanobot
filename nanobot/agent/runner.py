@@ -14,7 +14,9 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.pruner import ContextPruner
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.schema import ContextPruningConfig
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
     build_file_edit_end_event,
@@ -93,6 +95,7 @@ class AgentRunSpec:
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
+    context_pruning: ContextPruningConfig | None = None
 
 
 @dataclass(slots=True)
@@ -270,7 +273,14 @@ class AgentRunner:
                 # may repair or compact historical messages for the model, but
                 # those synthetic edits must not shift the append boundary used
                 # later when the caller saves only the new turn.
-                messages_for_model = self._drop_orphan_tool_results(messages)
+                # Context pruning: trim oversized tool results before governance
+                if spec.context_pruning and spec.context_pruning.enabled:
+                    pruner = ContextPruner(spec.context_pruning)
+                    context_window_chars = spec.max_tool_result_chars * spec.context_pruning.context_budget_multiplier
+                    messages_for_model = pruner.prune(messages, context_window_chars=context_window_chars)
+                else:
+                    messages_for_model = messages
+                messages_for_model = self._drop_orphan_tool_results(messages_for_model)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
                 messages_for_model = self._microcompact(messages_for_model)
                 messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
