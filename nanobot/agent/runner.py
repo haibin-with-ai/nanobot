@@ -290,6 +290,7 @@ class AgentRunner:
                 except Exception:
                     messages_for_model = messages
             context = AgentHookContext(iteration=iteration, messages=messages)
+            context.model = spec.model
             await hook.before_iteration(context)
             response, call_elapsed_ms = await self._request_model(spec, messages_for_model, hook, context)
             llm_elapsed_ms += call_elapsed_ms
@@ -693,6 +694,8 @@ class AgentRunner:
         # (NANOBOT_STREAM_IDLE_TIMEOUT_S). Do not also apply the outer wall-clock
         # LLM timeout here, or healthy long reasoning streams can be killed just
         # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
+        preview = self._last_message_preview(messages)
+        logger.info("LLM request → model={} messages={} last={!r}", spec.model, len(messages), preview)
         outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
         start = time.monotonic()
         try:
@@ -714,6 +717,19 @@ class AgentRunner:
                 error_kind="timeout",
             ), elapsed_ms
         call_elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
+        logger.info(
+            "LLM response ← model={} finish_reason={} usage={} elapsed_ms={}",
+            spec.model,
+            response.finish_reason,
+            response.usage,
+            call_elapsed_ms,
+        )
+        if response.tool_calls:
+            logger.info(
+                "LLM tool_calls model={} tools={}",
+                spec.model,
+                [tc.name for tc in response.tool_calls],
+            )
         if progress_state and progress_state.get("reasoning_open"):
             await hook.emit_reasoning_end()
         return response, call_elapsed_ms
@@ -730,6 +746,23 @@ class AgentRunner:
         response = await self.provider.chat_with_retry(**kwargs)
         elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
         return response, elapsed_ms
+
+    @staticmethod
+    def _last_message_preview(messages: list[dict[str, Any]], limit: int = 256) -> str:
+        if not messages:
+            return ""
+        content = messages[-1].get("content", "")
+        if isinstance(content, list):
+            text = ""
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    break
+            content = text
+        preview = str(content).replace("\n", " ").strip()
+        if len(preview) > limit:
+            preview = preview[: limit - 3] + "..."
+        return preview
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:

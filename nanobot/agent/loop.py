@@ -203,6 +203,10 @@ class AgentLoop:
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        subagent_reasoning_effort: str | None = None,
+        subagent_max_tokens: int | None = None,
+        model_alias_resolver: Callable | None = None,
+        subagent_provider_snapshot: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -277,7 +281,15 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
             extra_hooks=self._extra_hooks,
+            reasoning_effort=subagent_reasoning_effort,
+            max_tokens=subagent_max_tokens,
+            model_alias_resolver=model_alias_resolver,
         )
+        _subagent_snapshot = subagent_provider_snapshot
+        self._subagent_has_independent_provider = False
+        if _subagent_snapshot is not None:
+            self.subagents.set_provider_snapshot(_subagent_snapshot)
+            self._subagent_has_independent_provider = True
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
         self._running = False
@@ -328,6 +340,10 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+    @staticmethod
+    def _llm_logs_dir(workspace: Path) -> Path:
+        return workspace / "llm_logs"
+
     @classmethod
     def from_config(
         cls,
@@ -356,6 +372,32 @@ class AgentLoop:
             provider_snapshot_loader,
         )
 
+        def _resolve_model_alias(alias: str) -> str:
+            if "/" in alias:
+                return alias
+            preset = config.resolve_preset(alias)
+            return preset.model
+
+        extra["model_alias_resolver"] = _resolve_model_alias
+
+        subagent_provider_snapshot = None
+        if defaults.subagent.model:
+            try:
+                from nanobot.providers.factory import build_provider_snapshot
+                if "/" in defaults.subagent.model:
+                    from nanobot.config.schema import ModelPresetConfig
+                    subagent_provider_snapshot = build_provider_snapshot(
+                        config,
+                        preset=ModelPresetConfig(model=defaults.subagent.model),
+                    )
+                else:
+                    subagent_provider_snapshot = build_provider_snapshot(
+                        config, preset=config.resolve_preset(defaults.subagent.model)
+                    )
+            except ImportError:
+                subagent_provider_snapshot = None
+        extra["subagent_provider_snapshot"] = subagent_provider_snapshot
+
         rewrite_cfg = config.tools.command_rewrite
         if rewrite_cfg.enabled:
             from nanobot.agent.hooks import CommandRewriteHook
@@ -372,6 +414,17 @@ class AgentLoop:
                     path_append=config.tools.exec.path_append,
                 )
             )
+
+        # TraceHook: main agent trace file
+        from nanobot.agent.hooks import TraceHook
+        llm_logs_dir = cls._llm_logs_dir(config.workspace_path)
+        session_key = extra.get("session_key", "default")
+        trace_path = llm_logs_dir / f"main-{session_key}.trace.jsonl"
+        hooks = extra.setdefault("hooks", [])
+        if not isinstance(hooks, list):
+            hooks = list(hooks) if hooks is not None else []
+            extra["hooks"] = hooks
+        hooks.append(TraceHook(trace_file=trace_path))
 
         return cls(
             bus=bus,
@@ -398,6 +451,8 @@ class AgentLoop:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
+            subagent_reasoning_effort=defaults.subagent.reasoning_effort,
+            subagent_max_tokens=defaults.subagent.max_tokens,
             **extra,
         )
 
@@ -421,7 +476,8 @@ class AgentLoop:
         self.model = model
         self.context_window_tokens = context_window_tokens
         self.runner.provider = provider
-        self.subagents.set_provider(provider, model)
+        if not self._subagent_has_independent_provider:
+            self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self.dream.set_provider(provider, model)
         self._provider_signature = snapshot.signature

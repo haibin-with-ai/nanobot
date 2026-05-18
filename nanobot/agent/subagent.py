@@ -81,6 +81,9 @@ class SubagentManager:
         max_iterations: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         extra_hooks: list[AgentHook] | None = None,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+        model_alias_resolver: Callable[[str], str] | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -103,6 +106,22 @@ class SubagentManager:
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        self.reasoning_effort = reasoning_effort
+        self.max_tokens = max_tokens
+        self._model_alias_resolver = model_alias_resolver
+        self._independent_provider = False
+
+    def set_provider_snapshot(self, snapshot: Any | None = None) -> None:
+        """Swap to an independent provider snapshot (e.g. subagent-specific model)."""
+        if snapshot is not None:
+            self.provider = snapshot.provider
+            self.model = snapshot.model
+            self._independent_provider = True
+            self.runner = AgentRunner(self.provider)
+
+    @property
+    def has_independent_provider(self) -> bool:
+        return self._independent_provider
 
     def _subagent_tools_config(self) -> ToolsConfig:
         """Build a ToolsConfig scoped for subagent use."""
@@ -142,6 +161,7 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         origin_message_id: str | None = None,
+        model: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -157,7 +177,7 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id)
+            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id, model)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -184,6 +204,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: SubagentStatus,
         origin_message_id: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -207,15 +228,32 @@ class SubagentManager:
                 else None
             )
             subagent_hook = _SubagentHook(task_id, status)
+            # Per-spawn TraceHook for independent llm_logs
+            per_spawn_hooks = list(self._extra_hooks)
+            if self.workspace:
+                from nanobot.agent.hooks import TraceHook
+                llm_logs_dir = self.workspace / "llm_logs"
+                trace_path = llm_logs_dir / f"{task_id}.trace.jsonl"
+                per_spawn_hooks.append(TraceHook(trace_file=trace_path))
             hook = (
-                CompositeHook([subagent_hook] + self._extra_hooks)
-                if self._extra_hooks
+                CompositeHook([subagent_hook] + per_spawn_hooks)
+                if per_spawn_hooks
                 else subagent_hook
             )
+            run_model = self.model
+            if model is not None:
+                if self._model_alias_resolver is not None:
+                    try:
+                        run_model = self._model_alias_resolver(model)
+                    except ValueError:
+                        logger.warning("Unknown model alias '{}' for subagent, using raw string", model)
+                        run_model = model
+                else:
+                    run_model = model
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
-                model=self.model,
+                model=run_model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
@@ -225,6 +263,8 @@ class SubagentManager:
                 checkpoint_callback=_on_checkpoint,
                 session_key=sess_key,
                 llm_timeout_s=llm_timeout,
+                reasoning_effort=self.reasoning_effort,
+                max_tokens=self.max_tokens,
             ))
             status.phase = "done"
             status.stop_reason = result.stop_reason

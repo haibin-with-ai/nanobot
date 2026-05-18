@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     tool_parameters_schema(
         task=StringSchema("The task for the subagent to complete"),
         label=StringSchema("Optional short label for the task (for display)"),
+        model=StringSchema("Optional model override for this subagent"),
         required=["task"],
     )
 )
@@ -58,7 +59,7 @@ class SpawnTool(Tool, ContextAware):
             "and use a dedicated subdirectory when helpful."
         )
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, task: str, label: str | None = None, model: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         running = self._manager.get_running_count()
         limit = self._manager.max_concurrent_subagents
@@ -71,6 +72,7 @@ class SpawnTool(Tool, ContextAware):
         return await self._manager.spawn(
             task=task,
             label=label,
+            model=model,
             origin_channel=self._origin_channel.get(),
             origin_chat_id=self._origin_chat_id.get(),
             session_key=self._session_key.get(),

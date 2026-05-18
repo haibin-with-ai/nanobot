@@ -107,6 +107,14 @@ class ModelPresetConfig(Base):
         )
 
 
+class SubagentDefaults(Base):
+    """Default configuration for subagent spawns."""
+
+    model: str | None = None
+    reasoning_effort: str | None = None
+    max_tokens: int | None = None
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -156,6 +164,7 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    subagent: SubagentDefaults = Field(default_factory=SubagentDefaults)
 
 
 class AgentsConfig(Base):
