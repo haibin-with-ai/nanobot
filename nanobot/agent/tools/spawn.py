@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware, RequestContext
-from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import IntegerSchema, StringSchema, tool_parameters_schema
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
@@ -18,6 +18,11 @@ if TYPE_CHECKING:
         task=StringSchema("The task for the subagent to complete"),
         label=StringSchema("Optional short label for the task (for display)"),
         model=StringSchema("Optional model override for this subagent"),
+        timeout_seconds=IntegerSchema(
+            "Optional maximum time in seconds for the subagent to complete. "
+            "If exceeded, the subagent is cancelled.",
+            minimum=1,
+        ),
         required=["task"],
     )
 )
@@ -59,7 +64,7 @@ class SpawnTool(Tool, ContextAware):
             "and use a dedicated subdirectory when helpful."
         )
 
-    async def execute(self, task: str, label: str | None = None, model: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, task: str, label: str | None = None, model: str | None = None, timeout_seconds: int | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         running = self._manager.get_running_count()
         limit = self._manager.max_concurrent_subagents
@@ -77,4 +82,5 @@ class SpawnTool(Tool, ContextAware):
             origin_chat_id=self._origin_chat_id.get(),
             session_key=self._session_key.get(),
             origin_message_id=self._origin_message_id.get(),
+            timeout_seconds=timeout_seconds,
         )

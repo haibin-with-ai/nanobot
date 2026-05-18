@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.config.schema import AgentDefaults
+from nanobot.config.schema import AgentDefaults, _resolve_tool_config_refs
+
+# Ensure ToolsConfig is fully defined before tests instantiate it.
+_resolve_tool_config_refs()
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -446,3 +449,63 @@ async def test_drain_pending_timeout(tmp_path):
         await hang_task
     except asyncio.CancelledError:
         pass
+
+
+def test_spawn_tool_schema_includes_timeout_seconds():
+    """SpawnTool schema should include timeout_seconds parameter."""
+    from nanobot.agent.tools.spawn import SpawnTool
+    tool = SpawnTool(manager=MagicMock())
+    properties = tool.parameters["properties"]
+    assert "timeout_seconds" in properties
+    assert properties["timeout_seconds"]["type"] == "integer"
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_timeout_seconds_applied(tmp_path):
+    """SpawnTool should pass timeout_seconds through to asyncio.wait_for."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.agent.tools.spawn import SpawnTool
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.tools.context import RequestContext
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    mgr._announce_result = AsyncMock()
+
+    async def fake_run(spec):
+        return SimpleNamespace(
+            stop_reason="done",
+            final_content="done",
+            error=None,
+            tool_events=[],
+            messages=[],
+            usage={},
+            had_injections=False,
+            tools_used=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+
+    tool = SpawnTool(mgr)
+    tool.set_context(RequestContext(channel="test", chat_id="c1", session_key="test:c1"))
+
+    with patch("nanobot.agent.subagent.asyncio.wait_for") as mock_wait_for:
+        async def passthrough(coro, timeout=None):
+            return await coro
+        mock_wait_for.side_effect = passthrough
+
+        result = await tool.execute(task="do something", timeout_seconds=60)
+        assert "started" in result
+
+        # Wait for background task
+        await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+        mock_wait_for.assert_awaited_once()
+        assert mock_wait_for.await_args[1]["timeout"] == 60

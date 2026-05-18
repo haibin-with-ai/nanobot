@@ -284,3 +284,10 @@ def test_exec_allows_format_in_url_and_args(command):
     tool = ExecTool()
     result = tool._guard_command(command, "/tmp")
     assert result is None
+
+
+def test_exec_allows_benign_device_paths():
+    """Benign device paths like /dev/null must not be blocked by workspace boundary."""
+    tool = ExecTool()
+    result = tool._guard_command("cat /dev/null", "/tmp")
+    assert result is None

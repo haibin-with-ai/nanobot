@@ -47,3 +47,23 @@ def test_is_default_workspace_distinguishes_default_and_custom_paths() -> None:
     assert is_default_workspace(None) is True
     assert is_default_workspace(Path.home() / ".nanobot" / "workspace") is True
     assert is_default_workspace("~/custom-workspace") is False
+
+
+def test_get_logs_dir_follows_config_path(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    monkeypatch.setattr("nanobot.config.paths.get_config_path", lambda: config_file)
+    assert get_logs_dir() == config_file.parent / "logs"
+
+
+def test_get_workspace_path_explicit_not_repo(tmp_path: Path) -> None:
+    nanobot_repo = Path(__file__).resolve().parents[2]
+    custom = tmp_path / "my-workspace"
+    result = get_workspace_path(str(custom))
+    assert result != nanobot_repo
+    assert result == custom
+
+
+def test_runtime_subdir_tmp_under_config(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    monkeypatch.setattr("nanobot.config.paths.get_config_path", lambda: config_file)
+    assert get_runtime_subdir("tmp") == config_file.parent / "tmp"

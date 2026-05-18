@@ -177,3 +177,48 @@ class TestMessageToolTurnTracking:
             "Do not use this for a normal reply in the current chat"
             in tool.parameters["properties"]["content"]["description"]
         )
+
+    @pytest.mark.asyncio
+    async def test_not_suppress_when_cross_target(self) -> None:
+        tool = MessageTool()
+        from nanobot.agent.tools.context import RequestContext
+        tool.set_context(RequestContext(channel="feishu", chat_id="chat1"))
+        callback = AsyncMock()
+        tool.set_send_callback(callback)
+        await tool.execute(content="hello", channel="other", chat_id="other1")
+        assert not tool._sent_in_turn
+
+    @pytest.mark.asyncio
+    async def test_not_suppress_when_send_callback_fails(self) -> None:
+        tool = MessageTool()
+        from nanobot.agent.tools.context import RequestContext
+        tool.set_context(RequestContext(channel="feishu", chat_id="chat1"))
+        callback = AsyncMock(side_effect=RuntimeError("boom"))
+        tool.set_send_callback(callback)
+        result = await tool.execute(content="hello", channel="feishu", chat_id="chat1")
+        assert "Error sending message" in result
+        assert not tool._sent_in_turn
+
+    @pytest.mark.asyncio
+    async def test_same_target_media_tracks_delivered_paths(self, tmp_path: Path) -> None:
+        tool = MessageTool()
+        from nanobot.agent.tools.context import RequestContext
+        tool.set_context(RequestContext(channel="feishu", chat_id="chat1"))
+        callback = AsyncMock()
+        tool.set_send_callback(callback)
+        media_path = str(tmp_path / "test.png")
+        await tool.execute(content="hello", channel="feishu", chat_id="chat1", media=[media_path])
+        assert tool.turn_delivered_media_paths() == [media_path]
+
+    @pytest.mark.asyncio
+    async def test_omitted_channel_uses_default_context(self) -> None:
+        tool = MessageTool()
+        from nanobot.agent.tools.context import RequestContext
+        tool.set_context(RequestContext(channel="feishu", chat_id="chat1"))
+        callback = AsyncMock()
+        tool.set_send_callback(callback)
+        await tool.execute(content="hello")
+        assert callback.called
+        msg = callback.call_args[0][0]
+        assert msg.channel == "feishu"
+        assert msg.chat_id == "chat1"

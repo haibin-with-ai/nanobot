@@ -162,6 +162,7 @@ class SubagentManager:
         session_key: str | None = None,
         origin_message_id: str | None = None,
         model: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -177,7 +178,7 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id, model)
+            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id, model, timeout_seconds)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -205,6 +206,7 @@ class SubagentManager:
         status: SubagentStatus,
         origin_message_id: str | None = None,
         model: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -250,7 +252,7 @@ class SubagentManager:
                         run_model = model
                 else:
                     run_model = model
-            result = await self.runner.run(AgentRunSpec(
+            run_coro = self.runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
                 model=run_model,
@@ -266,6 +268,10 @@ class SubagentManager:
                 reasoning_effort=self.reasoning_effort,
                 max_tokens=self.max_tokens,
             ))
+            if timeout_seconds and timeout_seconds > 0:
+                result = await asyncio.wait_for(run_coro, timeout=timeout_seconds)
+            else:
+                result = await run_coro
             status.phase = "done"
             status.stop_reason = result.stop_reason
 
