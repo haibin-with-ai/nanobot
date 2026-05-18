@@ -175,7 +175,7 @@
 
 **变更文件**: `nanobot/agent/loop.py`
 
-- `AgentLoop.__init__` 新增参数（或从 `extra` 中弹出）：
+- `AgentLoop.__init__` 通过 `ForkConfig` 接收参数（Spec4 定义的跨 spec 参数打包机制）：
   ```python
   subagent_model: str | None = None,
   subagent_reasoning_effort: str | None = None,
@@ -407,7 +407,9 @@ def _last_message_preview(messages: list[dict[str, Any]], limit: int = 256) -> s
     return preview[:limit]
 ```
 
-#### 4.6.2 _request_model() 日志
+#### 4.6.2 _request_model() 日志（与 Spec3 计时共享同一插桩点）
+
+**重要协调**：Spec3 要求 `_request_model()` 返回值从 `LLMResponse` 变为 `tuple[LLMResponse, int]`（增加 `elapsed_ms`）。本 spec 的日志和 Spec3 的计时在同一个方法内完成，共享同一个 `time.monotonic()` 插桩点。实现时不能各自独立插桩导致重复计时。
 
 在 `kwargs = self._build_request_kwargs(...)` 之后、`coro = self.provider.chat_...` 之前，插入 request log：
 
@@ -446,7 +448,9 @@ if response.tool_calls:
 
 `_request_finalization_retry()` 直接调用 `self.provider.chat_with_retry()`，不走 `_request_model()`。
 
-**方案**：不在 `_request_finalization_retry()` 中添加 request/response preview 日志。仅在 `_request_model()` 中记录。finalization retry 属于 runner 内部容错，不应在正常的 LLM I/O 边界产生混淆日志。
+**方案**（已与 Spec3 计时策略对齐）：
+- **日志**：不在 `_request_finalization_retry()` 中添加 request/response preview 日志。仅在 `_request_model()` 中记录。finalization retry 属于 runner 内部容错，不应在正常的 LLM I/O 边界产生混淆日志。
+- **计时**：但 `_request_finalization_retry()` 内部需独立计时（`time.monotonic()` 包裹），其耗时纳入 Spec3 的 `llm_elapsed_ms` 累加。计时和日志是独立关注点——不因"不写日志"而漏掉计时。
 
 若需要标识 finalization retry 的发生，可单独在调用处（`runner.py` 中发起 retry 的位置）输出一条 debug 或 info：
 ```python

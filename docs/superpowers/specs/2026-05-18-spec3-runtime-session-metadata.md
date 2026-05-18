@@ -244,19 +244,28 @@ def _persist_user_message_early(self, msg: InboundMessage, session: Session, **k
    llm_elapsed_ms: int = 0
    ```
 
-2. **增加 `_timed_request_model()` 包装器**：
+2. **在 `_request_model()` 内部完成计时**（与 Spec5 LLM 日志统一设计）：
+   `_request_model()` 是 provider I/O 的单一边界。不新增 `_timed_request_model()` 包装器，而是直接在 `_request_model()` 内部计时并返回 `(response, elapsed_ms)`：
    ```python
-   async def _timed_request_model(self, spec, messages, hook, context):
+   async def _request_model(self, spec, messages, hook, context) -> tuple[LLMResponse, int]:
        start = time.monotonic()
-       response = await self._request_model(spec, messages, hook, context)
+       # ... existing provider call logic ...
        elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
+       # Spec5 LLM 日志也在此处插入（logger.info request/response preview）
        return response, elapsed_ms
    ```
+   这样 Spec3 的计时和 Spec5 的日志共享同一个插桩点，不会重复计时或绕过日志。
 
-3. **修改 `run()`**：
+3. **`_request_finalization_retry()` 计时策略**（与 Spec5 日志策略协调）：
+   `_request_finalization_retry()` 直接调用 `provider.chat_with_retry()`，不走 `_request_model()`。
+   - **计时**：在 `_request_finalization_retry()` 内部独立计时，其耗时纳入 `llm_elapsed_ms` 累加（保证计时完整性）。
+   - **日志**：不产生完整 request/response preview 日志（避免与 `_request_model()` 日志混淆，这是 Spec5 的决策）。
+   - 计时和日志是两件事，不因"不想多一行日志"而漏掉计时。
+
+4. **修改 `run()`**：
    - 顶部记录 `run_started = time.monotonic()`。
-   - 每次调用 provider 使用 `_timed_request_model()`，累加 `llm_elapsed_ms`。
-   - `_request_finalization_retry()` 同样通过 `_timed_request_model()` 或单独计时。
+   - 每次调用 `_request_model()` 取返回的 `elapsed_ms`，累加 `llm_elapsed_ms`。
+   - `_request_finalization_retry()` 内部独立计时，其耗时也累加 `llm_elapsed_ms`。
    - 返回时：
      ```python
      elapsed_ms = max(0, int((time.monotonic() - run_started) * 1000))
@@ -281,7 +290,10 @@ def _persist_user_message_early(self, msg: InboundMessage, session: Session, **k
    - **方案 A**：扩展 tuple 为 `(final_content, tools_used, messages, stop_reason, had_injections, usage, elapsed_ms, llm_elapsed_ms)`。
    - **方案 B**：把 `AgentRunResult` 整体存入 `TurnContext`。
 
-   **推荐方案 A**（最小侵入）：直接扩展 tuple，修改 `_state_run()` 解包逻辑和 `_save_turn()` 调用。
+   **推荐方案 B**（面向复用）：把 `AgentRunResult` 整体存入 `TurnContext.run_result`，`_state_run()` 从 `ctx.run_result.elapsed_ms` 等属性读取。理由：
+   - Spec5 也会扩展 `AgentRunResult`（加 `model` 字段），继续扩展 tuple 会越来越脆弱，位置参数错一个就全歪。
+   - 方案 B 的侵入度并不比 A 高——`_state_run()` 是唯一调用点，改一处解包逻辑即可。
+   - 未来 upstream 若本身重构为返回 `AgentRunResult` 对象（向前兼容性表中已标注此可能），方案 B 天然对齐。
 
 3. **修改 `_save_turn()` 签名**：
    ```python
@@ -375,8 +387,8 @@ Upstream 已经解耦：
 | `ContextBuilder._build_runtime_context()` | 低 | 增加两个可选参数，内部追加两行文本。|
 | `ContextBuilder.build_messages()` | 低 | 增加两个可选参数，透传。|
 | `AgentRunResult` | 低 | 增加两个 int 字段，默认 0。不影响现有调用方。|
-| `AgentRunner.run()` | 中 | 增加计时逻辑，但不改变外部契约。`_timed_request_model()` 是私有方法包装。|
-| `AgentLoop._run_agent_loop()` | 中 | 扩展返回 tuple。所有调用点仅 `_state_run()` 一处，可控。|
+| `AgentRunner._request_model()` | 中 | 在内部增加计时（与 Spec5 日志共享同一插桩点），返回值从 `LLMResponse` 变为 `tuple[LLMResponse, int]`。所有调用点在 `run()` 内部，可控。|
+| `AgentLoop._run_agent_loop()` | 中 | 改为返回 `AgentRunResult` 对象（方案 B）。所有调用点仅 `_state_run()` 一处，可控。|
 | `TurnContext` | 低 | 增加两个 int 字段。|
 | `AgentLoop._state_run()` | 低 | 解包扩展后的 tuple，写入 TurnContext。|
 | `AgentLoop._save_turn()` | 低 | 增加可选参数，仅在最后一个 assistant message 上写几个键。|
@@ -407,7 +419,8 @@ Upstream 已经解耦：
 | `tests/agent/test_loop_save_turn.py` | `test_persist_user_message_includes_sender_id_and_name` | `_persist_user_message_early()` 把 `sender_id` 和可选 `sender_name` 写入 user message。 |
 | `tests/agent/test_loop_save_turn.py` | `test_runtime_context_stripped_from_persisted_user_message` | 已有测试覆盖，保持不变。 |
 | `tests/agent/test_runner_timing.py`（新建） | `test_run_returns_elapsed_ms_and_llm_elapsed_ms` | `AgentRunner.run()` 返回非负 `elapsed_ms` 和 `llm_elapsed_ms`。 |
-| `tests/agent/test_runner_timing.py`（新建） | `test_timed_request_model_accumulates_llm_elapsed_ms` | Monkeypatch `time.monotonic` 确认多次 provider call 的累加正确。 |
+| `tests/agent/test_runner_timing.py`（新建） | `test_request_model_returns_elapsed_ms` | Monkeypatch `time.monotonic` 确认 `_request_model()` 返回正确 elapsed_ms。 |
+| `tests/agent/test_runner_timing.py`（新建） | `test_run_accumulates_llm_elapsed_ms` | Monkeypatch `time.monotonic` 确认多次 provider call 的累加正确（含 finalization retry 的独立计时）。 |
 | `tests/channels/test_discord_channel.py` | `test_build_inbound_metadata_includes_channel_name_and_sender_name` | `_build_inbound_metadata()` 对 guild message 返回 `channel_name` 和 `sender_name`。 |
 | `tests/channels/test_discord_channel.py` | `test_build_inbound_metadata_omits_channel_name_for_dm` | DM 消息 metadata 中无 `channel_name`。 |
 | `tests/agent/test_context_builder.py`（新建或已有） | `test_runtime_context_includes_channel_name_and_sender_name` | `_build_runtime_context()` 输出包含 `Channel Name` 和 `Sender Name`。 |
@@ -450,7 +463,7 @@ def test_assistant_message_metadata_persisted_to_jsonl(tmp_path):
 | 设计决策 | 依赖 upstream 版本细节 | 未来升级 review point |
 |---|---|---|
 | `AgentRunResult` 增加 `elapsed_ms` / `llm_elapsed_ms` | `AgentRunResult` dataclass 定义 | upstream 若改为 pydantic model 或 NamedTuple，字段添加方式需调整。 |
-| `AgentLoop._run_agent_loop()` 返回 tuple 扩展 | 当前返回 5 元组 | upstream 若重构为返回 `AgentRunResult` 对象，则 `_state_run()` 需从对象属性读取，而非解包。 |
+| `AgentLoop._run_agent_loop()` 返回 `AgentRunResult` | 本 spec 已采用方案 B | 与 Spec5 对齐。upstream 若改变 `AgentRunResult` 字段，需同步更新 `_state_run()` 读取逻辑。 |
 | `ContextBuilder._build_runtime_context()` 签名扩展 | 当前是 `@staticmethod` | upstream 若改为实例方法或引入 dataclass/pydantic 参数对象，签名变更成本降低，可同时引入更多字段。 |
 | `sender_name` 通过 `metadata` 传递 | `InboundMessage.metadata` 是 `dict[str, Any]` | 若未来 `InboundMessage` 引入显式 `sender_name` 字段，metadata 路径可作为 fallback 保留一个版本。 |
 | `Session.add_message(**kwargs)` 透传 | 当前是 `**kwargs` 合并 | upstream 若改为显式字段验证（如 pydantic model），需同步修改所有 `add_message` 调用点。 |
@@ -493,7 +506,19 @@ def test_assistant_message_metadata_persisted_to_jsonl(tmp_path):
 
 ---
 
-## 附录 A：关键设计决策速查
+## 附录 A：跨 Spec 协调声明
+
+本 spec 与其他 spec 有以下交叉点，已在正文中对齐：
+
+| 交叉点 | 涉及 Spec | 对齐结论 |
+|--------|-----------|---------|
+| `_request_model()` 计时 | Spec3 + Spec5 | 统一在 `_request_model()` 内部完成计时+日志，返回 `(response, elapsed_ms)`。不新增 `_timed_request_model()` 包装器。 |
+| `_request_finalization_retry()` | Spec3 + Spec5 | 计时纳入 `llm_elapsed_ms`（Spec3），日志静默（Spec5）。 |
+| `AgentRunResult` 扩展方式 | Spec3 + Spec5 | 统一用方案 B（`AgentRunResult` 整体传递），不扩展 tuple。 |
+| `sender_name` 数据流 | Spec3 → Spec2 | Spec3 建立入口（`InboundMessage.metadata["sender_name"]`），Spec2 在 outbound 阶段消费。metadata key 名必须一致：`"sender_name"`。实现顺序：先 Spec3 后 Spec2。 |
+| `AgentLoop` 参数膨胀 | Spec3 + Spec4 + Spec5 + Spec6 | 所有 pack 新增的 `AgentLoop` 配置统一打包到 `ForkConfig` dataclass，`AgentLoop.__init__` 只新增一个 `fork_config: ForkConfig | None = None` 参数。详见 Spec4/5/6 对应段落。 |
+
+## 附录 B：关键设计决策速查
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
@@ -502,11 +527,11 @@ def test_assistant_message_metadata_persisted_to_jsonl(tmp_path):
 | `provider_name` 是否保留 | **完全不保留** | 实现细节，无对话价值，有泄漏风险。 |
 | `Session.clear()` 是否修改 | **不修改** | upstream 已保留 `metadata`，行为符合需求。 |
 | `AgentRunResult` 新增字段默认值 | **0** | 保持向后兼容，现有调用方无需修改。 |
-| `_run_agent_loop()` 返回扩展方式 | **扩展 tuple** | 调用点唯一（`_state_run`），侵入度低于重构为返回对象。 |
+| `_run_agent_loop()` 返回方式 | **方案 B：返回 `AgentRunResult`** | 与 Spec5 对齐，避免 tuple 位置参数膨胀。调用点唯一（`_state_run`），侵入可控。 |
 
 ## 附录 B：不确定点
 
 1. **Upstream `openai_compat_provider.py` 的 usage 字段粒度**：plan 提到该 provider 可能已保留更详细的 usage 字段（如 `cached_tokens`）。实现前需 inspect `nanobot/providers/openai_compat_provider.py` 中 `LLMResponse` 的构造逻辑。如果已完整保留，则无需修改 provider 层；否则在 provider 层补充。
 2. **`tests/agent/test_context_builder.py` 是否存在**：未在 plan 中明确列出。若不存在，测试应新建在 `tests/agent/` 下。若上游已有但未发现，应复用现有模块。
-3. **`_request_finalization_retry()` 的计时**：如果该辅助方法直接调用 `provider.chat_with_retry()` 而不经过 `_request_model()`，需确认是否已纳入 `llm_elapsed_ms`。实现时检查其调用路径，确保全部 LLM 调用都被计时。
+3. **`_request_finalization_retry()` 的计时**（已与 Spec5 对齐）：该方法直接调用 `provider.chat_with_retry()` 不走 `_request_model()`。本 spec 要求在其内部独立计时并纳入 `llm_elapsed_ms`，但不产生完整 request/response preview 日志（Spec5 的日志策略）。计时和日志是独立关注点。
 4. **Slash command 的 metadata**：plan 提到 slash-command 路径也应获得同样的 metadata shape。当前 `DiscordBotClient._on_interaction` 通过 `_handle_message()` 发送命令，`_build_inbound_metadata()` 仅用于普通消息。需确认 slash command 的 `metadata` 是否也经过 `_build_inbound_metadata()` 或需要单独补充 `channel_name`/`sender_name`。

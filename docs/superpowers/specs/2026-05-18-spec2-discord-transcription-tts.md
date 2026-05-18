@@ -725,7 +725,7 @@ if message_tool := self.tools.get("message"):
 | # | 不确定点 | 建议 |
 |---|----------|------|
 | 1 | `DiscordConfig` 是否应在 schema.py 中统一注册？ | 当前 upstream 将 `DiscordConfig` 放在 `discord.py`。本 spec 遵循此惯例，在 `DiscordConfig` 中直接加 `tts` 字段。若未来 upstream 统一迁移，同步移动即可。 |
-| 2 | `sender_name` 在 outbound 中如何获取？ | `OutboundMessage` / `msg.metadata` 当前无 `sender_name`。若 TTS 需要 `auto_tts_senders` 在 outbound 阶段生效，需在 `AgentLoop._assemble_outbound` 或 `_state_respond` 中将 `msg.sender_id` 映射为 name 并写入 metadata。或者将 `auto_tts_senders` 逻辑前移到 `AgentLoop`（在组装 outbound 时决定是否设置 `_session_tts`）。**本 spec 推荐后者**：`auto_tts_senders` 判断放在 `AgentLoop._state_respond`，与 session_tts 统一决策，这样 `DiscordChannel.send` 只读 `_session_tts` 一个 flag。 |
+| 2 | `sender_name` 在 outbound 中如何获取？ | **已与 Spec3 对齐**：Spec3 建立 `sender_name` 入口，写入 `InboundMessage.metadata["sender_name"]`。本 spec 在 `AgentLoop._state_respond` 中从 inbound metadata 读取 `sender_name`，结合 `auto_tts_senders` 判断后统一写入 `_session_tts` flag 到 outbound metadata。`DiscordChannel.send` 只读 `_session_tts` 一个 flag。metadata key 名必须与 Spec3 一致：`"sender_name"`。**实现顺序**：先实现 Spec3（建立入口），再实现 Spec2（消费）。 |
 | 3 | `edge-tts` 在 upstream 的 pyproject.toml 中是否已存在？ | 需实现时检查。若不存在，加依赖。若存在但版本不同，验证 `edge_tts.Communicate` API 兼容性。 |
 | 4 | 音频附件下载后是否应从磁盘清理？ | 当前 `_download_attachments` 不写临时文件，而是写到 `get_media_dir()`。transcription 后的原始音频可保留或删除。为最小改动，保留文件（与图片附件一致）。TTS 生成的音频在 `/tmp/nanobot_tts/` 中，由系统清理。 |
 | 5 | `fish.py` 的 `httpx` 超时与重试策略 | 当前 FishTTSProvider 使用 `httpx.AsyncClient(timeout=60.0)`，无重试。若 Fish Audio 不稳定，未来可仿照 `transcription.py` 引入 `_post_with_retry` 模式。本 spec 保持简单，不加重试。 |

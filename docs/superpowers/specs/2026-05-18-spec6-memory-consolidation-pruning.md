@@ -215,8 +215,8 @@ context_pruning: ContextPruningConfig | None = None
 
 **修改 2：AgentLoop 透传配置**
 
-- `AgentLoop.__init__` 新增参数 `context_pruning: ContextPruningConfig | None = None`，并保存为实例属性。
-- `AgentLoop.from_config()` 从 `defaults.context_pruning` 读取并传入构造器。
+- `AgentLoop.__init__` 通过 `ForkConfig.context_pruning` 接收参数（Spec4 定义的跨 spec 参数打包机制），不直接新增构造函数参数。`AgentLoop` 从 `self._fork_config.context_pruning` 读取。
+- `AgentLoop.from_config()` 在组装 `ForkConfig` 时从 `defaults.context_pruning` 读取并填入。
 - `AgentLoop` 在每次构建 `AgentRunSpec` 时将 `context_pruning` 传入（同 `max_tool_result_chars` 等字段的传递方式）。
 
 **修改 3：AgentRunner.run() 插入裁剪步骤**
