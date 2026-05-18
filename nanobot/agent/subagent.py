@@ -367,7 +367,7 @@ class SubagentManager:
 
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
-        from nanobot.agent.context import ContextBuilder
+        from nanobot.agent.context import ContextBuilder, load_and_format_bootstrap
         from nanobot.agent.skills import SkillsLoader
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
@@ -375,11 +375,13 @@ class SubagentManager:
             self.workspace,
             disabled_skills=self.disabled_skills,
         ).build_skills_summary()
+        bootstrap = load_and_format_bootstrap(["SOUL.md", "TOOLS.md"], self.workspace)
         return render_template(
             "agent/subagent_system.md",
             time_ctx=time_ctx,
             workspace=str(self.workspace),
             skills_summary=skills_summary or "",
+            bootstrap=bootstrap,
         )
 
     async def cancel_by_session(self, session_key: str) -> int:

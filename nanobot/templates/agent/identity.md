@@ -10,7 +10,7 @@ Your workspace is at: {{ workspace_path }}
 {{ platform_policy }}
 {% if channel == 'telegram' or channel == 'qq' or channel == 'discord' %}
 ## Format Hint
-This conversation is on a messaging app. Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. No tables — use plain lists.
+This conversation is on a messaging app. Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. **CRITICAL: Discord does NOT render Markdown tables.** Never use `|` column syntax. If you must show structured data, use a plain list or an ASCII table inside a fenced code block (```).
 {% elif channel == 'whatsapp' or channel == 'sms' %}
 ## Format Hint
 This conversation is on a text messaging platform that does not render markdown. Use plain text only.

@@ -22,7 +22,7 @@ from nanobot.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -72,6 +72,10 @@ class ContextBuilder:
 
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+
+        soul_anchor = self._load_soul_anchor()
+        if soul_anchor:
+            parts.append(f"# Remember\n\n{soul_anchor}")
 
         return "\n\n---\n\n".join(parts)
 
@@ -138,6 +142,14 @@ class ContextBuilder:
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _load_soul_anchor(self) -> str | None:
+        soul_path = self.workspace / "SOUL.md"
+        if soul_path.exists():
+            content = soul_path.read_text(encoding="utf-8").strip()
+            if content:
+                return content
+        return None
 
     @staticmethod
     def _is_template_content(content: str, template_path: str) -> bool:
@@ -220,4 +232,16 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+
+def load_and_format_bootstrap(files: list[str], workspace: Path) -> str:
+    """Load and format the specified bootstrap files from workspace."""
+    parts = []
+    for filename in files:
+        file_path = workspace / filename
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8").strip()
+            if content:
+                parts.append(f"## {filename}\n\n{content}")
+    return "\n\n".join(parts) if parts else ""
 

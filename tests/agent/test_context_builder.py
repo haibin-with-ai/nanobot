@@ -261,6 +261,35 @@ class TestBuildSystemPrompt:
         assert "## AGENTS.md" not in result
         assert "[Archived Context Summary]" not in result
 
+    def test_bootstrap_order_respected(self, tmp_path):
+        """Bootstrap files must appear in the declared order."""
+        for name in ContextBuilder.BOOTSTRAP_FILES:
+            (tmp_path / name).write_text(name, encoding="utf-8")
+
+        builder = _builder(tmp_path)
+        prompt = builder.build_system_prompt()
+        # SOUL.md should come before USER.md, which comes before AGENTS.md
+        assert prompt.index("SOUL.md") < prompt.index("USER.md")
+        assert prompt.index("USER.md") < prompt.index("AGENTS.md")
+
+    def test_soul_anchor_injected_when_file_exists(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("Be kind. Be sharp.", encoding="utf-8")
+
+        builder = _builder(tmp_path)
+        prompt = builder.build_system_prompt()
+        assert "# Remember" in prompt
+        assert "Be kind. Be sharp." in prompt
+
+    def test_soul_anchor_omitted_when_file_missing(self, tmp_path):
+        builder = _builder(tmp_path)
+        prompt = builder.build_system_prompt()
+        assert "# Remember" not in prompt
+
+    def test_discord_table_hint_in_identity(self, tmp_path):
+        builder = _builder(tmp_path)
+        prompt = builder.build_system_prompt(channel="discord")
+        assert "Discord does NOT render Markdown tables" in prompt
+
 
 # ---------------------------------------------------------------------------
 # build_messages
