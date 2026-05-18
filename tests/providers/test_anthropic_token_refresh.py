@@ -106,16 +106,16 @@ class TestUpdateOAuthToken:
             assert p._auth_token == "sk-ant-oat-new"
             store.save.assert_called_once()
 
-    def test_failed_refresh_fallback_to_build_client(self):
+    def test_failed_refresh_raises_to_caller(self):
+        """_update_oauth_token no longer swallows errors; _ensure_valid_token handles them."""
         store = MagicMock()
         p = _make_provider(auth_token="sk-ant-oat-old", credential_store=store)
         with patch(
             "nanobot.providers.oauth_store.refresh_anthropic_token"
         ) as mock_refresh:
             mock_refresh.side_effect = RuntimeError("network")
-            with patch.object(p, "_build_client") as mock_build:
+            with pytest.raises(RuntimeError, match="network"):
                 p._update_oauth_token("sk-ant-ort-old")
-                mock_build.assert_called_once()
 
     def test_chat_calls_ensure_valid_token(self):
         store = MagicMock()

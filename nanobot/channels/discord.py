@@ -765,12 +765,12 @@ class DiscordChannel(BaseChannel):
         if bot_user_id is None:
             return False
 
-        mentions_bot = any((
-            any(str(user.id) == bot_user_id for user in message.mentions),
-            bot_user_id in {str(user_id) for user_id in getattr(message, "raw_mentions", [])},
-            f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content,
-            self._references_bot_message(message, bot_user_id),
-        ))
+        mentions_bot = (
+            any(str(user.id) == bot_user_id for user in message.mentions)
+            or bot_user_id in {str(user_id) for user_id in getattr(message, "raw_mentions", [])}
+            or f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content
+            or self._references_bot_message(message, bot_user_id)
+        )
         if mentions_bot:
             return False
 

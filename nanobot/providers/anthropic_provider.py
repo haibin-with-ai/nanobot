@@ -606,21 +606,17 @@ class AnthropicProvider(LLMProvider):
         try:
             await asyncio.to_thread(self._update_oauth_token, credentials.refresh_token)
         except Exception:
-            logger.warning("OAuth token refresh failed, continuing with existing token")
+            logger.exception("OAuth token refresh failed, continuing with existing token")
 
     def _update_oauth_token(self, refresh_token: str) -> None:
         """Refresh and persist a new OAuth token. On failure, rebuild client anyway."""
-        try:
-            from nanobot.providers.oauth_store import refresh_anthropic_token
+        from nanobot.providers.oauth_store import refresh_anthropic_token
 
-            new_credentials = refresh_anthropic_token(refresh_token)
-            self._auth_token = new_credentials.access_token
-            if self._credential_store is not None:
-                self._credential_store.save(new_credentials)
-            self._client = self._build_client()
-        except Exception:
-            logger.warning("OAuth token refresh failed, continuing with existing token")
-            self._client = self._build_client()
+        new_credentials = refresh_anthropic_token(refresh_token)
+        self._auth_token = new_credentials.access_token
+        if self._credential_store is not None:
+            self._credential_store.save(new_credentials)
+        self._client = self._build_client()
 
     async def chat(
         self,

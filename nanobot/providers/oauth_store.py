@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -156,8 +157,6 @@ def refresh_anthropic_token(refresh_token: str) -> OAuthCredentials:
     expires_in = payload.get("expires_in")
     if not access or not refresh or expires_in is None:
         raise RuntimeError("Token refresh response missing required fields")
-
-    import time
 
     expires_at = int(time.time() * 1000 + int(expires_in) * 1000)
     account = payload.get("account", {})

@@ -267,17 +267,18 @@ class AgentRunner:
         injection_cycles = 0
         llm_elapsed_ms = 0
 
+        # Pre-compute pruner once (stateless, config won't change mid-run)
+        _pruner = ContextPruner(spec.context_pruning) if spec.context_pruning and spec.context_pruning.enabled else None
+        _prune_window = (spec.max_tool_result_chars * spec.context_pruning.context_budget_multiplier) if _pruner else 0
+
         for iteration in range(spec.max_iterations):
             try:
                 # Keep the persisted conversation untouched. Context governance
                 # may repair or compact historical messages for the model, but
                 # those synthetic edits must not shift the append boundary used
                 # later when the caller saves only the new turn.
-                # Context pruning: trim oversized tool results before governance
-                if spec.context_pruning and spec.context_pruning.enabled:
-                    pruner = ContextPruner(spec.context_pruning)
-                    context_window_chars = spec.max_tool_result_chars * spec.context_pruning.context_budget_multiplier
-                    messages_for_model = pruner.prune(messages, context_window_chars=context_window_chars)
+                if _pruner:
+                    messages_for_model = _pruner.prune(messages, context_window_chars=_prune_window)
                 else:
                     messages_for_model = messages
                 messages_for_model = self._drop_orphan_tool_results(messages_for_model)

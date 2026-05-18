@@ -103,7 +103,7 @@ async def _run_rg(
             cmd.extend(["-g", f"*.{type_key}"])
     # Ignore common noise dirs
     for d in ("node_modules", ".git", "__pycache__", ".venv", "venv"):
-        cmd.extend(["--glob", f"!{d}/"])
+        cmd.extend(["-g", f"!{d}/"])
     cmd.extend(["--", pattern, str(target)])
 
     try:

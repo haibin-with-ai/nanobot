@@ -15,7 +15,7 @@ from nanobot.agent.subagent import SubagentManager, SubagentStatus
 from nanobot.agent.tools.search import GrepTool
 from nanobot.agent.tools.web import WebSearchTool
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import WebSearchConfig
+from nanobot.agent.tools.web import WebSearchConfig
 
 
 @pytest.mark.asyncio

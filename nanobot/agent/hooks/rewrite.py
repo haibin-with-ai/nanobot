@@ -85,5 +85,3 @@ class CommandRewriteHook(AgentHook):
     def _ensure_killed(proc: asyncio.subprocess.Process) -> None:
         with suppress(Exception):
             proc.kill()
-        with suppress(Exception):
-            proc.wait()
