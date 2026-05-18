@@ -206,17 +206,40 @@ return cls(
 
 修改文件：`nanobot/agent/tools/search.py`
 
-新增方法（均在 `GrepTool` 内）：
+新增类型与方法（均在 `GrepTool` 所在模块）：
 
 ```python
-# 类常量
-_RG_AVAILABLE: bool | None = None
+from dataclasses import dataclass
+import functools
 
-@classmethod
-def _rg_available(cls) -> bool:
-    if cls._RG_AVAILABLE is None:
-        cls._RG_AVAILABLE = shutil.which("rg") is not None
-    return cls._RG_AVAILABLE
+@dataclass(frozen=True)
+class SearchMatch:
+    path: str
+    line_num: int | None = None
+    line_text: str | None = None
+    submatches: list[tuple[int, int]] | None = None
+
+@functools.lru_cache(maxsize=1)
+def _rg_available() -> bool:
+    return shutil.which("rg") is not None
+
+def _rg_params_supported(type_key: str | None) -> bool:
+    """Return True if all query parameters are within rg's supported subset."""
+    if type_key and type_key not in _TYPE_GLOB_MAP:
+        return False
+    return True
+
+def _format_search_results(
+    matches: list[SearchMatch],
+    mode: str,
+    limit: int,
+    offset: int,
+) -> str:
+    """Single formatter used by both rg and Python paths.
+
+    mode: 'content' | 'files_with_matches' | 'count'
+    Pagination, truncation notes, and sort order are applied here and only here.
+    """
 
 async def _run_rg_search(
     self,
@@ -228,26 +251,20 @@ async def _run_rg_search(
     type_key: str | None,
     case_insensitive: bool,
     fixed_strings: bool,
-    output_mode: str,
     context_before: int,
     context_after: int,
-    limit: int,
-    offset: int,
-) -> str | None:
-    """Return formatted result string if rg succeeds, else None to trigger fallback."""
+) -> list[SearchMatch] | None:
+    """Return parsed SearchMatch list if rg succeeds, else None to trigger fallback."""
 
 async def _parse_rg_json(
     self,
     json_lines: list[str],
     root: Path,
     *,
-    output_mode: str,
     context_before: int,
     context_after: int,
-    limit: int,
-    offset: int,
-) -> str:
-    """Parse rg --json lines into upstream-compatible formatted output."""
+) -> list[SearchMatch]:
+    """Parse rg --json lines into structured SearchMatch objects."""
 ```
 
 #### 4.1.3 rg 命令构造
@@ -270,31 +287,24 @@ if type_key:
     if mapped:
         for g in mapped:
             cmd.extend(["-g", g])
-    else:
-        # unknown type -> skip rg, fallback to Python
-        return None
 cmd.append(pattern)
 cmd.append(str(target))
 ```
 
-**关键决策**：`type` 参数在 Python 实现中映射为 glob tuple；在 rg 中通过 `-g` 多传入实现相同过滤。若 `type_key` 不在 `_TYPE_GLOB_MAP` 中，返回 `None` fallback。
+**关键决策**：`type` 参数在 Python 实现中映射为 glob tuple；在 rg 中通过 `-g` 多传入实现相同过滤。rg 是否适用的判断在 `execute()` 入口处统一完成（`_rg_available() and _rg_params_supported(type_key)`），不在 rg 路径内部再做退出决策。
 
-#### 4.1.4 rg JSON 解析与格式化
+#### 4.1.4 rg JSON 解析
 
 rg `--json` 输出每行是一个 JSON object，type 包括 `begin`、`match`、`end`、`summary` 等。
 
-解析逻辑：
+`_parse_rg_json` 解析逻辑：
 1. 按 file 分组收集 matches
 2. 每个 match 的 lines.text 取匹配行，配合 `submatches` 中的 start/end 做高亮（可选）
 3. `context` 行与 Python 实现中 `context_before`/`context_after` 语义一致
 4. 跳过 binary files（rg 不会搜索 binary，但会输出 `binary` type，忽略即可）
 5. 大文件由 `--max-filesize` 控制，rg 自动跳过，需统计 skipped_large（从 summary 或 stderr 提取）
 
-格式化复用现有逻辑：
-- `content` mode：`"\n\n".join(blocks)`，每个 block 是 `"file_path\nline_num | line_content"`
-- `files_with_matches` mode：sorted file list（按 `-mtime` desc，然后 name）
-- `count` mode：`"file: count"` lines
-- pagination 与 notes 复用现有 `_paginate` 和 `notes` 构建逻辑
+解析结果返回 `list[SearchMatch]`，不做任何格式化。最终输出统一由 `_format_search_results` 生成。
 
 #### 4.1.5 execute() 入口改造
 
@@ -306,15 +316,31 @@ async def execute(self, pattern, path=".", ...):
     if not (target.is_dir() or target.is_file()):
         return f"Error: path is not a file or directory: {path}"
 
-    if self._rg_available():
-        rg_result = await self._run_rg_search(target, pattern, root, ...all kwargs...)
-        if rg_result is not None:
-            return rg_result
-    # fallback 到现有 Python 实现（保持不动）
-    ...existing logic...
+    # 单一决策点：rg 可用且所有参数在 rg 支持范围内
+    use_rg = _rg_available() and _rg_params_supported(type_key)
+    if use_rg:
+        rg_matches = await self._run_rg_search(
+            target, pattern, root,
+            glob=glob, type_key=type_key,
+            case_insensitive=case_insensitive,
+            fixed_strings=fixed_strings,
+            context_before=context_before,
+            context_after=context_after,
+        )
+        if rg_matches is not None:
+            return _format_search_results(
+                rg_matches, mode=output_mode, limit=limit, offset=offset
+            )
+
+    # Python path：构建 list[SearchMatch] 后统一格式化
+    py_matches = []
+    ...existing Python search logic, emitting SearchMatch objects...
+    return _format_search_results(
+        py_matches, mode=output_mode, limit=limit, offset=offset
+    )
 ```
 
-**向前兼容标注**：`_rg_available()` 在类级别缓存，避免每次 grep 调用都 `which`。若用户环境中 `rg` 后续被卸载，进程生命周期内仍视为可用（直到重启）。这是可接受的 trade-off，因为工具实例通常在 loop 生命周期内复用。
+**向前兼容标注**：`_rg_available()` 使用模块级 `functools.lru_cache(maxsize=1)`，避免每次 grep 调用都 `which`。若用户环境中 `rg` 后续被卸载，进程生命周期内仍视为可用（直到重启）。这是可接受的 trade-off，因为工具实例通常在 loop 生命周期内复用。
 
 #### 4.1.6 错误处理
 
@@ -324,7 +350,7 @@ rg 调用可能失败的情况：
 - `FileNotFoundError`（rg 被删除）
 - JSON 解析失败
 
-以上任一情况，`_run_rg_search` 返回 `None`，无感 fallback。
+以上任一情况，`_run_rg_search` 返回 `None`（`list[SearchMatch] | None`），由 `execute()` 中的统一 fallback 路径接管，无感 fallback。格式化失败（如 mode 不合法）不属于 rg 路径的错误，由 `_format_search_results` 统一处理。
 
 ### 4.2 `extra_allowed_paths` 不复活的决策记录
 
@@ -508,7 +534,7 @@ Upstream 已实现完整的 shell 边界：
 
 | 修改点 | 侵入度 | 说明 |
 |--------|--------|------|
-| `search.py` 新增 `_run_rg_search` / `_parse_rg_json` | 中 | 纯新增方法，不删除现有方法；`execute()` 增加一个 rg 入口判断 |
+| `search.py` 新增 `SearchMatch`、`_format_search_results`、`_run_rg_search`、`_parse_rg_json`、`_rg_params_supported` | 中 | 纯新增，不删除现有方法；`execute()` 在单一决策点判断 rg 是否可用+参数是否支持，rg 与 Python 均输出 `list[SearchMatch]`，再由统一 formatter 生成字符串 |
 | `spawn.py` 新增 `timeout_seconds` 参数 | 低 | schema + execute 参数透传 |
 | `subagent.py` spawn / `_run_subagent` 新增 timeout | 低 | 签名扩展 + 外层 `asyncio.wait_for` |
 | `message.py` | **无修改**（仅补测试） | 当前实现已满足语义 |
@@ -536,7 +562,7 @@ Upstream 已实现完整的 shell 边界：
 **方案**：
 1. 使用 `pytest.mark.skipif(not shutil.which("rg"), reason="ripgrep not installed")` 包裹 rg-specific 测试。
 2. 对于 rg 输出格式测试，可以 mock `subprocess.run` 返回预录的 `rg --json` 输出，验证 `_parse_rg_json` 正确性，这样无需真实 rg。
-3. fallback 测试：mock `GrepTool._rg_available()` 返回 `False`，验证走 Python 路径。
+3. fallback 测试：mock `_rg_available()` 返回 `False`（或 patch `shutil.which`），验证走 Python 路径。
 
 ### 6.3 MessageTool 测试策略
 
@@ -556,8 +582,7 @@ Upstream 已实现完整的 shell 边界：
 |------|-----------|----------|
 | rg 输出格式与 Python 严格一致 | 未来 rg 版本 `--json` schema 变化可能破坏解析 | 解析逻辑集中在一个方法；rg 失败 fallback 到 Python；spec 要求在 rg 解析异常时返回 `None` fallback |
 | `timeout_seconds` 新增为可选参数 | 旧调用（无 timeout）行为不变 | 参数默认 `None`，不传时不加 `asyncio.wait_for` |
-| `GrepTool` 增加类级 `_RG_AVAILABLE` 缓存 | 进程生命周期内 rg 可用性不变 | 可接受；如需热切换，可改为实例级检查，但性能有损 |
-| 不引入 `extra_allowed_paths` | 未来若需用户配置额外目录，需新设计 | 在 schema 中预留空间（但不实现），避免字段名冲突 |
+| `_rg_available()` 使用模块级 `lru_cache` | 进程生命周期内 rg 可用性不变 | 可接受；如需热切换，可改为无缓存检查，但性能有损 |
 
 **依赖 upstream 特定版本实现细节的设计决策**：
 1. `AgentRunSpec` 在当前 upstream 中已有 `llm_timeout_s` 字段；`timeout_seconds` 是 subagent 总超时，与其独立。若 future upstream 重构 `AgentRunSpec` 为 dataclass 并改变字段语义，spawn timeout 实现需相应调整。
@@ -574,8 +599,8 @@ Upstream 已实现完整的 shell 边界：
    - **运行测试，确认 baseline（部分新测试预期失败或跳过）**
 
 2. **Phase 2 — ripgrep 集成**
-   - 实现 `GrepTool._rg_available()`、`_run_rg_search()`、`_parse_rg_json()`
-   - 修改 `GrepTool.execute()` 增加 rg 入口
+   - 实现模块级 `_rg_available()`、`_format_search_results()`、`_run_rg_search()`、`_parse_rg_json()`、`_rg_params_supported()`
+   - 修改 `GrepTool.execute()` 统一 rg 决策点与 fallback 路径
    - 在 `tests/tools/test_search_tools.py` 追加 rg 与 fallback 测试
    - 运行测试，修复输出格式差异
 

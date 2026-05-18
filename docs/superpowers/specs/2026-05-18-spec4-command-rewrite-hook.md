@@ -171,6 +171,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import traceback
 from typing import Any
 
 from loguru import logger
@@ -208,26 +209,37 @@ class CommandRewriteHook(AgentHook):
         if not self._enabled:
             return
         for tc in context.tool_calls:
-            if tc.name != "exec":
-                continue
-            raw = tc.arguments.get("command")
-            if not isinstance(raw, str) or not raw.strip():
-                continue
-            rewritten = await self._rewrite(raw)
-            if rewritten is not None and rewritten != raw:
-                tc.arguments["command"] = rewritten
-                if self._verbose:
-                    logger.debug(
-                        "[command-rewrite] {} -> {}",
-                        raw.strip().splitlines()[0][:80],
-                        rewritten.strip().splitlines()[0][:80],
-                    )
+            try:
+                if tc.name != "exec":
+                    continue
+                raw = tc.arguments.get("command")
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                rewritten = await self._rewrite(raw)
+                if rewritten is not None and rewritten != raw:
+                    tc.arguments["command"] = rewritten
+                    if self._verbose:
+                        logger.debug(
+                            "[command-rewrite] {} -> {}",
+                            raw.strip().splitlines()[0][:80],
+                            rewritten.strip().splitlines()[0][:80],
+                        )
+            except Exception:
+                logger.debug("CommandRewriteHook: unexpected error for tool {}: {}", tc.name, traceback.format_exc())
+
+    @staticmethod
+    async def _ensure_killed(proc: asyncio.subprocess.Process) -> None:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
 
     async def _rewrite(self, command: str) -> str | None:
         """Call rtk binary. Return rewritten command or None to keep original."""
         # 1. locate binary (fast path: assume in PATH; fallback shutil.which)
         binary = self._binary_path
-        if os.sep not in binary and not getattr(os, "altsep", None):
+        if os.name != "nt" and os.sep not in binary:
             # On POSIX, if no path separator, try which for clearer error messages
             resolved = shutil.which(binary)
             if resolved is None:
@@ -255,14 +267,10 @@ class CommandRewriteHook(AgentHook):
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError:
-            with suppress(Exception):
-                proc.kill()
-                await proc.wait()
+            await self._ensure_killed(proc)
             return None
         except Exception:
-            with suppress(Exception):
-                proc.kill()
-                await proc.wait()
+            await self._ensure_killed(proc)
             return None
 
         if proc.returncode not in (0, 3):
@@ -291,7 +299,7 @@ class CommandRewriteHook(AgentHook):
 |------|------|
 | 调用方式 | `asyncio.create_subprocess_exec(binary, stdin=PIPE, stdout=PIPE, stderr=PIPE)` |
 | 输入 | 原始命令字符串，以 UTF-8 写入 stdin，含末尾换行由 rtk 自行处理 |
-| 输出 | stdout 第一行（去尾换行）作为改写后命令 |
+| 输出 | stdout 全部内容去尾换行作为改写后命令 |
 | 退出码 0 | 改写成功，stdout 非空则替换 |
 | 退出码 3 | 同上（fork 兼容语义） |
 | 退出码 1/2/其他 | 保留原始命令 |
@@ -313,68 +321,9 @@ class CommandRewriteHook(AgentHook):
 
 为什么不匹配 `"shell"` 或其他名字？因为 upstream 基线中只有 `ExecTool.name == "exec"`。如果未来新增其他 shell-like 工具，应扩展配置白名单，而非在 hook 中硬编码更多名称。
 
-### 4.5 ForkConfig 统一参数打包（跨 Spec 协调）
+### 4.5 Main loop 与 subagent 的 hook 共享
 
-**问题**：Spec4/5/6 各自往 `AgentLoop.__init__` 和 `from_config()` 加参数（hooks、subagent provider、context pruning），如果不协调会导致参数膨胀。
-
-**解法**：引入 `ForkConfig` dataclass，将所有 fork-specific 的 `AgentLoop` 配置打包到一个对象中：
-
-```python
-# nanobot/config/fork_config.py（新增文件）
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any
-
-@dataclass
-class ForkConfig:
-    """Fork-specific configuration for AgentLoop.
-
-    Packs all parameters introduced by the upstream sync replay (Pack1–Pack8)
-    into a single object, so AgentLoop.__init__ only gains one parameter
-    instead of N scattered ones. If upstream absorbs any of these features
-    natively, the corresponding field can be removed.
-    """
-    # Pack4: command rewrite hooks
-    extra_hooks: list[Any] = field(default_factory=list)
-
-    # Pack5: subagent independent model
-    subagent_model: str | None = None
-    subagent_reasoning_effort: str | None = None
-    subagent_max_tokens: int | None = None
-    subagent_provider_snapshot: Any | None = None  # ProviderSnapshot if independent
-    model_alias_resolver: Any | None = None  # Callable[[str], str]
-    trace_dir: str | None = None
-
-    # Pack6: context pruning
-    context_pruning: Any | None = None  # ContextPruningConfig
-```
-
-`AgentLoop.__init__` 只新增一个参数：
-
-```python
-def __init__(self, ..., fork_config: ForkConfig | None = None):
-    fc = fork_config or ForkConfig()
-    self._extra_hooks = fc.extra_hooks
-    self._fork_config = fc
-    ...
-```
-
-`AgentLoop.from_config()` 负责从 `config` 组装 `ForkConfig`：
-
-```python
-fc = ForkConfig(
-    extra_hooks=extra_hooks,          # Pack4
-    subagent_model=...,               # Pack5
-    context_pruning=...,              # Pack6
-)
-return cls(..., fork_config=fc)
-```
-
-**向前兼容**：如果 upstream 3.0/4.0 原生支持了某个功能（如 context pruning），只需从 `ForkConfig` 删除对应字段，改用 upstream 原生参数。`ForkConfig` 作为隔离层，不污染 upstream 已有的参数命名空间。
-
-### 4.6 Main loop 与 subagent 的 hook 共享
-
-#### 4.6.1 主 Loop
+#### 4.5.1 主 Loop
 
 修改 `AgentLoop.from_config()`（`nanobot/agent/loop.py`）：
 
@@ -393,7 +342,7 @@ if config.tools.command_rewrite.enabled:
 
 然后在 `return cls(...)` 调用中注入 `hooks=extra_hooks`（仅当非空时注入，保持与现有代码风格一致）。
 
-#### 4.6.2 SubagentManager
+#### 4.5.2 SubagentManager
 
 修改 `SubagentManager.__init__`（`nanobot/agent/subagent.py`）新增参数：
 
@@ -417,7 +366,7 @@ result = await self.runner.run(AgentRunSpec(..., hook=hook, ...))
 
 修改 `AgentLoop.__init__` 在构造 `SubagentManager` 时传入 `extra_hooks=self._extra_hooks`。
 
-#### 4.6.3 配置 → Hook 实例化 → 注入的数据流
+#### 4.5.3 配置 → Hook 实例化 → 注入的数据流
 
 ```
 config.toml
@@ -546,9 +495,8 @@ async def test_composite_before_execute_tools_ordering_and_mutation():
 
 ```python
 def test_exectool_config_has_no_rtk_fields():
-    from nanobot.agent.tools.shell import ExecToolConfig
-    assert not hasattr(ExecToolConfig, "rtk_enabled")
-    assert not hasattr(ExecToolConfig, "command_rewrite")
+    from pathlib import Path
+    assert 'rtk' not in Path('nanobot/agent/tools/shell.py').read_text()
 ```
 
 ### 6.5 Subagent 传播测试

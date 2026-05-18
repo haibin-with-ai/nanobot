@@ -12,11 +12,11 @@
 |---|---|---|
 | BR-1 | `anthropic_claude_code` 在 registry、config schema、CLI status 中作为一等 OAuth provider 注册。 | P0 |
 | BR-2 | 当使用 OAuth token（`sk-ant-oat...`）时，HTTP 认证方式为 `Authorization: Bearer <token>`，而非 `x-api-key`。 | P0 |
-| BR-3 | Claude Code 所需的 beta headers（`anthropic-beta`）仅在 OAuth 模式下自动注入；API key 模式不受影响。 | P0 |
-| BR-4 | Claude Code 身份 system prompt 仅在 OAuth 模式下自动 prepend；API key 模式不受影响。 | P0 |
+| BR-3 | Claude Code 所需的 beta headers（`anthropic-beta`）仅在 Claude Code 产品模式下自动注入；普通 Anthropic API key 模式不受影响。 | P0 |
+| BR-4 | Claude Code 身份 system prompt 仅在 Claude Code 产品模式下自动 prepend；普通 API key 模式不受影响。 | P0 |
 | BR-5 | OAuth credentials 可从 nanobot 自有 credential store（`~/.nanobot/oauth_credentials.json`）加载，并支持从 Claude CLI store（`~/.claude/.credentials.json`）只读迁移。 | P0 |
 | BR-6 | 过期或临近过期（5 分钟 margin）的 OAuth token 在每次请求前自动刷新，并发请求只触发一次刷新。刷新后的 token 写回 store。 | P0 |
-| BR-7 | OAuth 模式下 tool names 自动规范化到 Claude Code canonical casing（如 `read` → `Read`）；API key 模式下保持原样。 | P0 |
+| BR-7 | Claude Code 产品模式下 tool names 自动规范化到 Claude Code canonical casing（如 `read` → `Read`）；非 Claude Code 模式下保持原样。 | P0 |
 | BR-8 | `provider login anthropic-claude-code` 与 `provider logout anthropic-claude-code` 在 CLI 中可用（若 upstream 无 generic OAuth hook，则使用现有 per-provider 注册机制）。 | P1 |
 | BR-9 | 刷新失败时，通过现有 provider error path 返回/抛出，不破坏旧 credentials。 | P0 |
 
@@ -125,14 +125,19 @@ def __init__(
     api_base: str | None = None,
     default_model: str = "claude-sonnet-4-20250514",
     extra_headers: dict[str, str] | None = None,
-    auth_token: str | None = None,                     # NEW
+    auth_token: str | None = None,                     # NEW — bearer token 认证
+    product_mode: str = "default",                     # NEW — "default" | "claude_code"
     credential_store: OAuthCredentialStore | None = None,  # NEW
 ) -> None:
 ```
 
 **初始化逻辑**：
-1. 若 `auth_token` 非空 → OAuth 模式 (`self._is_oauth = True`)。
-2. 否则若 `api_key` 以 `sk-ant-oat` 开头 → 兼容模式，同样视为 OAuth 模式（用于直接传入 env var 的场景）。
+**认证模式与产品模式正交分离**（review 修正）：
+
+1. `self._auth_mode = "bearer_token" if auth_token else "api_key"` — 控制 SDK 构造和 token refresh。
+2. `self._product_mode = product_mode` — 控制 beta headers、system prompt cc_block、tool name normalization。
+3. OAuth 检测唯一来源是 `auth_token is not None`。**删除** `api_key.startswith("sk-ant-oat")` 前缀猜测——env var 场景由 factory 层处理（读取 env 后作为 `auth_token` 传入），不在 provider 内部做前缀检测。
+4. factory.py 中根据 `spec.is_oauth` 同时设两者（`auth_token=...`, `product_mode="claude_code"`），默认行为不变。但两者是独立参数，未来可以组合出"API key + Claude Code 模式"或"OAuth + 非 Claude Code 模式"。
 3. 否则 → 普通 API key 模式。
 
 **Client 构造**：
@@ -150,8 +155,16 @@ class AnthropicProvider:
     _credential_store: OAuthCredentialStore | None = None   # NEW
 
     def _update_oauth_token(self, new_access_token: str) -> None:
-        """Hot-swap the auth token on the existing SDK client."""
-        self._client.auth_token = new_access_token   # SDK 公开属性
+        """Hot-swap the auth token on the existing SDK client.
+        
+        Fallback: if SDK property assignment fails (future SDK version
+        makes auth_token read-only), rebuild the client entirely.
+        """
+        try:
+            self._client.auth_token = new_access_token
+        except (AttributeError, TypeError):
+            logger.debug("auth_token property assignment failed, rebuilding client")
+            self._client = self._build_client(auth_token=new_access_token)
 
     async def _ensure_valid_token(self) -> None:
         """Refresh OAuth token if expired or near expiry.
@@ -160,7 +173,7 @@ class AnthropicProvider:
         Concurrent callers are serialized by _refresh_lock; after lock
         acquisition, re-check expiry to avoid redundant refresh.
         """
-        if not self._is_oauth or self._credential_store is None:
+        if self._auth_mode != "bearer_token" or self._credential_store is None:
             return
         now_ms = int(time.time() * 1000)
         if now_ms < self._token_expires_at_ms - TOKEN_REFRESH_MARGIN_MS:
@@ -196,33 +209,36 @@ class AnthropicProvider:
 
 #### 4.3.3 `_build_kwargs` 的 OAuth 注入
 
-在 `_build_kwargs` 中增加以下 OAuth-only 逻辑（不影响 API key 路径）：
+在 `_build_kwargs` 中，按 `_product_mode` 和 `_auth_mode` 分别控制行为（review 修正：认证和产品行为正交分离）：
 
-1. **System prompt prepend**：
+1. **System prompt prepend**（由 `_product_mode` 控制，不由 `_auth_mode` 控制）：
    ```python
-   if self._is_oauth:
+   if self._product_mode == "claude_code":
        cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PROMPT}
-       if isinstance(system, list) and system:
-           kwargs["system"] = [cc_block, *system]
-       elif isinstance(system, str) and system:
-           kwargs["system"] = [cc_block, {"type": "text", "text": system}]
-       else:
-           kwargs["system"] = [cc_block]
+       # 先规范化为 list，再 prepend（消除三层分支）
+       if isinstance(system, str) and system:
+           system = [{"type": "text", "text": system}]
+       elif not isinstance(system, list):
+           system = []
+       kwargs["system"] = [cc_block, *system]
    ```
 
-2. **Beta headers per-request**：
+2. **Beta headers per-request**（由 `_product_mode` 控制）：
    ```python
    request_headers = dict(self.extra_headers)
-   if self._is_oauth:
-       request_headers = _merge_beta_header(request_headers, _OAUTH_BETAS)
+   if self._product_mode == "claude_code":
+       request_headers = _merge_beta_header(request_headers, _CLAUDE_CODE_BETAS)
    if request_headers:
        kwargs["extra_headers"] = request_headers
    ```
 
-3. **Tool name normalization**（在 `_convert_tools` 中）：
+3. **Tool name normalization**（在 `_convert_tools` 中，由 `_product_mode` 控制）：
    ```python
-   name = _to_claude_code_name(raw_name) if self._is_oauth else raw_name
+   name = _to_claude_code_name(raw_name) if self._product_mode == "claude_code" else raw_name
    ```
+
+4. **Token refresh**（由 `_auth_mode` 控制，与产品模式无关）：
+   `_ensure_valid_token()` 仅在 `self._auth_mode == "bearer_token"` 时执行。
 
 #### 4.3.4 `chat()` / `chat_stream()` 入口
 
@@ -349,7 +365,7 @@ factory._make_provider_core()
         │   └── fallback: 读取 ~/.claude/.credentials.json (read-only)
         └── AnthropicProvider(auth_token=..., credential_store=...)
             ├── __init__ 构造 AsyncAnthropic(auth_token=...)
-            └── 设置 _is_oauth=True
+            └── 设置 _auth_mode="bearer_token", _product_mode="claude_code"
     ↓
 AnthropicProvider.chat() / chat_stream()
     ├── await _ensure_valid_token()
@@ -409,8 +425,10 @@ AnthropicProvider.chat() / chat_stream()
 
 ```python
 class TestOAuthDetection:
-    def test_detects_oauth_token_prefix(self): ...
-    def test_rejects_api_key_prefix(self): ...
+    def test_bearer_auth_when_auth_token_provided(self): ...
+    def test_api_key_auth_when_no_auth_token(self): ...
+    def test_product_mode_claude_code_enables_betas(self): ...
+    def test_product_mode_default_skips_betas(self): ...
     def test_rejects_none(self): ...
 
 class TestOAuthHeaders:
@@ -511,7 +529,7 @@ def test_logout_handler_registered_for_anthropic_claude_code(): ...
 | 设计决策 | 依赖的 upstream 特定版本细节 | 未来升级 review point |
 |---|---|---|
 | `AsyncAnthropic` 支持 `auth_token` 参数 | `anthropic` SDK >= 0.50 | 若 SDK 移除 `auth_token`，需改用 `default_headers={"Authorization": "Bearer ..."}`。 |
-| `self._client.auth_token = new_access_token` | SDK 公开属性赋值 | 若 SDK 未来改为私有属性或不可变，需改为重新构造 `AsyncAnthropic` 实例。 |
+| `self._client.auth_token = new_access_token` | SDK 公开属性赋值 | 已在 `_update_oauth_token` 中加 try/except fallback 到 `_build_client()` 重建，降低风险。 |
 | `AnthropicProvider.__init__` 新增可选参数 | 当前 upstream 的构造函数签名 | 若 upstream 重构 provider 为 dataclass 或 pydantic model，需调整参数注入方式。 |
 | `factory.py` 硬编码 `backend == "anthropic"` 分支 | upstream 的 provider 构造分发模式 | 若 upstream 引入 provider factory registry / plugin 机制，应将 OAuth 逻辑迁移到 plugin。 |
 | `AnthropicProvider.chat/chat_stream` 中内嵌 refresh | 当前 upstream 无 `pre_request` hook | 若 upstream 基类增加 `pre_request()` lifecycle hook，应将 `_ensure_valid_token()` 迁移到 hook。 |
@@ -565,11 +583,12 @@ def test_logout_handler_registered_for_anthropic_claude_code(): ...
 2. **Refresh 失败不阻断请求**：避免了网络抖动导致服务完全不可用。过期 token 会让 SDK 返回 401，走正常 error path。
 3. **Credential store 独立成模块**：不耦合 `oauth_cli_kit`，也不依赖 provider 实现。这个模块未来可被其他 OAuth provider 复用。
 4. **Login handler 为 migration-only**：不实现完整的 OAuth device flow（这需要一个 OAuth app registration 和回调服务器），而是依赖用户先通过 Claude CLI 登录，然后 nanobot 读取并迁移 credentials。这符合最小侵入原则。
-5. **Tool name normalization 在 `_convert_tools` 中条件执行**：只在 OAuth 模式生效，不影响 API key 用户。
+5. **Tool name normalization 在 `_convert_tools` 中条件执行**：只在 Claude Code 产品模式生效（`_product_mode == "claude_code"`），不影响普通 API key 用户。
+6. **认证模式与产品模式正交分离**（review 修正）：`_auth_mode` 控制 SDK 构造和 token refresh，`_product_mode` 控制 beta headers/system prompt/tool normalization。两者独立，不再用一个 `_is_oauth` 焊死。
 
 ### 9.3 不确定点
 
 1. **Login handler 的完整度**：如果产品要求 `provider login anthropic-claude-code` 实现完整的 device flow（不依赖 Claude CLI），则需要一个独立的 OAuth 登录实现（类似 `github_copilot_provider.py` 的 device flow）。当前 spec 将其降级为 migration-only，是否满足需求需产品确认。
-2. **`auth_token` 属性赋值**：`self._client.auth_token = new_access_token` 是 SDK 的公开属性，但不在官方文档中明确列出。如果 SDK 未来版本限制该属性为只读，需要改为重新构造 `AsyncAnthropic` 实例。
+2. **`auth_token` 属性赋值**：已在 `_update_oauth_token` 中加 try/except fallback 到 `_build_client()` 重建，即使 SDK 未来限制该属性为只读也不会运行时崩溃。
 3. **Beta headers 列表**：`_OAUTH_BETAS` 的具体值来源于 fork 的生产代码。Anthropic 可能在未来 API 版本中移除某些 beta flag，需要持续跟踪。
 4. **Upstream 测试覆盖度**：upstream 当前的 `tests/providers/test_anthropic_provider.py` 是否存在（工作目录中未找到）。如果不存在，OAuth 回归测试需要覆盖更多 API key 模式的基础 case，以防止 OAuth 改动破坏普通 Anthropic 用户。

@@ -165,6 +165,8 @@ class AgentRunResult:
 | **Assistant message metadata** | `model`、`usage`、`latency_ms`、`elapsed_ms`、`llm_elapsed_ms` | 每个 assistant message dict | 随 message 存入 JSONL |
 | **Runtime-only context** | `[Runtime Context]` prompt 块中的 `Channel Name`、`Sender Name`、`Current Time` | **不持久化**，仅拼接在 user content 末尾发给 LLM | 单 turn |
 
+> **明确标注**：Session-level metadata 当前不做额外持久化写入，runtime 信息（channel_name 等）仅注入 prompt context，不写入 session.metadata。
+
 **关键设计**：`channel_name` 和 `sender_name` 属于 runtime-only context（不持久化），但 `sender_id` 和可选的 `sender_name` 作为 user message metadata 持久化。这避免了在 prompt 中重复注入已持久化的信息，同时保留审计能力。
 
 ### 4.2 channel_name / sender_id / sender_name 的入口边界
@@ -295,42 +297,57 @@ def _persist_user_message_early(self, msg: InboundMessage, session: Session, **k
    - 方案 B 的侵入度并不比 A 高——`_state_run()` 是唯一调用点，改一处解包逻辑即可。
    - 未来 upstream 若本身重构为返回 `AgentRunResult` 对象（向前兼容性表中已标注此可能），方案 B 天然对齐。
 
-3. **修改 `_save_turn()` 签名**：
-   ```python
-   def _save_turn(
-       self,
-       session: Session,
-       messages: list[dict],
-       skip: int,
-       *,
-       turn_latency_ms: int | None = None,
-       model: str | None = None,
-       usage: dict[str, int] | None = None,
-       elapsed_ms: int | None = None,
-       llm_elapsed_ms: int | None = None,
-   ) -> None:
-   ```
+    3. **定义 `AssistantTurnMetrics` dataclass 并修改 `_save_turn()` 签名**：
+       ```python
+       @dataclass
+       class AssistantTurnMetrics:
+           model: str | None = None
+           usage: dict[str, int] | None = None
+           latency_ms: int | None = None
+           elapsed_ms: int | None = None
+           llm_elapsed_ms: int | None = None
+       ```
 
-   在写入最后一个 assistant message 后，追加：
-   ```python
-   if last_assistant_idx is not None:
-       am = session.messages[last_assistant_idx]
-       if model is not None:
-           am["model"] = model
-       if usage:
-           am["usage"] = dict(usage)
-       if turn_latency_ms is not None:
-           am["latency_ms"] = int(turn_latency_ms)
-       if elapsed_ms is not None:
-           am["elapsed_ms"] = int(elapsed_ms)
-       if llm_elapsed_ms is not None:
-           am["llm_elapsed_ms"] = int(llm_elapsed_ms)
-   ```
+       ```python
+       def _save_turn(
+           self,
+           session: Session,
+           messages: list[dict],
+           skip: int,
+           *,
+           metrics: AssistantTurnMetrics | None = None,
+       ) -> None:
+       ```
 
-4. **`_state_save()` 调用 `_save_turn()` 时传入新参数**：
-   - `model` 来自 `self.model`（AgentLoop 实例属性，即当前 turn 使用的模型）。
-   - `usage` 来自 `self._last_usage`（AgentLoop 在 `_run_agent_loop()` 中已设置 `self._last_usage = result.usage`）。
-   - `elapsed_ms`、`llm_elapsed_ms` 来自 `TurnContext`（由 `_state_run()` 在解包 runner 结果时写入）。
+       在写入最后一个 assistant message 后，追加：
+       ```python
+       if last_assistant_idx is not None:
+           am = session.messages[last_assistant_idx]
+           if metrics is not None:
+               if metrics.model is not None:
+                   am["model"] = metrics.model
+               if metrics.usage:
+                   am["usage"] = dict(metrics.usage)
+               if metrics.latency_ms is not None:
+                   am["latency_ms"] = int(metrics.latency_ms)
+               if metrics.elapsed_ms is not None:
+                   am["elapsed_ms"] = int(metrics.elapsed_ms)
+               if metrics.llm_elapsed_ms is not None:
+                   am["llm_elapsed_ms"] = int(metrics.llm_elapsed_ms)
+       ```
+
+    4. **`_state_save()` 调用 `_save_turn()` 时传入 `metrics`**：
+       - 构造 `AssistantTurnMetrics`：
+         ```python
+         metrics = AssistantTurnMetrics(
+             model=self.model,
+             usage=self._last_usage,
+             latency_ms=turn_latency_ms,
+             elapsed_ms=ctx.turn_elapsed_ms,
+             llm_elapsed_ms=ctx.turn_llm_elapsed_ms,
+         )
+         ```
+       - 调用 `_save_turn(session, messages, skip, metrics=metrics)`。
 
 ### 4.4 provider_name 为什么不应该进入 runtime context
 
@@ -390,8 +407,8 @@ Upstream 已经解耦：
 | `AgentRunner._request_model()` | 中 | 在内部增加计时（与 Spec5 日志共享同一插桩点），返回值从 `LLMResponse` 变为 `tuple[LLMResponse, int]`。所有调用点在 `run()` 内部，可控。|
 | `AgentLoop._run_agent_loop()` | 中 | 改为返回 `AgentRunResult` 对象（方案 B）。所有调用点仅 `_state_run()` 一处，可控。|
 | `TurnContext` | 低 | 增加两个 int 字段。|
-| `AgentLoop._state_run()` | 低 | 解包扩展后的 tuple，写入 TurnContext。|
-| `AgentLoop._save_turn()` | 低 | 增加可选参数，仅在最后一个 assistant message 上写几个键。|
+| `AgentLoop._state_run()` | 低 | 将 `AgentRunResult` 存入 `TurnContext.run_result`，后续从 `ctx.run_result` 读取 timing 与 usage。|
+| `AgentLoop._save_turn()` | 低 | 改为接收 `AssistantTurnMetrics | None`，在最后一个 assistant message 上写键。|
 | `AgentLoop._state_save()` | 低 | 调用 `_save_turn()` 时传入新参数。|
 | `AgentLoop._persist_user_message_early()` | 低 | 增加 `sender_id`/`sender_name` 写入。|
 | `DiscordChannel._build_inbound_metadata()` | 低 | 增加两个字段。|
@@ -475,13 +492,13 @@ def test_assistant_message_metadata_persisted_to_jsonl(tmp_path):
 
 1. **Runner 计时**（`AgentRunner`）
    - 添加 `elapsed_ms` / `llm_elapsed_ms` 到 `AgentRunResult`。
-   - 添加 `_timed_request_model()` 包装器。
+   - 在 `_request_model()` 内部增加计时，返回 `(response, elapsed_ms)`。
    - 修改 `run()` 计时逻辑。
    - 测试：`tests/agent/test_runner_timing.py`
 
 2. **AgentLoop turn 保存增强**（`AgentLoop._save_turn`, `_state_save`, `_state_run`）
    - 扩展 `TurnContext`。
-   - 扩展 `_run_agent_loop()` 返回 tuple。
+   - 改 `_run_agent_loop()` 返回 `AgentRunResult` 对象（方案 B）。
    - 扩展 `_save_turn()` 签名和 assistant message 写入逻辑。
    - 测试：`tests/agent/test_loop_save_turn.py`
 
@@ -516,7 +533,7 @@ def test_assistant_message_metadata_persisted_to_jsonl(tmp_path):
 | `_request_finalization_retry()` | Spec3 + Spec5 | 计时纳入 `llm_elapsed_ms`（Spec3），日志静默（Spec5）。 |
 | `AgentRunResult` 扩展方式 | Spec3 + Spec5 | 统一用方案 B（`AgentRunResult` 整体传递），不扩展 tuple。 |
 | `sender_name` 数据流 | Spec3 → Spec2 | Spec3 建立入口（`InboundMessage.metadata["sender_name"]`），Spec2 在 outbound 阶段消费。metadata key 名必须一致：`"sender_name"`。实现顺序：先 Spec3 后 Spec2。 |
-| `AgentLoop` 参数膨胀 | Spec3 + Spec4 + Spec5 + Spec6 | 所有 pack 新增的 `AgentLoop` 配置统一打包到 `ForkConfig` dataclass，`AgentLoop.__init__` 只新增一个 `fork_config: ForkConfig | None = None` 参数。详见 Spec4/5/6 对应段落。 |
+| `AgentLoop` 构造函数参数 | Spec3 | **Spec3 不涉及 AgentLoop 构造函数参数新增**。 |
 
 ## 附录 B：关键设计决策速查
 
@@ -529,7 +546,7 @@ def test_assistant_message_metadata_persisted_to_jsonl(tmp_path):
 | `AgentRunResult` 新增字段默认值 | **0** | 保持向后兼容，现有调用方无需修改。 |
 | `_run_agent_loop()` 返回方式 | **方案 B：返回 `AgentRunResult`** | 与 Spec5 对齐，避免 tuple 位置参数膨胀。调用点唯一（`_state_run`），侵入可控。 |
 
-## 附录 B：不确定点
+## 附录 C：不确定点
 
 1. **Upstream `openai_compat_provider.py` 的 usage 字段粒度**：plan 提到该 provider 可能已保留更详细的 usage 字段（如 `cached_tokens`）。实现前需 inspect `nanobot/providers/openai_compat_provider.py` 中 `LLMResponse` 的构造逻辑。如果已完整保留，则无需修改 provider 层；否则在 provider 层补充。
 2. **`tests/agent/test_context_builder.py` 是否存在**：未在 plan 中明确列出。若不存在，测试应新建在 `tests/agent/` 下。若上游已有但未发现，应复用现有模块。

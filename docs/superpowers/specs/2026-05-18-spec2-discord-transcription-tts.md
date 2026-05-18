@@ -48,12 +48,13 @@
 ### 2.4 TTS 回播
 
 - 全局配置 `tts.enabled` 控制 TTS 模块是否加载。
-- `/tts on` 将当前 session 的 `_session_tts` 设为 `True`；`/tts off` 设为 `False`。
+- `/tts on` 将当前 session 的 `metadata["_outbound_tts"]` 设为 `True`；`/tts off` 删除该 key。
 - 当 session TTS 开启且全局 TTS 启用时，outbound 文本响应应附带一张 MP3 音频附件。
 - `auto_tts_senders` 列表支持按 sender name（大小写不敏感）自动触发 TTS，无需用户手动 `/tts on`。
 - MessageTool 向同一 chat 发送的消息也应触发 TTS（因为属于同一对话上下文）。
 - TTS 合成失败不得阻塞文本发送；音频缺失时文本仍应送达。
 - 文本超过 `max_text_length` 时截断后再合成。
+- **通用传播机制**：AgentLoop 在 `_state_respond` 和 `_state_build` 中自动将 session metadata 里所有以 `_outbound_` 前缀的 key 注入到 outbound metadata。TTS 只是该机制的第一个消费者。
 
 ---
 
@@ -111,7 +112,7 @@ MessageTool.send_message(...)
           └── OutboundMessage(..., metadata=metadata)
 ```
 
-因此，只要 `_session_tts` 被写入 `InboundMessage.metadata` 或 `MessageTool._default_metadata`，same-target 的 `MessageTool` 发送自然携带该标志。
+因此，只要 `_outbound_tts` 被写入 `session.metadata`，AgentLoop 的通用传播机制会自动将它复制到 outbound metadata 和 `MessageTool._default_metadata`，same-target 的 `MessageTool` 发送自然携带该标志。
 
 ---
 
@@ -136,11 +137,11 @@ class DiscordChannel(BaseChannel):
         if bot_user_id is None:
             return False  # identity unknown; don't drop
 
-        mentions_bot = any(str(u.id) == bot_user_id for u in message.mentions)
-        if not mentions_bot:
-            mentions_bot = bot_user_id in {str(uid) for uid in getattr(message, "raw_mentions", [])}
-        if not mentions_bot:
-            mentions_bot = f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content
+        mentions_bot = any((
+            any(str(u.id) == bot_user_id for u in message.mentions),
+            bot_user_id in {str(uid) for uid in getattr(message, "raw_mentions", [])},
+            f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content,
+        ))
 
         if mentions_bot:
             return False
@@ -344,11 +345,9 @@ class TTSConfig(Base):
     enabled: bool = False
     provider: str = "edge"
     voice: str = "zh-CN-XiaoxiaoNeural"
-    max_text_length: int = 2000
+    max_text_length: int = 4096
     auto_tts_senders: list[str] = Field(default_factory=list)
-    fish_api_key: str = ""
-    fish_reference_id: str = ""
-    fish_speed: float = 1.2
+    provider_config: dict[str, Any] = Field(default_factory=dict)  # provider-specific
 
 class Config(BaseSettings):
     # ... existing fields ...
@@ -388,9 +387,9 @@ if getattr(config, "tts", None) is not None and config.tts.enabled:
 async def send(self, msg: OutboundMessage) -> None:
     # TTS injection
     if self._tts_service is not None:
-        session_tts = msg.metadata.get("_session_tts", False)
+        outbound_tts = msg.metadata.get("_outbound_tts", False)
         sender_name = msg.metadata.get("sender_name")  # or wherever sender name is stored
-        if self._tts_service.should_trigger(session_tts=session_tts, sender_name=sender_name):
+        if self._tts_service.should_trigger(session_tts=outbound_tts, sender_name=sender_name):
             try:
                 audio_path = await self._tts_service.synthesize(msg.content)
                 if audio_path:
@@ -425,13 +424,13 @@ async def cmd_tts(ctx: CommandContext) -> OutboundMessage:
         )
     args = ctx.args.strip().lower()
     if args == "on":
-        ctx.session.metadata["_session_tts"] = True
+        ctx.session.metadata["_outbound_tts"] = True
         content = "TTS enabled for this session."
     elif args == "off":
-        ctx.session.metadata["_session_tts"] = False
+        ctx.session.metadata.pop("_outbound_tts", None)
         content = "TTS disabled for this session."
     elif args == "":
-        state = ctx.session.metadata.get("_session_tts", False)
+        state = ctx.session.metadata.get("_outbound_tts", False)
         content = f"TTS is {'on' if state else 'off'} for this session."
     else:
         content = "Usage: `/tts on` or `/tts off`"
@@ -448,21 +447,15 @@ router.exact("/tts", cmd_tts)
 router.prefix("/tts ", cmd_tts)
 ```
 
-### 4.6 session_tts 状态如何传递到 outbound
+### 4.6 `_outbound_` 前缀的通用传播机制
 
-#### 4.6.1 正常响应路径
+**设计原则**：AgentLoop 不应当认识 `_session_tts` 这个字符串常量。任何 session metadata 中以 `_outbound_` 前缀的 key 都应自动注入到 outbound metadata，供下游 channel 消费。
 
-`session.metadata["_session_tts"]` 在 `_save_turn` 时随 session 持久化到磁盘（`SessionManager` 保存整个 `session.metadata`）。因此跨 turn 状态天然持久。
+#### 4.6.1 正常响应路径（`_state_respond`）
 
-**传递链**：
+`session.metadata["_outbound_tts"]` 在 `_save_turn` 时随 session 持久化到磁盘（`SessionManager` 保存整个 `session.metadata`）。因此跨 turn 状态天然持久。
 
-```
-session.metadata["_session_tts"]
-  └── AgentLoop._state_respond
-        └── 在 _assemble_outbound 返回后，直接补丁 metadata
-```
-
-**最小侵入实现**（不改 `_assemble_outbound` 签名）：
+**通用注入实现**：
 
 ```python
 # AgentLoop._state_respond
@@ -477,63 +470,46 @@ async def _state_respond(self, ctx: TurnContext) -> str:
         ctx.on_stream,
         turn_latency_ms=ctx.turn_latency_ms,
     )
-    # Pack2: propagate session TTS flag to outbound metadata
-    if ctx.session and ctx.session.metadata.get("_session_tts"):
-        ctx.outbound.metadata["_session_tts"] = True
+    # Pack2: propagate all session metadata keys prefixed with _outbound_ to outbound
+    if ctx.session:
+        for key, value in ctx.session.metadata.items():
+            if key.startswith("_outbound_"):
+                ctx.outbound.metadata[key] = value
     return "ok"
 ```
 
-**为什么不改 `_assemble_outbound`**：`_assemble_outbound` 是纯组装函数，当前签名不依赖 `Session`。如果加入 `session` 参数，会改变 upstream 核心 API 的契约，未来 upstream 若调整该方法，合并冲突风险更大。在 `_state_respond` 中补丁 metadata 是外科手术式的修改，范围最小。
+#### 4.6.2 MessageTool same-target 路径（`_state_build`）
 
-#### 4.6.2 MessageTool same-target 路径
-
-`MessageTool` 发送 same-target 消息时，会复制 `_default_metadata` ContextVar 到 outbound。因此需要把 `_session_tts` 写入 `_default_metadata`。
-
-当前 `MessageTool.start_turn()` 只复制 `RequestContext.metadata`（即 inbound message metadata），不读 `session.metadata`。
-
-**方案比较**：
-
-| 方案 | 侵入点 | 评价 |
-|------|--------|------|
-| A. 在 `AgentLoop._state_build` 中把 `_session_tts` 写入 `msg.metadata` | `InboundMessage` | 污染 inbound metadata；若 upstream 将 metadata 用于其他路由决策，可能产生副作用。 |
-| B. 修改 `MessageTool.start_turn()` 接收 session | `MessageTool` 签名 | 需要改 Tool ABC，侵入性高。 |
-| C. 在 `MessageTool` 上新增 `add_default_metadata(key, value)` 方法，由 `AgentLoop._state_build` 在 `start_turn()` 后调用 | `MessageTool` | 仅增加一个公共 setter，不改现有调用链，侵入最低。 |
-
-**推荐方案 C**：
+`MessageTool.start_turn()` 会复制 `RequestContext.metadata`（即 inbound message metadata）到 `_default_metadata` ContextVar。为了让 MessageTool 的 same-target 发送也能获得 `_outbound_*` 标志，在 `AgentLoop._state_build` 中将 session 中的 `_outbound_*` key 同步写入 `_default_metadata`：
 
 ```python
-# nanobot/agent/tools/message.py
-class MessageTool(Tool, ContextAware):
-    # ... existing ...
-    def add_default_metadata(self, key: str, value: Any) -> None:
-        """Inject an extra key into the default metadata for same-target sends."""
-        try:
-            meta = dict(self._default_metadata.get())
-        except LookupError:
-            meta = {}
-        meta[key] = value
-        self._default_metadata.set(meta)
-```
-
-在 `AgentLoop._state_build` 中：
-
-```python
+# AgentLoop._state_build
 if message_tool := self.tools.get("message"):
     if isinstance(message_tool, MessageTool):
         message_tool.start_turn()
-        if ctx.session and ctx.session.metadata.get("_session_tts"):
-            message_tool.add_default_metadata("_session_tts", True)
+        # Propagate _outbound_* keys from session to MessageTool default metadata
+        if ctx.session:
+            for key, value in ctx.session.metadata.items():
+                if key.startswith("_outbound_"):
+                    try:
+                        meta = dict(message_tool._default_metadata.get())
+                    except LookupError:
+                        meta = {}
+                    meta[key] = value
+                    message_tool._default_metadata.set(meta)
 ```
+
+**为什么不改 `_assemble_outbound` 或 `MessageTool` 签名**：`_assemble_outbound` 是纯组装函数，当前签名不依赖 `Session`。如果加入 `session` 参数，会改变 upstream 核心 API 的契约。在 `_state_respond` 和 `_state_build` 中通过前缀遍历注入是外科手术式的修改，AgentLoop 不需要知道任何具体业务 key（如 `_session_tts`），范围最小。
 
 ### 4.7 MessageTool 如何触发 TTS
 
 当 MessageTool 调用 `send_message` 到 same-target 时：
-1. `metadata = dict(_default_metadata.get())` 会包含 `"_session_tts": True`。
+1. `metadata = dict(_default_metadata.get())` 会包含 `"_outbound_tts": True`。
 2. `OutboundMessage(..., metadata=metadata)` 被 publish 到 bus。
 3. `ChannelManager._dispatch_outbound` 将该消息路由到 `DiscordChannel.send(msg)`。
-4. `DiscordChannel.send` 检查 `msg.metadata.get("_session_tts")`，触发 TTS 合成并追加到 `msg.media`。
+4. `DiscordChannel.send` 检查 `msg.metadata.get("_outbound_tts")`，触发 TTS 合成并追加到 `msg.media`。
 
-因此 MessageTool 触发 TTS **不需要任何额外改动**，只要 `_session_tts` 能进入 `_default_metadata` 即可（见 4.6.2）。
+因此 MessageTool 触发 TTS **不需要任何额外改动**，只要通用传播机制把 `_outbound_tts` 复制到 `_default_metadata` 即可（见 4.6.2）。
 
 ---
 
@@ -549,9 +525,8 @@ if message_tool := self.tools.get("message"):
 | `DiscordChannel.__init__` 懒加载 TTS | **低** | 仅检查 `config.tts` 并构造 service。 |
 | `DiscordChannel.send` TTS 注入 | **中** | override `send` 方法，内嵌 TTS 逻辑。若 upstream 未来大幅重构 `send`，需同步。 |
 | `/tts` builtin command | **低** | `builtin.py` 新增 handler + 一行注册。 |
-| `AgentLoop._state_respond` metadata 补丁 | **低** | 两行注入，不改 `_assemble_outbound` 签名。 |
-| `MessageTool.add_default_metadata` | **低** | 新增公共方法，不改现有行为。 |
-| `AgentLoop._state_build` 调用 `add_default_metadata` | **低** | 两行注入，仅在 session TTS 开启时执行。 |
+| `AgentLoop._state_respond` 通用 outbound metadata 传播 | **低** | 前缀遍历注入，不改 `_assemble_outbound` 签名；AgentLoop 不硬编码业务 key。 |
+| `AgentLoop._state_build` 向 `MessageTool._default_metadata` 同步 `_outbound_*` | **低** | 前缀遍历注入，不改 `MessageTool` 签名；无需 `add_default_metadata` 方法。 |
 
 **总体评估**：所有改动均为"新增方法/模块"或"在现有函数末尾/条件分支中注入"，没有删除 upstream 代码，没有重命名 upstream 类/方法。
 
@@ -619,24 +594,24 @@ if message_tool := self.tools.get("message"):
 
 - `test_tts_command_sets_session_metadata`
   - 构造 `CommandContext` + mock session。
-  - 调用 `cmd_tts(ctx)`，断言 `session.metadata["_session_tts"]` 为 True/False。
+  - 调用 `cmd_tts(ctx)`，断言 `session.metadata["_outbound_tts"]` 为 True；off 时断言 key 被移除。
 - `test_tts_command_returns_status_when_no_args`
   - 无 args，断言返回内容包含当前状态。
 
 ### 6.6 Integration（AgentLoop + MessageTool + Outbound）
 
 - `test_session_tts_reaches_outbound_metadata`
-  - Mock `AgentLoop._state_respond` 路径：session.metadata 中预置 `_session_tts=True`。
-  - 调用 `_process_message`，断言返回的 `OutboundMessage.metadata["_session_tts"]` 为 True。
-- `test_session_tts_reaches_message_tool_same_target_send`
-  - 设置 session.metadata + 调用 `MessageTool.start_turn()` + `add_default_metadata`。
-  - `send_message` same-target，断言 publish 的 `OutboundMessage.metadata["_session_tts"]` 为 True。
+  - Mock `AgentLoop._state_respond` 路径：session.metadata 中预置 `_outbound_tts=True`。
+  - 调用 `_process_message`，断言返回的 `OutboundMessage.metadata["_outbound_tts"]` 为 True。
+- `test_outbound_prefix_keys_reach_message_tool_same_target_send`
+  - 设置 session.metadata `_outbound_tts=True` + 调用 `AgentLoop._state_build` 传播逻辑。
+  - `send_message` same-target，断言 publish 的 `OutboundMessage.metadata["_outbound_tts"]` 为 True。
 
 ### 6.7 DiscordChannel.send TTS 集成
 
-- `test_discord_send_appends_tts_audio_when_session_tts_enabled`
+- `test_discord_send_appends_tts_audio_when_outbound_tts_enabled`
   - Monkeypatch `TTSService.synthesize` 返回 fake path。
-  - 构造 `OutboundMessage(metadata={"_session_tts": True})`。
+  - 构造 `OutboundMessage(metadata={"_outbound_tts": True})`。
   - 调用 `DiscordChannel.send(msg)`。
   - 断言 `msg.media` 包含 fake path，且原始 send 逻辑仍被调用。
 - `test_discord_send_does_not_block_text_on_tts_failure`
@@ -658,11 +633,14 @@ if message_tool := self.tools.get("message"):
 | 5 | `ChannelManager._dispatch_outbound` 直接调用 `channel.send(msg)` | outbound 不经过转换直接投递 | 若 upstream 引入 outbound interceptor/middleware 层，TTS 可迁移到 middleware 中， cleaner。 |
 | 6 | `Session.metadata` 是自由 `dict[str, Any]` | 直接读写，无 schema 校验 | 若 upstream 给 metadata 增加 schema 或白名单，`_session_tts` 需注册为合法 key。 |
 | 7 | `discord.py` Message 对象的 `mentions`, `raw_mentions`, `webhook_id` | Mention filter 依赖这些属性 | 若 upstream 换用其他 Discord 库（如 `nextcord`/`disnake`），属性名大概率兼容，但需验证。 |
+| 8 | `_outbound_` 前缀约定作为 session→outbound metadata 契约 | `AgentLoop` 在 `_state_respond` / `_state_build` 中遍历 `session.metadata`，将 `_outbound_*` key 复制到 outbound / `MessageTool._default_metadata` | 若 upstream 给 metadata 增加 schema 白名单，或改用显式 context 对象，前缀遍历需改为注册式传播。 |
+| 9 | `AgentLoop._state_respond` 可安全补丁 outbound metadata | 在 `_assemble_outbound` 返回后修改 `ctx.outbound.metadata` | 若 upstream 将 `_assemble_outbound` 与 `_state_respond` 合并，或 outbound 变为 immutable，注入点需迁移。 |
+| 10 | `AgentLoop._state_build` 可访问 `MessageTool._default_metadata` | 通过 `self.tools.get("message")` 获取 tool 实例并修改其 ContextVar | 若 upstream 改变 tool 注册方式或移除 ContextVar，同步逻辑需重写。 |
 
 **缓解策略**：
 - 所有 TTS 逻辑集中在 `nanobot/tts/` 包和 `DiscordChannel.send` 中，核心改动不超过 5 个文件。
-- TTS 模块与 upstream 核心通过 `OutboundMessage.metadata["_session_tts"]` 单一 flag 耦合，契约极简。
-- `add_default_metadata` 是正向扩展（新增方法），不破坏现有接口。
+- TTS 模块与 upstream 核心通过 `OutboundMessage.metadata["_outbound_tts"]` 单一 flag 耦合，契约极简。
+- 通用传播机制不新增公共 API，仅通过前缀约定耦合，未来可平滑迁移到注册式或 middleware 方案。
 
 ---
 
@@ -694,9 +672,9 @@ if message_tool := self.tools.get("message"):
    - `builtin.py` 新增 `cmd_tts` + 注册。
    - 测试命令行为。
 
-6. **session_tts 传递到 outbound + MessageTool**
-   - `AgentLoop._state_respond` metadata 补丁。
-   - `MessageTool.add_default_metadata` + `AgentLoop._state_build` 调用。
+6. **通用 outbound metadata 传播机制**
+   - `AgentLoop._state_respond` 中遍历注入 `_outbound_*` 到 outbound metadata。
+   - `AgentLoop._state_build` 中同步 `_outbound_*` 到 `MessageTool._default_metadata`。
    - 测试 `_process_message` 返回的 outbound 含 flag；测试 MessageTool same-target 发送含 flag。
 
 7. **DiscordChannel.send TTS 注入**
@@ -715,10 +693,9 @@ if message_tool := self.tools.get("message"):
 1. **Mention filter 放在 `DiscordChannel._handle_discord_message`**，不是 `BaseChannel`。因为 mention 语义平台相关。
 2. **语音转写复用 `nanobot/providers/transcription.py`**，不新建 provider。调用链止于 `DiscordChannel._transcribe_audio`。
 3. **TTS 是可选插件模块 `nanobot/tts/`，生命周期由 `DiscordChannel` 持有**。不侵入 `AgentLoop` 或 `ChannelManager` 核心流。
-4. **`_session_tts` 在 `AgentLoop._state_respond` 中补丁到 outbound metadata**，不改 `_assemble_outbound` 签名，最小化核心 API 侵入。
-5. **`MessageTool` 通过新增 `add_default_metadata()` 方法传播 `_session_tts`**，不改 `start_turn()` 签名，不污染 `InboundMessage.metadata`。
-6. **TTS 合成在 `DiscordChannel.send` 中执行**，音频以 `OutboundMessage.media` 附加。失败被 swallow，不阻断文本。
-7. **`/tts` 走 `CommandRouter` 文本命令层**，不注册 Discord slash command，保持跨 channel 命令语义统一。
+4. **`_outbound_` 前缀的通用传播机制**：AgentLoop 在 `_state_respond` 和 `_state_build` 中自动将 session metadata 里所有 `_outbound_*` key 注入到 outbound metadata 和 `MessageTool._default_metadata`。TTS 只是第一个消费者，AgentLoop 不硬编码 `_session_tts`。
+5. **TTS 合成在 `DiscordChannel.send` 中执行**，音频以 `OutboundMessage.media` 附加。失败被 swallow，不阻断文本。
+6. **`/tts` 走 `CommandRouter` 文本命令层**，不注册 Discord slash command，保持跨 channel 命令语义统一。
 
 ## 10. 不确定点
 

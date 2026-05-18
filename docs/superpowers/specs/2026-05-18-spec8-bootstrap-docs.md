@@ -6,7 +6,7 @@ Pack8 是 upstream sync replay 系列的最后一个 pack。它将 fork 的本�
 
 本 spec 覆盖四个核心变更：
 
-1. **CLAUDE.md merge**：将 fork 的哲学/架构指南与 upstream 的技术参考合并为一个文件。
+1. **CLAUDE.md 不合并**：CLAUDE.md 保持 upstream 原样，fork 的哲学/架构指南独立存放，不污染 upstream 文档。
 2. **Bootstrap 文件重排序与 soul anchor**：调整主 agent 的引导文件加载顺序，并在系统提示末尾追加 soul anchor（`# Remember` 块）。
 3. **Subagent bootstrap 注入**：为子 agent 系统提示注入精简后的引导内容（仅 `SOUL.md` + `TOOLS.md`）。
 4. **identity.md Discord table hint**：在 Discord 格式提示中增加 Markdown 表格不渲染的警告。
@@ -19,9 +19,10 @@ Pack8 是 upstream sync replay 系列的最后一个 pack。它将 fork 的本�
 
 ### 1.1 CLAUDE.md
 
-- 文件必须同时包含 upstream 技术参考（完整保留 upstream/main 的 1–84 行）和 fork 哲学/架构指南（完整保留 origin/main 的 `CLAUDE.md` 内容）。
-- 两部分之间以独立的一行 `---` 分隔。
-- 不将 fork 的 XML-tag 风格内容改写为 Markdown；保持其原始格式，因为 fork 的 persona 系统按 XML tag 消费这些内容。
+- **CLAUDE.md 保持 upstream 原样，不追加 fork 内容。**
+- Fork 的哲学/架构指南已经在 `SOUL.md` 中体现（`SOUL.md` 是给模型读的运行时契约）。
+- 如果有 fork-specific 的开发者参考（如 coding philosophy），放在独立的 `FORK_GUIDE.md` 或 `docs/` 下，不污染 upstream `CLAUDE.md`。
+- 这样每次 upstream 更新 `CLAUDE.md` 时零冲突。
 
 ### 1.2 Bootstrap 加载顺序
 
@@ -39,6 +40,7 @@ BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 - 若 `SOUL.md` 不存在，不追加任何内容。
 - Soul anchor 必须位于 `session_summary` 块之后（即系统提示的最末尾，在 `return` 之前）。
 - **子 agent 系统提示中不得出现 soul anchor。**
+- **实验性特性**：soul anchor 基于 fork 生产经验，缺乏 A/B 测试验证。如果 upstream 未来提供 prompt importance/pinning 机制，soul anchor 应迁移到该机制。
 
 ### 1.4 Subagent bootstrap 注入
 
@@ -46,6 +48,7 @@ BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 - 格式化为 `## {filename}\n\n{content}` 块，缺失或空文件跳过，块之间以 `\n\n` 连接。
 - 将连接后的字符串作为 `bootstrap` 变量传给 `render_template("agent/subagent_system.md", ...)`。
 - 子 agent 不注入 `USER.md` 和 `AGENTS.md`——子 agent 是任务专注的，不需要用户特定上下文或 agent 路由规则。
+- **显式验证**：`USER.md` 包含用户个人信息和偏好，subagent 是任务专注的短生命周期执行者，不需要也不应该接触用户个人数据。如果未来出现 subagent 需要用户偏好的场景（如用户是色盲），应通过 task prompt 显式传递相关上下文，而不是注入完整 `USER.md`。
 - 子 agent 使用独立的本地文件列表，不重用 `ContextBuilder.BOOTSTRAP_FILES`。
 
 ### 1.5 Subagent 模板渲染位置
@@ -88,6 +91,17 @@ BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 #### `ContextBuilder`（`nanobot/agent/context.py`）
 
 ```python
+def load_and_format_bootstrap(filenames: list[str], workspace: Path) -> str:
+    """Load and format bootstrap files as `## {name}\n\n{content}` blocks."""
+    parts = []
+    for filename in filenames:
+        file_path = workspace / filename
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8")
+            parts.append(f"## {filename}\n\n{content}")
+    return "\n\n".join(parts) if parts else ""
+
+
 class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
 
@@ -110,13 +124,7 @@ class ContextBuilder:
         return "\n\n---\n\n".join(parts)
 
     def _load_bootstrap_files(self) -> str:
-        parts = []
-        for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
-        return "\n\n".join(parts) if parts else ""
+        return load_and_format_bootstrap(self.BOOTSTRAP_FILES, self.workspace)
 ```
 
 当前 `build_system_prompt` 的结构（从上到下）是：
@@ -190,26 +198,29 @@ This conversation is on a messaging app. Use short paragraphs. Avoid large headi
 | Bootstrap 顺序 | `AGENTS, SOUL, USER, TOOLS` | `SOUL, USER, AGENTS, TOOLS` | 采用 fork 顺序 |
 | Soul anchor | 不存在 | 主 agent 有，子 agent 无 | 采用 fork 最终状态 |
 | Subagent bootstrap | 不存在 | `SOUL.md` + `TOOLS.md` | 采用 fork 最终状态 |
-| CLAUDE.md | 纯技术参考 | 纯哲学指南 | Merge：upstream 在前 + fork 在后 |
+| CLAUDE.md | 纯技术参考 | 纯哲学指南 | **不合并**：保持 upstream 原样，fork 内容放 SOUL.md / FORK_GUIDE.md |
 | Discord tables | 无特殊提示 | 明确禁止 `|` 语法 | 采用 fork 提示 |
 
 ---
 
 ## 3. Technical Design
 
-### 3.1 CLAUDE.md Merge Strategy
+### 3.1 CLAUDE.md 不合并策略
 
-**策略名称**：upstream-first concatenation with `---` separator
+**决策**：CLAUDE.md **不合并**，保持 upstream 原样。
 
-**实现步骤**：
+**理由**：
 
-1. 保留当前工作树中 upstream `CLAUDE.md` 的全部内容（1–84 行），一字不改。
-2. 追加 `\n\n---\n\n`。
-3. 追加 `origin/main:CLAUDE.md` 的完整内容。
+1. **零冲突**：upstream 会不断更新 `CLAUDE.md`（技术参考、工具说明等）。如果 fork 追加内容，每次 upstream 更新都会产生 merge conflict。
+2. **语义分离**：upstream `CLAUDE.md` 是面向 Claude Code 的技术指南；fork 的哲学/架构指南是面向模型运行时的身份定义。两者消费方不同，不需要放在同一个文件。
+3. **已有替代载体**：fork 的 persona 内容已经在 `SOUL.md` 中完整表达（通过 bootstrap 注入到主 agent 上下文）。`SOUL.md` 才是给模型读的运行时契约，`CLAUDE.md` 是给开发者读的静态参考。
+4. **开发者参考独立存放**：如果有 fork-specific 的开发者参考（如 coding philosophy、架构决策记录），放在 `FORK_GUIDE.md` 或 `docs/` 下，不污染 upstream 文件。
 
-**为什么不是 diff/merge**：CLAUDE.md 是两个独立文档的物理合并。upstream 版本是面向 Claude Code 的技术指南；fork 版本是面向模型运行时的哲学/架构身份定义。它们之间没有重叠语义，不需要 three-way merge。
+**实现**：
 
-**为什么 fork 内容保持 XML**：fork 的 CLAUDE.md 使用 `<identity>`、`<cognitive_architecture>` 等 XML tag 定义 persona。这不是 Markdown，但模型消费时按结构化 XML 解析。将其改写为 Markdown 会破坏 persona 系统的消费契约。
+- `CLAUDE.md` 不做任何修改，直接使用 upstream 版本。
+- Fork 的 persona XML 内容迁移到 `SOUL.md`（如果尚未迁移）。
+- 可选：在 `docs/superpowers/` 下保留 `FORK_GUIDE.md` 作为开发者参考。
 
 ### 3.2 Bootstrap 文件顺序调整
 
@@ -237,6 +248,7 @@ BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 
 - **主 agent**：系统提示末尾有 `# Remember` 块，内容是 `SOUL.md`。
 - **子 agent**：系统提示中**没有** soul anchor。子 agent 通过 bootstrap 注入获得 `SOUL.md` 内容一次，足够。
+- **实验性声明**：soul anchor 是基于 fork 生产经验的启发式做法，缺乏 A/B 测试验证其有效性。如果 upstream 未来提供 prompt importance/pinning 机制（如原生支持标记某些 prompt 片段为 high-priority），soul anchor 应迁移到该机制，而不是继续用 `# Remember` hack。
 
 **历史振荡（仅供理解，spec 不实现中间态）**：
 1. `5369da7e` — 主 agent 添加 soul anchor。
@@ -281,16 +293,11 @@ def _build_subagent_prompt(self) -> str:
     time_ctx = ...  # existing
     skills_summary = ...  # existing
 
-    # NEW: load bootstrap files for subagent
-    _SUBAGENT_BOOTSTRAP_FILES = ["SOUL.md", "TOOLS.md"]
-    bootstrap_parts = []
-    for filename in _SUBAGENT_BOOTSTRAP_FILES:
-        file_path = self.workspace / filename
-        if file_path.exists():
-            content = file_path.read_text(encoding="utf-8").strip()
-            if content:
-                bootstrap_parts.append(f"## {filename}\n\n{content}")
-    bootstrap = "\n\n".join(bootstrap_parts) if bootstrap_parts else ""
+    # NEW: load bootstrap files for subagent via shared helper
+    bootstrap = load_and_format_bootstrap(
+        ["SOUL.md", "TOOLS.md"],
+        self.workspace,
+    )
 
     return render_template(
         "agent/subagent_system.md",
@@ -359,7 +366,7 @@ This conversation is on a messaging app. Use short paragraphs. Avoid large headi
 
 | 文件 | 修改类型 | 侵入性 | 理由 |
 |------|---------|--------|------|
-| `CLAUDE.md` | 内容追加 | 低 | 纯文档，无运行时依赖 |
+| `CLAUDE.md` | 无修改 | 无 | 直接使用 upstream 版本，零侵入 |
 | `ContextBuilder` | 常量重排 + 新方法 + 一行插入 | 低 | 不改动现有方法签名，只调整内部顺序 |
 | `SubagentManager` | 方法内新增局部逻辑 + 模板变量 | 低 | 不改动类接口，_build_subagent_prompt 是内部方法 |
 | `subagent_system.md` | 新增条件块 | 低 | Jinja2 条件渲染，不传变量时无输出差异 |
@@ -582,9 +589,9 @@ async def test_subagent_no_soul_anchor(tmp_path):
 9. **修改 `identity.md`**：在 Discord format hint 中追加 table 警告。
 10. **运行测试确认 GREEN**。
 
-### Phase 3 — 内容合并与文档
+### Phase 3 — 文档留存与确认
 
-11. **合并 CLAUDE.md**：upstream 内容在前 + `---` + fork 内容在后。
+11. **确认 CLAUDE.md 不合并**：直接使用 upstream 版本，不追加 fork 内容。fork 的 persona 内容确保已在 `SOUL.md` 中完整表达。
 12. **复制 fork 本地文档**：将 6 个 plan 文件和 1 个 spec 文件从 `origin/main` 复制到当前工作树。
 13. **验证 `.gitignore`**：确认 `docs/superpowers/` 已在 ignore 列表中，无需变更。
 
@@ -659,9 +666,10 @@ assert "Discord does NOT render Markdown tables" in out
 
 ### 8.5 CLAUDE.md smoke
 ```bash
-head -n 5 CLAUDE.md | grep -q "Project Overview"
-tail -n 20 CLAUDE.md | grep -q "<identity>"
-grep -q "^---$" CLAUDE.md
+# CLAUDE.md should be exactly the upstream version — no fork additions
+git diff upstream/main -- CLAUDE.md | wc -l | grep -q "^0$"
+# Verify SOUL.md contains the fork persona content (migrated from old CLAUDE.md)
+grep -q "SOUL.md" SOUL.md 2>/dev/null || echo "WARN: SOUL.md may need persona migration"
 ```
 
 ---
@@ -686,7 +694,7 @@ grep -q "^---$" CLAUDE.md
 
 Pack8 完成当且仅当以下全部成立：
 
-1. `CLAUDE.md` 包含 upstream 技术参考（1–84 行完整保留）和 fork 哲学指南（`---` 分隔）。
+1. `CLAUDE.md` 保持 upstream 原样，未追加 fork 内容；fork 哲学/架构指南在 `SOUL.md` 中表达，开发者参考在独立文件中。
 2. `ContextBuilder.BOOTSTRAP_FILES == ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]`。
 3. `ContextBuilder.build_system_prompt` 在文件存在时追加 `# Remember` 块。
 4. `SubagentManager._build_subagent_prompt` 传递 `SOUL.md` + `TOOLS.md` 作为 `bootstrap`。

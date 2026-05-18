@@ -125,6 +125,7 @@ class ContextPruningConfig(Base):
     enabled: bool = False
     keep_last_assistants: int = Field(default=3, ge=0)
     min_prunable_tool_chars: int = Field(default=50_000, ge=0)
+    context_budget_multiplier: float = Field(default=4.0, ge=0.0)
     soft_trim: SoftTrimConfig = Field(default_factory=SoftTrimConfig)
     hard_clear: HardClearConfig = Field(default_factory=HardClearConfig)
 ```
@@ -172,18 +173,26 @@ class ContextPruner:
    - 从末尾向前扫描，找到第 keep_last_assistants 条 assistant 消息。
    - 若 assistant 总数 < keep_last_assistants：return messages（全保护）。
    - 边界索引 = 该 assistant 消息的索引（含）之后所有消息受保护。
-4. 遍历消息，构建新列表：
+4. 策略查找表（policy 与执行分离）：
+   ```python
+   _PRUNE_POLICY = {
+       ("tool", "str"): "ELIGIBLE",   # 进入 trim/clear 判断
+       ("tool", "list"): "KEEP",       # image blocks etc
+       ("tool", "other"): "KEEP",
+       ("*", "*"): "KEEP",             # non-tool messages
+   }
+   ```
+5. 遍历消息，构建新列表：
    - 若消息索引 >= 边界索引：原样拷贝。
-   - 若 role != "tool"：原样拷贝。
-   - 若 content 不是 str：原样拷贝（但若是非 list/dict 的异常类型，抛 ValueError）。
-   - 若 content 为 list 且含 image block：原样拷贝。
-   - 进入裁剪逻辑：
+   - 查表决定策略：根据 `(role, content_type)` 匹配 `_PRUNE_POLICY`。
+   - `"KEEP"`：原样拷贝（但非 str/list/dict 的异常类型，抛 ValueError）。
+   - `"ELIGIBLE"`：进入裁剪逻辑：
        a. hard_clear 优先：若 enabled 且 len(content)/context_window_chars > ratio：
           content = f"[{len(content)} characters cleared]"
        b. 否则 soft_trim：若 enabled 且 len(content) > chunk_size：
           content = _soft_trim(content, target_size)
    - 用 shallow copy 替换 content，其余字段不变。
-5. return 新列表
+6. return 新列表
 ```
 
 **不变量（Invariants）**：
@@ -193,9 +202,9 @@ class ContextPruner:
 | 不删除消息 | 输出列表长度 = 输入列表长度 |
 | 不改 role | 仅替换 `content` 字段 |
 | 不删 tool_call_id | 不触碰 `tool_call_id` 键 |
-| 不破坏 tool call/result 配对 | 仅修改 content 长度，不删除消息，orphan 清理仍由 `_drop_orphan_tool_results` 负责 |
+| 不破坏 tool call/result 配对 | ContextPruner.prune() 独立契约：输出消息列表长度 == 输入长度，每条消息的 role 和 tool_call_id 不变，只修改 string content 值 |
 | 不删用户意图 | 非 tool 消息原样保留；短对话（assistant 不足）全部保护 |
-| 不破坏 role alternation | 不插入/删除消息，runner 后续 `_backfill_missing_tool_results` 继续兜底 |
+| 不破坏 role alternation | ContextPruner.prune() 独立契约：输出消息列表长度 == 输入长度，每条消息的 role 不变，不插入/删除消息 |
 | 输入不可变 | 使用 `dict(msg)` shallow copy，不修改原始字典 |
 
 **soft trim 实现细节**：
@@ -215,8 +224,11 @@ context_pruning: ContextPruningConfig | None = None
 
 **修改 2：AgentLoop 透传配置**
 
-- `AgentLoop.__init__` 通过 `ForkConfig.context_pruning` 接收参数（Spec4 定义的跨 spec 参数打包机制），不直接新增构造函数参数。`AgentLoop` 从 `self._fork_config.context_pruning` 读取。
-- `AgentLoop.from_config()` 在组装 `ForkConfig` 时从 `defaults.context_pruning` 读取并填入。
+- `context_pruning` 作为直接参数传给 `AgentLoop.__init__`，与 `consolidation_ratio` 同一模式：
+  ```python
+  def __init__(self, ..., context_pruning: ContextPruningConfig | None = None):
+  ```
+- `AgentLoop.from_config()` 从 `config.agents.defaults.context_pruning` 读取并传入。
 - `AgentLoop` 在每次构建 `AgentRunSpec` 时将 `context_pruning` 传入（同 `max_tool_result_chars` 等字段的传递方式）。
 
 **修改 3：AgentRunner.run() 插入裁剪步骤**
@@ -229,7 +241,7 @@ if spec.context_pruning is not None and spec.context_pruning.enabled:
     pruner = ContextPruner(spec.context_pruning)
     messages_for_model = pruner.prune(
         messages_for_model,
-        context_window_chars=spec.max_tool_result_chars * 4,
+        context_window_chars=spec.max_tool_result_chars * spec.context_pruning.context_budget_multiplier,
     )
 ```
 
@@ -373,7 +385,7 @@ async def test_runner_applies_pruning_before_governance(monkeypatch):
 | `hard_clear.ratio` 范围 `0..1` | 使用 Pydantic `Field(ge=0.0, le=1.0)`，与 `consolidation_ratio` 的校验风格一致。 |
 
 **版本依赖标注**：
-- 依赖 upstream `AgentRunSpec` 为 `@dataclass(slots=True)`。若 upstream 未来改为普通 class 或 frozen dataclass，需同步调整字段追加方式。
+- AgentRunSpec 是普通 class，不是 dataclass(slots=True)。追加字段直接写即可，没有 `__slots__` 限制。向前兼容风险降低：普通 class 的字段追加比 slots dataclass 更自由。
 - 依赖 `AgentLoop.from_config()` 的签名模式（从 `defaults` 逐项读取）。若 upstream 未来重构为 `**defaults.model_dump()` 批量转发，本 spec 的透传逻辑可简化。
 
 ---

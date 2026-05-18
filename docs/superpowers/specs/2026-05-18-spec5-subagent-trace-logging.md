@@ -28,14 +28,14 @@
 - `TraceHook` 和 `CompositeHook` 均无需修改即可读取该字段。
 
 ### 2.2 Subagent 独立 provider 生命周期
-- `AgentDefaults` 新增三个可选字段，均默认 `None`，且支持 camelCase（通过 `Base` 的 `alias_generator=to_camel` 自动支持，无需额外 `AliasChoices`）：
-  - `subagent_model: str | None`
-  - `subagent_reasoning_effort: str | None`
-  - `subagent_max_tokens: int | None`
-- 当 `subagent_model` 为 `None` 时，保持现有行为：
+- `AgentDefaults` 新增嵌套字段 `subagent: SubagentDefaults`，其中 `SubagentDefaults` 包含三个可选字段，均默认 `None`，且支持 camelCase（通过 `Base` 的 `alias_generator=to_camel` 自动支持，无需额外 `AliasChoices`）：
+  - `model: str | None`
+  - `reasoning_effort: str | None`
+  - `max_tokens: int | None`
+- 当 `subagent.model` 为 `None` 时，保持现有行为：
   - `AgentLoop` 构造时将主 provider/model 传入 `SubagentManager`。
   - `_apply_provider_snapshot()` 调用 `self.subagents.set_provider(provider, model)` 以同步主 provider 变更。
-- 当 `subagent_model` 不为 `None` 时：
+- 当 `subagent.model` 不为 `None` 时：
   - `AgentLoop.from_config()` 或同级构造逻辑使用 `nanobot.providers.factory` 的现有工具（如 `build_provider_snapshot` / `make_provider`）为 subagent 独立创建 provider 和 model。
   - `SubagentManager` 持有该独立 provider；`_apply_provider_snapshot()` **不再**调用 `self.subagents.set_provider(...)`，避免主 provider 切换覆盖 subagent 配置。
   - 独立 subagent provider 必须和 main provider 完全隔离，不共享 client 状态。
@@ -142,13 +142,19 @@
 
 **变更文件**: `nanobot/config/schema.py`
 
+- 新增 `SubagentDefaults` dataclass：
+  ```python
+  @dataclass
+  class SubagentDefaults:
+      model: str | None = None
+      reasoning_effort: str | None = None
+      max_tokens: int | None = None
+  ```
 - 在 `AgentDefaults` 追加：
   ```python
-  subagent_model: str | None = None
-  subagent_reasoning_effort: str | None = None
-  subagent_max_tokens: int | None = None
+  subagent: SubagentDefaults = Field(default_factory=SubagentDefaults)
   ```
-- `Base` 已配置 `alias_generator=to_camel, populate_by_name=True`，因此 `subagentModel` / `subagentReasoningEffort` / `subagentMaxTokens` 自动可用，无需额外 `AliasChoices`。
+- `Base` 已配置 `alias_generator=to_camel, populate_by_name=True`，因此嵌套后的 `subagent.model` / `subagent.reasoningEffort` / `subagent.maxTokens` 自动可用，无需额外 `AliasChoices`。
 
 #### 4.2.2 SubagentManager 扩展
 
@@ -175,63 +181,68 @@
 
 **变更文件**: `nanobot/agent/loop.py`
 
-- `AgentLoop.__init__` 通过 `ForkConfig` 接收参数（Spec4 定义的跨 spec 参数打包机制）：
-  ```python
-  subagent_model: str | None = None,
-  subagent_reasoning_effort: str | None = None,
-  subagent_max_tokens: int | None = None,
-  ```
-- 在 `__init__` 中，区分两种情况：
+- `AgentLoop.__init__` **不**新增参数。subagent 配置由 `from_config()` 读取，在构造 `SubagentManager` 时传入。
+- `from_config()` 读取 `config.agents.defaults.subagent` 并准备 subagent provider：
 
-**情况 A: `subagent_model` 未配置（`None`）**
 ```python
-self.subagents = SubagentManager(
-    provider=provider,
+subagent_defaults = config.agents.defaults.subagent
+subagent_provider = None
+subagent_model_resolved = None
+
+if subagent_defaults.model:
+    # 先过 resolver 解析 alias（见 §4.3）
+    resolved_model = _resolve_alias(subagent_defaults.model)
+    # 复用 factory 已有工具；factory.py 不可用时优雅降级（见 §4.2.4）
+    try:
+        from nanobot.providers.factory import build_provider_snapshot
+        subagent_snapshot = build_provider_snapshot(config, preset_name=resolved_model)
+        subagent_provider = subagent_snapshot.provider
+        subagent_model_resolved = subagent_snapshot.model
+    except ImportError:
+        subagent_provider = None
+        subagent_model_resolved = resolved_model
+```
+
+- `from_config()` 在构造 `AgentLoop` 后初始化 `SubagentManager`：
+
+```python
+loop = cls(provider=provider, model=model, ...)
+loop.subagents = SubagentManager(
+    provider=subagent_provider or provider,
     workspace=workspace,
     bus=bus,
-    model=self.model,
+    model=subagent_model_resolved or model,
     tools_config=_tc,
-    ...
-    # 不传入独立 provider
-)
-self._subagent_has_independent_provider = False
-```
-`_apply_provider_snapshot()` 保持现有逻辑：调用 `self.subagents.set_provider(provider, model)`。
-
-**情况 B: `subagent_model` 已配置**
-- 使用 `build_provider_snapshot(config)` 或 `make_provider(config, ...)` 的现有能力，为 subagent 创建独立 provider。注意：由于 `AgentLoop.__init__` 不直接持有 `config` 对象，可以在 `from_config()` 层构建 subagent provider snapshot 后传入。
-- `from_config()` 层示例逻辑：
-  ```python
-  subagent_provider = None
-  subagent_model_resolved = None
-  if config.agents.defaults.subagent_model:
-      # 复用 factory 已有工具
-      subagent_snapshot = build_provider_snapshot(config, preset_name=config.agents.defaults.subagent_model)
-      subagent_provider = subagent_snapshot.provider
-      subagent_model_resolved = subagent_snapshot.model
-  ```
-- 在 `__init__` 中：
-  ```python
-  self.subagents = SubagentManager(
-      provider=subagent_provider or provider,
-      workspace=workspace,
-      bus=bus,
-      model=subagent_model_resolved or model,
-      tools_config=_tc,
-      reasoning_effort=subagent_reasoning_effort,
-      max_tokens=subagent_max_tokens,
+    reasoning_effort=subagent_defaults.reasoning_effort,
+    max_tokens=subagent_defaults.max_tokens,
     model_alias_resolver=...,  # 见 §4.3
     trace_file=...,            # 见 §4.5
     ...
-  )
-  self._subagent_has_independent_provider = subagent_provider is not None
-  ```
+)
+loop._subagent_has_independent_provider = subagent_provider is not None
+```
 
 - `_apply_provider_snapshot()` 修改：
+```python
+if not self._subagent_has_independent_provider:
+    self.subagents.set_provider(provider, model)
+```
+
+#### 4.2.4 factory.py 依赖 fallback
+
+**变更文件**: `nanobot/agent/loop.py`
+
+- 当 `factory.py` 不存在或 API 不匹配时，独立 subagent provider 退化为复用 main provider。
+- 实现上使用 `try/except ImportError`：
   ```python
-  if not self._subagent_has_independent_provider:
-      self.subagents.set_provider(provider, model)
+  try:
+      from nanobot.providers.factory import build_provider_snapshot
+      subagent_snapshot = build_provider_snapshot(config, preset_name=resolved_model)
+  except ImportError:
+      subagent_snapshot = None
   ```
+- `subagent_snapshot` 为 `None` 时，`SubagentManager` 使用 main provider，行为等同于 upstream 默认。
+- **明确标注**：独立 subagent provider 功能在 `factory.py` 被 upstream 正式接纳前属于 **graceful degradation**；fallback 路径下 `subagent.model` 仍会被解析为字符串传入 `SubagentManager`，但 provider 实例与主 agent 共享。
 
 ### 4.3 Per-spawn model override 和 alias resolution
 
@@ -297,7 +308,7 @@ self._subagent_has_independent_provider = False
           preset = config.resolve_preset(alias)
           return preset.model
       except ValueError:
-          pass
+          logger.warning("Unknown model alias %r, treating as exact model name", alias)
       # 若不是 preset，则假定是 exact model name，直接返回
       # 若后续需要验证 exact model name 是否合法，可扩展
       return alias
@@ -331,6 +342,7 @@ self._subagent_has_independent_provider = False
 
       async def after_iteration(self, context: AgentHookContext) -> None:
           entry = {
+              "v": 1,
               "timestamp": time.time(),
               "model": context.model,
               "iteration": context.iteration,
@@ -339,6 +351,9 @@ self._subagent_has_independent_provider = False
           }
           line = json.dumps(entry, ensure_ascii=False, default=str)
           self._trace_file.parent.mkdir(parents=True, exist_ok=True)
+          await asyncio.to_thread(self._append_sync, line)
+
+      def _append_sync(self, line: str) -> None:
           with self._trace_file.open("a", encoding="utf-8") as f:
               f.write(line + "\n")
   ```
@@ -473,7 +488,7 @@ logger.debug("Attempting finalization retry for model={}", spec.model)
 | 目标 | 侵入方式 | 评估 |
 |------|----------|------|
 | `AgentHookContext.model` | 在 dataclass 加字段 | 无侵入；现有 hook 忽略新字段 |
-| `AgentDefaults` 新增字段 | 在 schema 加三个可选字段 | 无侵入；不破坏现有配置解析 |
+| `AgentDefaults` 新增嵌套字段 | 在 schema 加 `SubagentDefaults` | 无侵入；不破坏现有配置解析 |
 | `SubagentManager` 扩展 | 新增构造参数 + `spawn` 参数 | 轻微侵入；现有测试需更新 mock 构造（仅新增可选参数，默认值保持兼容） |
 | `SpawnTool` schema 扩展 | schema 加可选字段 | 无侵入；旧调用不传 `model` 仍兼容 |
 | 独立 subagent provider | `AgentLoop` 中增加分支判断 | 中等侵入；但完全复用 `factory.py` 已有 API，不新增 provider 创建逻辑 |
@@ -495,13 +510,13 @@ logger.debug("Attempting finalization retry for model={}", spec.model)
 
 ### 6.2 Config 扩展与默认值
 - **文件**: `tests/config/test_config_migration.py`
-- 断言 `AgentDefaults()` 的 `subagent_model`, `subagent_reasoning_effort`, `subagent_max_tokens` 均为 `None`。
+- 断言 `AgentDefaults().subagent` 为 `SubagentDefaults()`，且其 `model`, `reasoning_effort`, `max_tokens` 均为 `None`。
 - 断言 snake_case 和 camelCase 解析均正确。
 
 ### 6.3 Subagent 独立 provider 生命周期
 - **文件**: `tests/agent/test_subagent_model_override.py`（新建）
 - 用 `AgentLoop.from_config()` + monkeypatched factory 断言：
-  - `subagent_model` 配置时，`SubagentManager` 持有独立 fake provider（`is` 不相等）。
+  - 配置 `subagent.model` 时，`SubagentManager` 持有独立 fake provider（`is` 不相等）。
   - 未配置时，`SubagentManager` 持有主 provider。
   - `_apply_provider_snapshot()` 后，未配置时 subagent provider 被同步更新；已配置时 subagent provider 保持不变。
 
@@ -553,7 +568,7 @@ logger.debug("Attempting finalization retry for model={}", spec.model)
 | `AgentHookContext` 新增 `model` | dataclass 无 `frozen=True`，字段可安全追加 | 兼容 |
 | `AgentRunSpec` 传 `reasoning_effort`/`max_tokens` | upstream 已存在这两个字段 | 兼容。若未来 upstream 重命名，需同步调整 `SubagentManager._run_subagent()` 的赋值 |
 | 使用 `ProviderSnapshot` | `nanobot/providers/factory.py` 已在 replay branch 中存在 | 该文件在 `origin/main` 不存在，是 replay branch 引入。若 upstream main 后续以不同 API 引入 provider snapshot，需要 adapter 层 |
-| `build_provider_snapshot` / `make_provider` | 同上 | 同上。本 spec 假设这些 factory 函数在 replay branch 中稳定可用 |
+| `build_provider_snapshot` / `make_provider` | 同上 | 同上。已增加 `ImportError` fallback：factory 不可用时独立 provider 退化为复用 main provider，行为等同于 upstream 默认 |
 | `config.resolve_preset()` 语义 | upstream `Config` 已有该方法，支持 exact + unique prefix | 兼容 |
 | `_apply_provider_snapshot()` 调用 `set_provider()` | upstream 已有该方法 | 兼容。条件化分支是新增逻辑，不影响未配置 `subagent_model` 的路径 |
 
