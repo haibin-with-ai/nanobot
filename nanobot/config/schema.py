@@ -283,6 +283,17 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class TTSConfig(Base):
+    """Text-to-speech configuration."""
+
+    enabled: bool = False
+    provider: Literal["edge-tts", "fish"] = "edge-tts"
+    voice: str = ""
+    max_text_length: int = 2000
+    auto_tts_senders: list[str] = Field(default_factory=list)
+    provider_config: dict[str, Any] = Field(default_factory=dict)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 

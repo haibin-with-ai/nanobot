@@ -243,6 +243,42 @@ def _model_command_status(loop) -> str:
     ])
 
 
+async def cmd_tts(ctx: CommandContext) -> OutboundMessage:
+    """Toggle text-to-speech for the current session.
+
+    Usage:
+        /tts on   — enable TTS for this session
+        /tts off  — disable TTS for this session
+        /tts      — show current TTS state
+    """
+    session = ctx.session
+    if session is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="No active session.",
+            metadata={"render_as": "text"},
+        )
+
+    args = ctx.args.strip().lower()
+    if args == "on":
+        session.metadata["_outbound_tts"] = True
+        content = "TTS enabled for this session."
+    elif args == "off":
+        session.metadata.pop("_outbound_tts", None)
+        content = "TTS disabled for this session."
+    else:
+        state = "on" if session.metadata.get("_outbound_tts") else "off"
+        content = f"TTS is currently {state}."
+
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={"render_as": "text"},
+    )
+
+
 async def cmd_model(ctx: CommandContext) -> OutboundMessage:
     """Show or switch model presets."""
     loop = ctx.loop
@@ -647,5 +683,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
     router.exact("/help", cmd_help)
+    router.exact("/tts", cmd_tts)
+    router.prefix("/tts ", cmd_tts)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)

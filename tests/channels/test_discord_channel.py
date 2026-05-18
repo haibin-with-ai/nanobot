@@ -1313,3 +1313,163 @@ async def test_send_succeeds_normally() -> None:
     assert len(sent_messages) == 1
     assert sent_messages[0].content == "hello world"
     assert sent_messages[0].chat_id == "123"
+
+
+# ---------------------------------------------------------------------------
+# Tests for mention-filtering
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mentions_other_bot_only_blocks_other_bot_mention() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "999"
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            channel_id=456,
+            mentions=[SimpleNamespace(id=888, bot=True)],
+        )
+    )
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_mentions_other_bot_only_allows_when_mentions_self() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "999"
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            channel_id=456,
+            mentions=[SimpleNamespace(id=888, bot=True), SimpleNamespace(id=999, bot=True)],
+        )
+    )
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_mentions_other_bot_only_allows_non_bot_mentions() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "999"
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            channel_id=456,
+            mentions=[SimpleNamespace(id=888, bot=False)],
+        )
+    )
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_mentions_other_bot_only_noop_without_bot_id() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    # _bot_user_id is None and _client is None
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            channel_id=456,
+            mentions=[SimpleNamespace(id=888, bot=True)],
+        )
+    )
+    assert len(handled) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for voice transcription
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_audio_attachment_gets_transcribed(monkeypatch) -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+
+    async def fake_transcribe(path: str) -> str:
+        return "hello from audio"
+
+    monkeypatch.setattr(channel, "_transcribe_audio", fake_transcribe)
+
+    attachment = _FakeAttachment(1, "voice.mp3")
+    media_paths, markers = await channel._download_attachments([attachment])
+
+    assert media_paths == []
+    assert markers == ["[transcription: hello from audio]"]
+
+
+@pytest.mark.asyncio
+async def test_audio_attachment_transcription_failure(monkeypatch) -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+
+    async def fake_transcribe(path: str) -> str:
+        return ""
+
+    monkeypatch.setattr(channel, "_transcribe_audio", fake_transcribe)
+
+    attachment = _FakeAttachment(1, "voice.mp3")
+    media_paths, markers = await channel._download_attachments([attachment])
+
+    assert media_paths == []
+    assert markers == ["[attachment: voice.mp3 - transcription failed]"]
+
+
+@pytest.mark.asyncio
+async def test_non_audio_attachment_passthrough() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+
+    attachment = _FakeAttachment(1, "image.png")
+    media_paths, markers = await channel._download_attachments([attachment])
+
+    assert len(media_paths) == 1
+    assert media_paths[0].endswith("image.png")
+    assert markers == ["[attachment: 1_image.png]"]
+
+
+@pytest.mark.asyncio
+async def test_audio_attachment_transcription_exception(monkeypatch) -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+
+    async def fake_transcribe(path: str) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(channel, "_transcribe_audio", fake_transcribe)
+
+    attachment = _FakeAttachment(1, "voice.mp3")
+    media_paths, markers = await channel._download_attachments([attachment])
+
+    assert media_paths == []
+    assert markers == ["[attachment: voice.mp3 - download failed]"]

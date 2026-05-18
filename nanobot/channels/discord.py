@@ -17,7 +17,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
 from nanobot.config.paths import get_media_dir
-from nanobot.config.schema import Base
+from nanobot.config.schema import Base, TTSConfig
 from nanobot.utils.helpers import safe_filename, split_message
 
 DISCORD_AVAILABLE = importlib.util.find_spec("discord") is not None
@@ -63,6 +63,7 @@ class DiscordConfig(Base):
     proxy: str | None = None
     proxy_username: str | None = None
     proxy_password: str | None = None
+    tts: TTSConfig | None = None
 
 
 if DISCORD_AVAILABLE:
@@ -541,6 +542,10 @@ class DiscordChannel(BaseChannel):
         if not self._should_accept_inbound(message, sender_id, content):
             return
 
+        if self._mentions_other_bot_only(message, content):
+            self.logger.debug("message in {} ignored (mentions other bot only)", message.channel.id)
+            return
+
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
         full_content = self._compose_inbound_content(content, attachment_markers)
         metadata = self._build_inbound_metadata(message)
@@ -651,6 +656,37 @@ class DiscordChannel(BaseChannel):
             return False
         return True
 
+    _AUDIO_EXTENSIONS: frozenset[str] = frozenset(
+        {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".webm", ".mp4", ".mpeg", ".mpga"}
+    )
+
+    @classmethod
+    def _is_audio_attachment(cls, attachment: discord.Attachment) -> bool:
+        """Return True if the attachment is an audio file."""
+        ext = Path(attachment.filename).suffix.lower()
+        return ext in cls._AUDIO_EXTENSIONS
+
+    async def _transcribe_audio(self, file_path: Path) -> str:
+        """Transcribe an audio file using the configured transcription provider."""
+        provider_name = self.transcription_provider or "groq"
+        if provider_name == "groq":
+            from nanobot.providers.transcription import GroqTranscriptionProvider
+
+            provider = GroqTranscriptionProvider(
+                api_key=self.transcription_api_key,
+                api_base=self.transcription_api_base,
+                language=self.transcription_language,
+            )
+        else:
+            from nanobot.providers.transcription import OpenAITranscriptionProvider
+
+            provider = OpenAITranscriptionProvider(
+                api_key=self.transcription_api_key,
+                api_base=self.transcription_api_base,
+                language=self.transcription_language,
+            )
+        return await provider.transcribe(file_path)
+
     async def _download_attachments(
         self,
         attachments: list[discord.Attachment],
@@ -670,6 +706,13 @@ class DiscordChannel(BaseChannel):
                 safe_name = safe_filename(filename)
                 file_path = media_dir / f"{attachment.id}_{safe_name}"
                 await attachment.save(file_path)
+                if self._is_audio_attachment(attachment):
+                    transcription = await self._transcribe_audio(file_path)
+                    if transcription:
+                        markers.append(f"[transcription: {transcription}]")
+                    else:
+                        markers.append(f"[attachment: {filename} - transcription failed]")
+                    continue
                 media_paths.append(str(file_path))
                 markers.append(f"[attachment: {file_path.name}]")
             except Exception as e:
@@ -705,15 +748,38 @@ class DiscordChannel(BaseChannel):
             "reply_to": reply_to,
         }
 
+    def _resolve_bot_user_id(self) -> str | None:
+        """Return the bot's user ID if available."""
+        if self._bot_user_id is not None:
+            return self._bot_user_id
+        if self._client and self._client.user:
+            return str(self._client.user.id)
+        return None
+
+    def _mentions_other_bot_only(self, message: discord.Message, content: str) -> bool:
+        """Return True if the message mentions another bot but not this one."""
+        bot_user_id = self._resolve_bot_user_id()
+        if bot_user_id is None:
+            return False
+
+        mentions_bot = any((
+            any(str(user.id) == bot_user_id for user in message.mentions),
+            bot_user_id in {str(user_id) for user_id in getattr(message, "raw_mentions", [])},
+            f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content,
+            self._references_bot_message(message, bot_user_id),
+        ))
+        if mentions_bot:
+            return False
+
+        return any(user.bot for user in message.mentions)
+
     def _should_respond_in_group(self, message: discord.Message, content: str) -> bool:
         """Check if the bot should respond in a guild channel based on policy."""
         if self.config.group_policy == "open":
             return True
 
         if self.config.group_policy == "mention":
-            bot_user_id = self._bot_user_id
-            if bot_user_id is None and self._client and self._client.user:
-                bot_user_id = str(self._client.user.id)
+            bot_user_id = self._resolve_bot_user_id()
             if bot_user_id is None:
                 self.logger.debug(
                     "message in {} ignored (bot identity unavailable)", message.channel.id

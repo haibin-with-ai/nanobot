@@ -1292,6 +1292,12 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+                if ctx.session is not None:
+                    default_meta = dict(message_tool._default_metadata.get())
+                    for key, value in ctx.session.metadata.items():
+                        if key.startswith("_outbound_"):
+                            default_meta[key] = value
+                    message_tool._default_metadata.set(default_meta)
 
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1384,6 +1390,10 @@ class AgentLoop:
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
         )
+        if ctx.outbound is not None and ctx.session is not None:
+            for key, value in ctx.session.metadata.items():
+                if key.startswith("_outbound_"):
+                    ctx.outbound.metadata[key] = value
         return "ok"
 
     def _sanitize_persisted_blocks(
