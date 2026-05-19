@@ -108,6 +108,32 @@ class OAuthCredentialStore:
             except Exception:
                 pass
 
+        # Flat {access_token, refresh_token, expires_at_ms} file next to config
+        creds = _try_load_flat_credentials()
+        if creds:
+            return creds
+
+        return None
+
+
+def _try_load_flat_credentials() -> OAuthCredentials | None:
+    """Load from oauth_credentials.json next to the nanobot config file."""
+    try:
+        from nanobot.config.paths import get_config_path
+        cred_path = get_config_path().parent / "oauth_credentials.json"
+        if not cred_path.exists():
+            return None
+        data = json.loads(cred_path.read_text())
+        access = data.get("access_token")
+        if not access:
+            return None
+        return OAuthCredentials(
+            access_token=access,
+            refresh_token=data.get("refresh_token", ""),
+            expires_at=data.get("expires_at_ms") or data.get("expires_at", 0),
+            account_id=data.get("account_id"),
+        )
+    except Exception:
         return None
 
 
