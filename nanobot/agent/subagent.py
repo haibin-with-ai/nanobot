@@ -247,7 +247,7 @@ class SubagentManager:
                 if self._model_alias_resolver is not None:
                     try:
                         run_model = self._model_alias_resolver(model)
-                    except ValueError:
+                    except (ValueError, KeyError):
                         logger.warning("Unknown model alias '{}' for subagent, using raw string", model)
                         run_model = model
                 else:
