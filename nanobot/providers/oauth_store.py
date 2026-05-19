@@ -16,6 +16,7 @@ from oauth_cli_kit.storage import FileTokenStorage
 _ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _CLAUDE_CLI_CONFIG_PATH = Path.home() / ".claude.json"
+_CLAUDE_CLI_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _CLAUDE_CODE_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 
 
@@ -73,7 +74,8 @@ class OAuthCredentialStore:
 
         Checks (in order):
         1. CLAUDE_CODE_OAUTH_TOKEN environment variable
-        2. ~/.claude.json config file for embedded tokens
+        2. ~/.claude/.credentials.json (Claude CLI v2.1+)
+        3. ~/.claude.json config file (legacy)
         """
         env_token = os.environ.get(_CLAUDE_CODE_ENV_KEY)
         if env_token:
@@ -84,9 +86,12 @@ class OAuthCredentialStore:
                 account_id=None,
             )
 
-        if _CLAUDE_CLI_CONFIG_PATH.exists():
+        # Claude CLI v2.1+ stores credentials in ~/.claude/.credentials.json
+        for config_path in (_CLAUDE_CLI_CREDENTIALS_PATH, _CLAUDE_CLI_CONFIG_PATH):
+            if not config_path.exists():
+                continue
             try:
-                data = json.loads(_CLAUDE_CLI_CONFIG_PATH.read_text())
+                data = json.loads(config_path.read_text())
                 oauth_data = data.get("claudeAiOauth") or data.get("oauth")
                 if isinstance(oauth_data, dict):
                     access = oauth_data.get("accessToken") or oauth_data.get("access_token")
@@ -158,7 +163,8 @@ def refresh_anthropic_token(refresh_token: str) -> OAuthCredentials:
     if not access or not refresh or expires_in is None:
         raise RuntimeError("Token refresh response missing required fields")
 
-    expires_at = int(time.time() * 1000 + int(expires_in) * 1000)
+    # Expire 5 minutes early to avoid using a nearly-expired token (aligned with pi-mono)
+    expires_at = int(time.time() * 1000 + int(expires_in) * 1000 - 5 * 60 * 1000)
     account = payload.get("account", {})
     account_id = account.get("uuid") or account.get("email_address")
 
