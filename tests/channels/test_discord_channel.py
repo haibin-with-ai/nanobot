@@ -1505,3 +1505,38 @@ async def test_audio_attachment_transcription_exception(monkeypatch) -> None:
 
     assert media_paths == []
     assert markers == ["[attachment: voice.mp3 - download failed]"]
+
+
+# ── Slash command name sanitizer ──────────────────────────────
+
+
+from nanobot.channels.discord import _sanitize_command_name
+
+
+def test_sanitize_normal_name():
+    assert _sanitize_command_name("ljg-card") == "ljg-card"
+
+
+def test_sanitize_underscore():
+    assert _sanitize_command_name("my_skill") == "my-skill"
+
+
+def test_sanitize_uppercase():
+    assert _sanitize_command_name("MySkill") == "myskill"
+
+
+def test_sanitize_special_chars():
+    assert _sanitize_command_name("skill@v2!") == "skillv2"
+
+
+def test_sanitize_too_long():
+    result = _sanitize_command_name("a" * 50)
+    assert result is not None and len(result) <= 32
+
+
+def test_sanitize_empty_returns_none():
+    assert _sanitize_command_name("@@@") is None
+
+
+def test_sanitize_leading_trailing_hyphen():
+    assert _sanitize_command_name("-hello-") == "hello"

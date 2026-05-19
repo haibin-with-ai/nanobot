@@ -64,6 +64,24 @@ class DiscordConfig(Base):
     proxy_username: str | None = None
     proxy_password: str | None = None
     tts: TTSConfig | None = None
+    slash_commands: bool = True
+
+
+import re as _re
+
+_BUILTIN_SLASH_NAMES = {"new", "stop", "restart", "status", "history", "help"}
+_CMD_NAME_PATTERN = _re.compile(r"^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$|^[a-z0-9]$")
+
+
+def _sanitize_command_name(name: str) -> str | None:
+    """将 skill name 转为合法的 Discord slash command 名称。"""
+    s = name.lower().replace("_", "-")
+    s = _re.sub(r"[^a-z0-9-]", "", s)
+    s = _re.sub(r"-{2,}", "-", s).strip("-")
+    s = s[:32]
+    if not s or not _CMD_NAME_PATTERN.match(s):
+        return None
+    return s
 
 
 if DISCORD_AVAILABLE:
@@ -87,6 +105,8 @@ if DISCORD_AVAILABLE:
         async def on_ready(self) -> None:
             self._channel._bot_user_id = str(self.user.id) if self.user else None
             self._channel.logger.info("bot connected as user {}", self._channel._bot_user_id)
+            if not self._channel.config.slash_commands:
+                return
             try:
                 synced = await self.tree.sync()
                 self._channel.logger.info("app commands synced: {}", len(synced))
@@ -191,6 +211,9 @@ if DISCORD_AVAILABLE:
             )
 
         def _register_app_commands(self) -> None:
+            if not self._channel.config.slash_commands:
+                return
+
             commands = (
                 ("new", "Stop current task and start a new conversation", "/new"),
                 ("stop", "Stop the current task", "/stop"),
@@ -219,6 +242,51 @@ if DISCORD_AVAILABLE:
                     await self._reply_ephemeral(interaction, "This channel is not allowed for this bot.")
                     return
                 await self._reply_ephemeral(interaction, build_help_text())
+
+            # ── Skill commands ──
+            registered_names = set(_BUILTIN_SLASH_NAMES)
+            skills_loader = self._channel._make_skills_loader()
+            if skills_loader:
+                for skill in skills_loader.list_skills():
+                    skill_name = skill["name"]
+                    cmd_name = _sanitize_command_name(skill_name)
+                    if cmd_name is None or cmd_name in registered_names:
+                        continue
+                    registered_names.add(cmd_name)
+                    desc = (skills_loader._get_skill_description(skill_name) or f"Run {skill_name}")[:100]
+
+                    @self.tree.command(name=cmd_name, description=desc)
+                    async def skill_handler(
+                        interaction: discord.Interaction,
+                        _sn: str = skill_name,
+                    ) -> None:
+                        await self._forward_slash_command(interaction, f"/{_sn}")
+
+            # ── /model command ──
+            model_choices = self._channel._load_model_choices()
+            if len(model_choices) > 1:
+                choices = [
+                    app_commands.Choice(name=m, value=m)
+                    for m in model_choices[:25]
+                ]
+
+                @self.tree.command(name="model", description="Switch model preset")
+                @app_commands.describe(preset="Model preset to switch to")
+                @app_commands.choices(preset=choices)
+                async def model_command(
+                    interaction: discord.Interaction,
+                    preset: app_commands.Choice[str],
+                ) -> None:
+                    await self._forward_slash_command(interaction, f"/model {preset.value}")
+
+                registered_names.add("model")
+
+            # ── /tts command ──
+            if "tts" not in registered_names:
+                @self.tree.command(name="tts", description="Toggle text-to-speech")
+                async def tts_command(interaction: discord.Interaction) -> None:
+                    await self._forward_slash_command(interaction, "/tts")
+                registered_names.add("tts")
 
             @self.tree.error
             async def on_app_command_error(
@@ -381,6 +449,27 @@ class DiscordChannel(BaseChannel):
 
     def _forget_channel(self, channel_or_id: Any) -> None:
         self._known_channels.pop(self._channel_key(channel_or_id), None)
+
+    def _make_skills_loader(self):
+        """构造 SkillsLoader 供 slash command 注册使用。"""
+        try:
+            from nanobot.agent.skills import SkillsLoader
+            from nanobot.config.paths import get_workspace_path
+            return SkillsLoader(get_workspace_path())
+        except Exception as e:
+            self.logger.debug("Could not create SkillsLoader for slash commands: {}", e)
+            return None
+
+    def _load_model_choices(self) -> list[str]:
+        """从 config 读取 model_presets keys 供 /model 下拉框使用。"""
+        try:
+            from nanobot.config.loader import load_config
+            config = load_config()
+            presets = list(config.model_presets.keys())
+            return ["default"] + presets
+        except Exception as e:
+            self.logger.debug("Could not load model choices: {}", e)
+            return ["default"]
 
     async def start(self) -> None:
         """Start the Discord client."""
