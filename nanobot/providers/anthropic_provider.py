@@ -515,8 +515,6 @@ class AnthropicProvider(LLMProvider):
                 kwargs["tool_choice"] = tc
 
         extra_headers = dict(self.extra_headers) if self.extra_headers else {}
-        if self._product_mode == "claude_code":
-            extra_headers.update(_CLAUDE_CODE_BETA_HEADERS)
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
