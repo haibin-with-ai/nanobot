@@ -23,8 +23,11 @@ _CLAUDE_CODE_SYSTEM_BLOCK = {
     "text": "You are Claude Code, Anthropic's official CLI for Claude.",
 }
 
-_CLAUDE_CODE_BETA_HEADERS = {
-    "anthropic-beta": "token-efficient-tools-2025-02-12",
+_CLAUDE_CODE_VERSION = "2.1.75"
+_CLAUDE_CODE_HEADERS = {
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    "user-agent": f"claude-cli/{_CLAUDE_CODE_VERSION}",
+    "x-app": "cli",
 }
 
 
@@ -62,14 +65,16 @@ class AnthropicProvider(LLMProvider):
         from anthropic import AsyncAnthropic
 
         client_kw: dict[str, Any] = {}
+        merged_headers = dict(self.extra_headers) if self.extra_headers else {}
         if self._auth_mode == "oauth":
             client_kw["auth_token"] = self._auth_token
+            merged_headers.update(_CLAUDE_CODE_HEADERS)
         elif self.api_key:
             client_kw["api_key"] = self.api_key
         if self.api_base:
             client_kw["base_url"] = self.api_base
-        if self.extra_headers:
-            client_kw["default_headers"] = self.extra_headers
+        if merged_headers:
+            client_kw["default_headers"] = merged_headers
         # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
         client_kw["max_retries"] = 0
         return AsyncAnthropic(**client_kw)
