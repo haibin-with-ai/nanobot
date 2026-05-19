@@ -35,6 +35,11 @@ def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
 
 
+def _sanitize_tool_id(tool_id: str) -> str:
+    """Truncate tool IDs to Anthropic's 64-character limit."""
+    return tool_id[:64] if tool_id else _gen_tool_id()
+
+
 class AnthropicProvider(LLMProvider):
     """LLM provider using the native Anthropic SDK for Claude models.
 
@@ -192,7 +197,7 @@ class AnthropicProvider(LLMProvider):
         content = msg.get("content")
         block: dict[str, Any] = {
             "type": "tool_result",
-            "tool_use_id": msg.get("tool_call_id", ""),
+            "tool_use_id": _sanitize_tool_id(msg.get("tool_call_id", "")),
         }
         if isinstance(content, list):
             block["content"] = AnthropicProvider._convert_user_content(content)
@@ -230,7 +235,7 @@ class AnthropicProvider(LLMProvider):
                 args = json_repair.loads(args)
             blocks.append({
                 "type": "tool_use",
-                "id": tc.get("id") or _gen_tool_id(),
+                "id": _sanitize_tool_id(tc.get("id") or ""),
                 "name": func.get("name", ""),
                 "input": args,
             })
