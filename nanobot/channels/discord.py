@@ -454,8 +454,9 @@ class DiscordChannel(BaseChannel):
         """构造 SkillsLoader 供 slash command 注册使用。"""
         try:
             from nanobot.agent.skills import SkillsLoader
-            from nanobot.config.paths import get_workspace_path
-            return SkillsLoader(get_workspace_path())
+            from nanobot.config.loader import load_config
+            config = load_config()
+            return SkillsLoader(config.workspace_path)
         except Exception as e:
             self.logger.debug("Could not create SkillsLoader for slash commands: {}", e)
             return None
