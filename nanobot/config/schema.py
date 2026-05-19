@@ -539,5 +539,5 @@ def _resolve_tool_config_refs() -> None:
 # happen lazily when Config/ToolsConfig is first used at runtime.
 try:
     _resolve_tool_config_refs()
-except ImportError:
+except Exception:
     pass

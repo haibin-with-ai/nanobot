@@ -41,6 +41,10 @@ def load_config(config_path: Path | None = None) -> Config:
     """
     path = config_path or get_config_path()
 
+    # Ensure forward-ref resolution (may have been skipped during circular import)
+    from nanobot.config.schema import _resolve_tool_config_refs
+    _resolve_tool_config_refs()
+
     config = Config()
     if path.exists():
         try:
@@ -168,5 +172,18 @@ def _migrate_config(data: dict) -> dict:
             my_cfg["allowSet"] = tools.pop("mySet")
         else:
             tools.pop("mySet", None)
+
+    # Remove fallback_models if no model_presets defined (fork → upstream migration)
+    defaults = data.get("agents", {}).get("defaults", {})
+    if defaults.get("fallbackModels") and not data.get("modelPresets"):
+        defaults.pop("fallbackModels", None)
+
+    # Move top-level tts → channels.discord.tts (fork migration)
+    if "tts" in data:
+        discord_cfg = data.setdefault("channels", {}).setdefault("discord", {})
+        if "tts" not in discord_cfg:
+            discord_cfg["tts"] = data.pop("tts")
+        else:
+            data.pop("tts")
 
     return data
