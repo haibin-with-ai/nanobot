@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import fnmatch
-import functools
-import json
 import os
 import re
-import shutil
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
-
-from loguru import logger
 
 from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
 
@@ -42,275 +35,6 @@ _TYPE_GLOB_MAP = {
     "html": ("*.html", "*.htm"),
     "css": ("*.css", "*.scss", "*.sass"),
 }
-
-
-class SearchBackendError(Exception):
-    """Raised when an external search backend (rg/grep) fails."""
-
-
-@dataclass(frozen=True)
-class SearchMatch:
-    """A single search match from any backend."""
-    file: str
-    line_no: int
-    text: str
-    context_before: list[str] | None = None
-    context_after: list[str] | None = None
-
-
-@functools.lru_cache(maxsize=1)
-def _rg_available() -> bool:
-    return shutil.which("rg") is not None
-
-
-@functools.lru_cache(maxsize=1)
-def _grep_available() -> bool:
-    return shutil.which("grep") is not None
-
-
-async def _run_rg(
-    target: Path,
-    pattern: str,
-    *,
-    glob_pattern: str | None = None,
-    type_key: str | None = None,
-    case_insensitive: bool = False,
-    fixed_strings: bool = False,
-    context_before: int = 0,
-    context_after: int = 0,
-    max_filesize: int = 2_000_000,
-    timeout: float = 60.0,
-) -> list[SearchMatch]:
-    """Run ripgrep and return parsed matches."""
-    cmd: list[str] = ["rg", "--json", f"--max-filesize={max_filesize}"]
-    if case_insensitive:
-        cmd.append("-i")
-    if fixed_strings:
-        cmd.append("-F")
-    if context_before:
-        cmd.extend(["-B", str(context_before)])
-    if context_after:
-        cmd.extend(["-A", str(context_after)])
-    # Glob / type filtering
-    if glob_pattern:
-        cmd.extend(["-g", glob_pattern])
-    elif type_key:
-        globs = _TYPE_GLOB_MAP.get(type_key.strip().lower())
-        if globs:
-            for g in globs:
-                cmd.extend(["-g", g])
-        else:
-            cmd.extend(["-g", f"*.{type_key}"])
-    # Ignore common noise dirs
-    for d in ("node_modules", ".git", "__pycache__", ".venv", "venv"):
-        cmd.extend(["-g", f"!{d}/"])
-    cmd.extend(["--", pattern, str(target)])
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        raise SearchBackendError("ripgrep timed out")
-    except FileNotFoundError:
-        raise SearchBackendError("rg binary not found")
-
-    # rg exit code: 0 = matches, 1 = no matches, 2+ = error
-    if proc.returncode and proc.returncode >= 2:
-        raise SearchBackendError(f"rg error (code {proc.returncode}): {stderr.decode(errors='replace')[:500]}")
-
-    matches: list[SearchMatch] = []
-    ctx_before_buf: list[str] = []
-    for raw_line in stdout.decode(errors="replace").splitlines():
-        try:
-            obj = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-        msg_type = obj.get("type")
-        if msg_type == "match":
-            data = obj["data"]
-            path_text = data.get("path", {}).get("text", "")
-            line_number = data.get("line_number", 0)
-            line_text = data.get("lines", {}).get("text", "").rstrip("\n")
-            matches.append(SearchMatch(
-                file=path_text,
-                line_no=line_number,
-                text=line_text,
-                context_before=ctx_before_buf.copy() if ctx_before_buf else None,
-            ))
-            ctx_before_buf.clear()
-        elif msg_type == "context":
-            data = obj["data"]
-            line_text = data.get("lines", {}).get("text", "").rstrip("\n")
-            ctx_before_buf.append(line_text)
-    return matches
-
-
-async def _run_system_grep(
-    target: Path,
-    pattern: str,
-    *,
-    glob_pattern: str | None = None,
-    type_key: str | None = None,
-    case_insensitive: bool = False,
-    fixed_strings: bool = False,
-    context_before: int = 0,
-    context_after: int = 0,
-    timeout: float = 60.0,
-) -> list[SearchMatch]:
-    """Run system grep and return parsed matches."""
-    cmd: list[str] = ["grep", "-rn"]
-    if case_insensitive:
-        cmd.append("-i")
-    if fixed_strings:
-        cmd.append("-F")
-    if context_before:
-        cmd.extend(["-B", str(context_before)])
-    if context_after:
-        cmd.extend(["-A", str(context_after)])
-    # Include filters
-    if glob_pattern:
-        cmd.extend(["--include", glob_pattern])
-    elif type_key:
-        globs = _TYPE_GLOB_MAP.get(type_key.strip().lower())
-        if globs:
-            for g in globs:
-                cmd.extend(["--include", g])
-        else:
-            cmd.extend(["--include", f"*.{type_key}"])
-    # Exclude common noise dirs
-    for d in ("node_modules", ".git", "__pycache__", ".venv", "venv"):
-        cmd.extend(["--exclude-dir", d])
-    cmd.extend(["--", pattern, str(target)])
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        raise SearchBackendError("grep timed out")
-    except FileNotFoundError:
-        raise SearchBackendError("grep binary not found")
-
-    # grep exit code: 0 = matches, 1 = no matches, 2+ = error
-    if proc.returncode and proc.returncode >= 2:
-        raise SearchBackendError(f"grep error (code {proc.returncode}): {stderr.decode(errors='replace')[:500]}")
-
-    matches: list[SearchMatch] = []
-    for line in stdout.decode(errors="replace").splitlines():
-        # Format: file:line_no:content (with -n)
-        # Context lines may use file-line_no-content
-        parts = line.split(":", 2)
-        if len(parts) >= 3:
-            try:
-                matches.append(SearchMatch(
-                    file=parts[0],
-                    line_no=int(parts[1]),
-                    text=parts[2],
-                ))
-            except ValueError:
-                continue
-    return matches
-
-
-def _format_rg_results(
-    matches: list[SearchMatch],
-    *,
-    mode: str,
-    limit: int | None,
-    offset: int,
-    workspace: Path | None,
-    search_root: Path,
-    pattern: str,
-) -> str:
-    """Format SearchMatch list into the output string."""
-    if not matches:
-        return f"No matches found for pattern '{pattern}' in {search_root}"
-
-    def _rel(filepath: str) -> str:
-        p = Path(filepath)
-        if workspace:
-            with suppress(ValueError):
-                return p.relative_to(workspace).as_posix()
-        with suppress(ValueError):
-            return p.relative_to(search_root).as_posix()
-        return filepath
-
-    if mode == "files_with_matches":
-        seen: dict[str, float] = {}
-        for m in matches:
-            if m.file not in seen:
-                try:
-                    seen[m.file] = Path(m.file).stat().st_mtime
-                except OSError:
-                    seen[m.file] = 0.0
-        ordered = sorted(seen, key=lambda f: (-seen[f], f))
-        display = [_rel(f) for f in ordered]
-        paged, truncated = _paginate(display, limit, offset)
-        result = "\n".join(paged)
-        notes: list[str] = []
-        pn = _pagination_note(limit, offset, truncated)
-        if pn:
-            notes.append(pn)
-        if notes:
-            result += "\n\n" + "\n".join(notes)
-        return result
-
-    if mode == "count":
-        counts: dict[str, int] = {}
-        mtimes: dict[str, float] = {}
-        for m in matches:
-            counts[m.file] = counts.get(m.file, 0) + 1
-            if m.file not in mtimes:
-                try:
-                    mtimes[m.file] = Path(m.file).stat().st_mtime
-                except OSError:
-                    mtimes[m.file] = 0.0
-        ordered = sorted(counts, key=lambda f: (-mtimes.get(f, 0), f))
-        display = [f"{_rel(f)}: {counts[f]}" for f in ordered]
-        paged, truncated = _paginate(display, limit, offset)
-        result = "\n".join(paged)
-        notes = []
-        pn = _pagination_note(limit, offset, truncated)
-        if pn:
-            notes.append(pn)
-        notes.append(f"(total matches: {sum(counts.values())} in {len(counts)} files)")
-        result += "\n\n" + "\n".join(notes)
-        return result
-
-    # content mode
-    blocks: list[str] = []
-    for m in matches:
-        display_path = _rel(m.file)
-        block_lines = [f"{display_path}:{m.line_no}"]
-        if m.context_before:
-            start_no = m.line_no - len(m.context_before)
-            for i, ctx in enumerate(m.context_before):
-                block_lines.append(f"  {start_no + i}| {ctx}")
-        block_lines.append(f"> {m.line_no}| {m.text}")
-        if m.context_after:
-            for i, ctx in enumerate(m.context_after):
-                block_lines.append(f"  {m.line_no + 1 + i}| {ctx}")
-        blocks.append("\n".join(block_lines))
-
-    paged, truncated = _paginate(blocks, limit, offset)
-    result = "\n\n".join(paged)
-    # Truncate oversized output
-    if len(result) > 128_000:
-        result = result[:128_000]
-    notes = []
-    pn = _pagination_note(limit, offset, truncated)
-    if pn:
-        notes.append(pn)
-    if notes:
-        result += "\n\n" + "\n".join(notes)
-    return result
 
 
 def _normalize_pattern(pattern: str) -> str:
@@ -537,7 +261,13 @@ class GrepTool(_SearchTool):
             if not (target.is_dir() or target.is_file()):
                 return f"Error: Unsupported path: {path}"
 
-            # Resolve limit from head_limit / legacy aliases
+            flags = re.IGNORECASE if case_insensitive else 0
+            try:
+                needle = re.escape(pattern) if fixed_strings else pattern
+                regex = re.compile(needle, flags)
+            except re.error as e:
+                return f"Error: invalid regex pattern: {e}"
+
             if head_limit is not None:
                 limit = None if head_limit == 0 else head_limit
             elif output_mode == "content" and max_matches is not None:
@@ -546,47 +276,6 @@ class GrepTool(_SearchTool):
                 limit = max_results
             else:
                 limit = _DEFAULT_HEAD_LIMIT
-
-            # Fast path: try rg, then system grep, then fall through to Python
-            root = target if target.is_dir() else target.parent
-            for backend in ("rg", "grep"):
-                if backend == "rg" and not _rg_available():
-                    continue
-                if backend == "grep" and not _grep_available():
-                    continue
-                try:
-                    runner = _run_rg if backend == "rg" else _run_system_grep
-                    matches = await runner(
-                        target, pattern,
-                        glob_pattern=glob,
-                        type_key=type,
-                        case_insensitive=case_insensitive,
-                        fixed_strings=fixed_strings,
-                        context_before=context_before,
-                        context_after=context_after,
-                    )
-                    return _format_rg_results(
-                        matches,
-                        mode=output_mode,
-                        limit=limit,
-                        offset=offset,
-                        workspace=self._workspace,
-                        search_root=root,
-                        pattern=pattern,
-                    )
-                except SearchBackendError as e:
-                    logger.debug("Search backend {} failed: {}, trying next", backend, e)
-                    continue
-
-            # Fallback: pure Python implementation
-            logger.debug("All external search backends unavailable, using pure Python")
-            flags = re.IGNORECASE if case_insensitive else 0
-            try:
-                needle = re.escape(pattern) if fixed_strings else pattern
-                regex = re.compile(needle, flags)
-            except re.error as e:
-                return f"Error: invalid regex pattern: {e}"
-
             blocks: list[str] = []
             result_chars = 0
             seen_content_matches = 0
@@ -597,6 +286,7 @@ class GrepTool(_SearchTool):
             matching_files: list[str] = []
             counts: dict[str, int] = {}
             file_mtimes: dict[str, float] = {}
+            root = target if target.is_dir() else target.parent
 
             for file_path in self._iter_files(target):
                 rel_path = file_path.relative_to(root).as_posix()
