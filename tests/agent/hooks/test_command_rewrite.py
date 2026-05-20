@@ -83,12 +83,18 @@ async def test_rewrite_exit_0_replaces_command(enabled_hook: CommandRewriteHook)
     proc.communicate = AsyncMock(return_value=(b"rewritten-cmd\n", b""))
     proc.returncode = 0
 
-    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc):
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc) as mock_exec:
         tc = _make_tool_call("exec", {"command": "original-cmd"})
         ctx = _FakeHookContext(tool_calls=[tc])
         await enabled_hook.before_execute_tools(ctx)  # type: ignore[arg-type]
 
     assert tc.arguments["command"] == "rewritten-cmd"
+    # Verify rtk rewrite is called with the command as a positional arg
+    mock_exec.assert_called_once()
+    args = mock_exec.call_args[0]
+    assert args[0] == "rtk"
+    assert args[1] == "rewrite"
+    assert args[2] == "original-cmd"
 
 
 @pytest.mark.anyio
@@ -103,6 +109,21 @@ async def test_rewrite_exit_3_replaces_command(enabled_hook: CommandRewriteHook)
         await enabled_hook.before_execute_tools(ctx)  # type: ignore[arg-type]
 
     assert tc.arguments["command"] == "rewritten-cmd"
+
+
+@pytest.mark.anyio
+async def test_rewrite_exit_0_empty_stdout_preserves_command(enabled_hook: CommandRewriteHook) -> None:
+    """Exit 0 with empty stdout should not replace with empty string."""
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc):
+        tc = _make_tool_call("exec", {"command": "original-cmd"})
+        ctx = _FakeHookContext(tool_calls=[tc])
+        await enabled_hook.before_execute_tools(ctx)  # type: ignore[arg-type]
+
+    assert tc.arguments["command"] == "original-cmd"
 
 
 @pytest.mark.anyio
@@ -124,7 +145,7 @@ async def test_rewrite_timeout_preserves_command(enabled_hook: CommandRewriteHoo
     proc = MagicMock()
     proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
     proc.kill = MagicMock()
-    proc.wait = MagicMock()
+    proc.wait = AsyncMock()
 
     with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc):
         tc = _make_tool_call("exec", {"command": "original-cmd"})
