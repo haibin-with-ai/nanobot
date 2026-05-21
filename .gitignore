@@ -97,4 +97,8 @@ logs/
 tmp/
 temp/
 *.tmp
-data-gym-cache/\ngraphify-out/\npytest-of-root/\ntmp*.jpg\ntmp*.png
+data-gym-cache/
+graphify-out/
+pytest-of-root/
+tmp*.jpg
+tmp*.png
