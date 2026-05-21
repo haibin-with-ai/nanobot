@@ -35,9 +35,19 @@ def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
 
 
+_TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9-]")
+
+
 def _sanitize_tool_id(tool_id: str) -> str:
-    """Truncate tool IDs to Anthropic's 64-character limit."""
-    return tool_id[:64] if tool_id else _gen_tool_id()
+    """Ensure tool IDs conform to Anthropic's ``^[a-zA-Z0-9-]+$`` pattern.
+
+    OpenAI-style IDs (e.g. ``call_abc123``) contain underscores which
+    Anthropic rejects.  Replace illegal chars with hyphens and truncate
+    to the 64-character limit.
+    """
+    if not tool_id:
+        return _gen_tool_id()
+    return _TOOL_ID_RE.sub("-", tool_id)[:64]
 
 
 class AnthropicProvider(LLMProvider):
@@ -623,6 +633,32 @@ class AnthropicProvider(LLMProvider):
             self._credential_store.save(new_credentials)
         self._client = self._build_client()
 
+    def _reload_token_from_store(self) -> bool:
+        """Reload token from credential store (another process may have refreshed it).
+
+        Returns True if a newer token was loaded, False otherwise.
+        """
+        if self._auth_mode != "oauth" or self._credential_store is None:
+            return False
+        credentials = self._credential_store.load()
+        if not credentials or credentials.access_token == self._auth_token:
+            return False
+        logger.info("Reloaded fresher OAuth token from credential store")
+        self._auth_token = credentials.access_token
+        self._client = self._build_client()
+        return True
+
+    @staticmethod
+    def _is_auth_error(e: Exception) -> bool:
+        """Check if the exception is an authentication error."""
+        status = getattr(e, "status_code", None)
+        if status == 401:
+            return True
+        body = getattr(e, "body", None)
+        if isinstance(body, dict) and body.get("error", {}).get("type") == "authentication_error":
+            return True
+        return False
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -643,11 +679,6 @@ class AnthropicProvider(LLMProvider):
             return self._parse_response(response)
         except Exception as e:
             if self._is_streaming_required_error(e):
-                # Anthropic SDK refuses non-stream calls when max_tokens (plus
-                # extended thinking budget) could push the request past the
-                # 10-minute server-side timeout (#2709). Transparently retry
-                # via the streaming path so callers don't need to know the
-                # provider-specific limit.
                 return await self.chat_stream(
                     messages=messages,
                     tools=tools,
@@ -657,7 +688,56 @@ class AnthropicProvider(LLMProvider):
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice,
                 )
+            if self._is_auth_error(e) and self._reload_token_from_store():
+                logger.info("Retrying chat after reloading OAuth token from store")
+                kwargs = self._build_kwargs(
+                    messages, tools, model, max_tokens, temperature,
+                    reasoning_effort, tool_choice,
+                )
+                try:
+                    response = await self._client.messages.create(**kwargs)
+                    return self._parse_response(response)
+                except Exception as e2:
+                    return self._handle_error(e2)
             return self._handle_error(e)
+
+    async def _do_stream(
+        self,
+        kwargs: dict[str, Any],
+        idle_timeout_s: int,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Execute a streaming request. Raises on error (caller handles retries)."""
+        async with self._client.messages.stream(**kwargs) as stream:
+            if on_content_delta or on_thinking_delta:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            stream.__anext__(),
+                            timeout=idle_timeout_s,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    if (
+                        chunk.type == "content_block_delta"
+                        and getattr(chunk.delta, "type", None) == "thinking_delta"
+                    ):
+                        piece = getattr(chunk.delta, "thinking", None) or ""
+                        if piece and on_thinking_delta:
+                            await on_thinking_delta(piece)
+                    elif (
+                        chunk.type == "content_block_delta"
+                        and getattr(chunk.delta, "type", None) == "text_delta"
+                    ):
+                        text = getattr(chunk.delta, "text", None) or ""
+                        if text and on_content_delta:
+                            await on_content_delta(text)
+            response = await asyncio.wait_for(
+                stream.get_final_message(),
+                timeout=idle_timeout_s,
+            )
+        return self._parse_response(response)
 
     async def chat_stream(
         self,
@@ -678,39 +758,7 @@ class AnthropicProvider(LLMProvider):
         )
         idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
         try:
-            async with self._client.messages.stream(**kwargs) as stream:
-                if on_content_delta or on_thinking_delta:
-                    # Idle timeout must track *any* SSE chunk (thinking_delta,
-                    # tool JSON deltas, etc.), not only text_stream tokens.
-                    # Otherwise extended thinking can stall text_stream for minutes
-                    # while the connection is healthy (e.g. MiniMax Anthropic).
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(
-                                stream.__anext__(),
-                                timeout=idle_timeout_s,
-                            )
-                        except StopAsyncIteration:
-                            break
-                        if (
-                            chunk.type == "content_block_delta"
-                            and getattr(chunk.delta, "type", None) == "thinking_delta"
-                        ):
-                            piece = getattr(chunk.delta, "thinking", None) or ""
-                            if piece and on_thinking_delta:
-                                await on_thinking_delta(piece)
-                        elif (
-                            chunk.type == "content_block_delta"
-                            and getattr(chunk.delta, "type", None) == "text_delta"
-                        ):
-                            text = getattr(chunk.delta, "text", None) or ""
-                            if text and on_content_delta:
-                                await on_content_delta(text)
-                response = await asyncio.wait_for(
-                    stream.get_final_message(),
-                    timeout=idle_timeout_s,
-                )
-            return self._parse_response(response)
+            return await self._do_stream(kwargs, idle_timeout_s, on_content_delta, on_thinking_delta)
         except asyncio.TimeoutError:
             return LLMResponse(
                 content=(
@@ -721,6 +769,16 @@ class AnthropicProvider(LLMProvider):
                 error_kind="timeout",
             )
         except Exception as e:
+            if self._is_auth_error(e) and self._reload_token_from_store():
+                logger.info("Retrying chat_stream after reloading OAuth token from store")
+                kwargs = self._build_kwargs(
+                    messages, tools, model, max_tokens, temperature,
+                    reasoning_effort, tool_choice,
+                )
+                try:
+                    return await self._do_stream(kwargs, idle_timeout_s, on_content_delta, on_thinking_delta)
+                except Exception as e2:
+                    return self._handle_error(e2)
             return self._handle_error(e)
 
     def get_default_model(self) -> str:

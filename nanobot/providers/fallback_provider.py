@@ -20,11 +20,11 @@ _FALLBACK_ERROR_KINDS = frozenset({
     "server_error",
     "rate_limit",
     "overloaded",
-})
-_NON_FALLBACK_ERROR_KINDS = frozenset({
     "authentication",
     "auth",
     "permission",
+})
+_NON_FALLBACK_ERROR_KINDS = frozenset({
     "content_filter",
     "refusal",
     "context_length",
@@ -152,6 +152,10 @@ class FallbackProvider(LLMProvider):
                 logger.warning(
                     "Primary model error but content already streamed; skipping failover"
                 )
+                # Content already pushed to user — retrying would send duplicate
+                # partial content followed by the same stall.  Tell _run_with_retry
+                # to stop immediately.
+                response.error_should_retry = False
                 return response
 
             if not self._should_fallback(response):
