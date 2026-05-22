@@ -31,6 +31,17 @@ _CLAUDE_CODE_HEADERS = {
 }
 
 
+class _StreamStall(Exception):
+    """Internal: stream idle timeout with content-tracking metadata."""
+
+    def __init__(self, idle_timeout_s: int, had_content: bool):
+        self.idle_timeout_s = idle_timeout_s
+        self.had_content = had_content
+        super().__init__(
+            f"stream stalled for {idle_timeout_s}s (had_content={had_content})"
+        )
+
+
 def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
 
@@ -708,36 +719,47 @@ class AnthropicProvider(LLMProvider):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        """Execute a streaming request. Raises on error (caller handles retries)."""
-        async with self._client.messages.stream(**kwargs) as stream:
-            if on_content_delta or on_thinking_delta:
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(
-                            stream.__anext__(),
-                            timeout=idle_timeout_s,
-                        )
-                    except StopAsyncIteration:
-                        break
-                    if (
-                        chunk.type == "content_block_delta"
-                        and getattr(chunk.delta, "type", None) == "thinking_delta"
-                    ):
-                        piece = getattr(chunk.delta, "thinking", None) or ""
-                        if piece and on_thinking_delta:
-                            await on_thinking_delta(piece)
-                    elif (
-                        chunk.type == "content_block_delta"
-                        and getattr(chunk.delta, "type", None) == "text_delta"
-                    ):
-                        text = getattr(chunk.delta, "text", None) or ""
-                        if text and on_content_delta:
-                            await on_content_delta(text)
-            response = await asyncio.wait_for(
-                stream.get_final_message(),
-                timeout=idle_timeout_s,
-            )
-        return self._parse_response(response)
+        """Execute a streaming request.
+
+        Raises ``_StreamStall`` (not raw ``asyncio.TimeoutError``) when the
+        stream idles beyond *idle_timeout_s*, carrying whether any content
+        text delta had already been pushed to the caller.
+        """
+        had_content = False
+        try:
+            async with self._client.messages.stream(**kwargs) as stream:
+                if on_content_delta or on_thinking_delta:
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                stream.__anext__(),
+                                timeout=idle_timeout_s,
+                            )
+                        except StopAsyncIteration:
+                            break
+                        if (
+                            chunk.type == "content_block_delta"
+                            and getattr(chunk.delta, "type", None) == "thinking_delta"
+                        ):
+                            piece = getattr(chunk.delta, "thinking", None) or ""
+                            if piece and on_thinking_delta:
+                                await on_thinking_delta(piece)
+                        elif (
+                            chunk.type == "content_block_delta"
+                            and getattr(chunk.delta, "type", None) == "text_delta"
+                        ):
+                            text = getattr(chunk.delta, "text", None) or ""
+                            if text:
+                                had_content = True
+                                if on_content_delta:
+                                    await on_content_delta(text)
+                response = await asyncio.wait_for(
+                    stream.get_final_message(),
+                    timeout=idle_timeout_s,
+                )
+            return self._parse_response(response)
+        except asyncio.TimeoutError:
+            raise _StreamStall(idle_timeout_s, had_content)
 
     async def chat_stream(
         self,
@@ -759,15 +781,48 @@ class AnthropicProvider(LLMProvider):
         idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
         try:
             return await self._do_stream(kwargs, idle_timeout_s, on_content_delta, on_thinking_delta)
-        except asyncio.TimeoutError:
-            return LLMResponse(
-                content=(
-                    f"Error calling LLM: stream stalled for more than "
-                    f"{idle_timeout_s} seconds"
-                ),
-                finish_reason="error",
-                error_kind="timeout",
-            )
+        except _StreamStall as stall:
+            if not stall.had_content:
+                # Zero-content stall — retry once on the same model.
+                logger.warning(
+                    "Stream stalled with no content after {}s, retrying once",
+                    stall.idle_timeout_s,
+                )
+                try:
+                    return await self._do_stream(
+                        kwargs, idle_timeout_s, on_content_delta, on_thinking_delta,
+                    )
+                except _StreamStall:
+                    logger.error(
+                        "Stream stall retry also timed out after {}s",
+                        idle_timeout_s,
+                    )
+                    return LLMResponse(
+                        content=(
+                            f"Error calling LLM: stream stalled for more than "
+                            f"{idle_timeout_s} seconds (retried once)"
+                        ),
+                        finish_reason="error",
+                        error_kind="timeout",
+                        error_should_retry=True,
+                    )
+                except Exception as e2:
+                    return self._handle_error(e2)
+            else:
+                # Partial-content stall — content already pushed, no retry.
+                logger.warning(
+                    "Stream stalled after partial content ({}s), not retrying",
+                    stall.idle_timeout_s,
+                )
+                return LLMResponse(
+                    content=(
+                        f"Error calling LLM: stream stalled for more than "
+                        f"{idle_timeout_s} seconds"
+                    ),
+                    finish_reason="error",
+                    error_kind="timeout",
+                    error_should_retry=False,
+                )
         except Exception as e:
             if self._is_auth_error(e) and self._reload_token_from_store():
                 logger.info("Retrying chat_stream after reloading OAuth token from store")
