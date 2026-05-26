@@ -37,7 +37,12 @@ class TestReadDescriptionFix:
 # ---------------------------------------------------------------------------
 
 class TestReadDedup:
-    """Same file + same offset/limit + unchanged mtime -> short stub."""
+    """Read dedup is DISABLED — repeated reads always return full content.
+
+    Previously, same file + same offset/limit + unchanged mtime returned a
+    short stub. This caused LLMs to waste 2-3 turns retrying reads when they
+    legitimately needed to re-read a file after doing significant work.
+    """
 
     @pytest.fixture()
     def tool(self, tmp_path):
@@ -48,15 +53,15 @@ class TestReadDedup:
         return WriteFileTool(workspace=tmp_path)
 
     @pytest.mark.asyncio
-    async def test_second_read_returns_unchanged_stub(self, tool, tmp_path):
+    async def test_second_read_returns_full_content(self, tool, tmp_path):
         f = tmp_path / "data.txt"
         f.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
         first = await tool.execute(path=str(f))
         assert "line 0" in first
         second = await tool.execute(path=str(f))
-        assert "unchanged" in second.lower()
-        # Stub should not contain file content
-        assert "line 0" not in second
+        # Dedup disabled: second read returns full content, not a stub
+        assert "line 0" in second
+        assert "unchanged" not in second.lower()
 
     @pytest.mark.asyncio
     async def test_read_after_external_modification_returns_full(self, tool, tmp_path):
@@ -74,7 +79,6 @@ class TestReadDedup:
         f.write_text("\n".join(f"line {i}" for i in range(1, 21)), encoding="utf-8")
         await tool.execute(path=str(f), offset=1, limit=5)
         second = await tool.execute(path=str(f), offset=6, limit=5)
-        # Different offset → full read, not stub
         assert "line 6" in second
 
     @pytest.mark.asyncio
@@ -87,13 +91,12 @@ class TestReadDedup:
         assert "unchanged" not in read_result.lower()
 
     @pytest.mark.asyncio
-    async def test_dedup_does_not_apply_to_images(self, tool, tmp_path):
+    async def test_images_always_return_content_blocks(self, tool, tmp_path):
         f = tmp_path / "img.png"
         f.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-data")
         first = await tool.execute(path=str(f))
         assert isinstance(first, list)
         second = await tool.execute(path=str(f))
-        # Images should always return full content blocks, not a stub
         assert isinstance(second, list)
 
 
@@ -146,7 +149,8 @@ class TestReadDedupSessionIsolation:
             file_state.reset_file_states(token)
 
         assert "line 0" in first
-        assert "unchanged" in repeat.lower()
+        # Dedup disabled: repeat read also returns full content
+        assert "line 0" in repeat
 
         token = file_state.bind_file_states(session_b)
         try:
