@@ -28,7 +28,7 @@ def test_tool_result_block_converts_image_url_in_list_content():
     block = AnthropicProvider._tool_result_block(msg)
 
     assert block["type"] == "tool_result"
-    assert block["tool_use_id"] == "call_1"
+    assert block["tool_use_id"] == "call-1"  # underscore sanitized to hyphen
     content = block["content"]
     assert isinstance(content, list)
     assert content[0] == {
@@ -53,5 +53,5 @@ def test_tool_result_block_preserves_string_content():
     block = AnthropicProvider._tool_result_block(msg)
 
     assert block["type"] == "tool_result"
-    assert block["tool_use_id"] == "call_2"
+    assert block["tool_use_id"] == "call-2"  # underscore sanitized to hyphen
     assert block["content"] == "plain tool output"
