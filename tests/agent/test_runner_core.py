@@ -106,31 +106,42 @@ async def test_runner_returns_max_iterations_fallback():
 
 @pytest.mark.asyncio
 async def test_runner_times_out_hung_llm_request():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import (
+        AgentRunSpec, AgentRunner,
+        _MAX_TIMEOUT_RETRIES, _MAX_TOTAL_TIMEOUTS,
+    )
 
     provider = MagicMock(spec=LLMProvider)
 
+    call_count = 0
+
     async def chat_with_retry(**kwargs):
+        nonlocal call_count
+        call_count += 1
         await asyncio.sleep(3600)
 
     provider.chat_with_retry = chat_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
 
+    # Need enough iterations for all 3 phases to exhaust:
+    # Phase 1 retries + Phase 2 accept repeats until total_timeouts > budget
+    total_calls_to_exhaust = _MAX_TOTAL_TIMEOUTS + _MAX_TIMEOUT_RETRIES
     runner = AgentRunner(provider)
     started = time.monotonic()
     result = await runner.run(AgentRunSpec(
         initial_messages=[{"role": "user", "content": "hello"}],
         tools=tools,
         model="test-model",
-        max_iterations=1,
+        max_iterations=total_calls_to_exhaust + 1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         llm_timeout_s=0.05,
     ))
 
-    assert (time.monotonic() - started) < 1.0
+    assert (time.monotonic() - started) < 5.0
     assert result.stop_reason == "error"
     assert "timed out" in (result.final_content or "").lower()
+    assert call_count == total_calls_to_exhaust
 
 
 @pytest.mark.asyncio

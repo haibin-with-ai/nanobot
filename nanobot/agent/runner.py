@@ -53,6 +53,8 @@ from nanobot.utils.runtime import (
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
+_MAX_TIMEOUT_RETRIES = 2
+_MAX_TOTAL_TIMEOUTS = 4
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
@@ -263,6 +265,8 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
         length_recovery_count = 0
+        timeout_retries = 0
+        total_timeouts = 0
         had_injections = False
         injection_cycles = 0
         llm_elapsed_ms = 0
@@ -501,6 +505,50 @@ class AgentRunner:
                 continue
 
             if response.finish_reason == "error":
+                if response.error_kind == "timeout":
+                    total_timeouts += 1
+
+                    # Phase 1: Immediate retry (same request, skip this turn)
+                    if timeout_retries < _MAX_TIMEOUT_RETRIES:
+                        timeout_retries += 1
+                        logger.warning(
+                            "Timeout/stall on turn {} for {} ({}/{}); retrying",
+                            iteration,
+                            spec.session_key or "default",
+                            timeout_retries,
+                            _MAX_TIMEOUT_RETRIES,
+                        )
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        continue
+
+                    # Phase 2: Retries exhausted but session budget remains —
+                    # accept error into context and let the agent loop recover.
+                    if total_timeouts <= _MAX_TOTAL_TIMEOUTS:
+                        timeout_retries = 0  # reset for next stall
+                        logger.warning(
+                            "Timeout retries exhausted on turn {} for {}; "
+                            "accepting error and continuing agent loop ({}/{} total timeouts)",
+                            iteration,
+                            spec.session_key or "default",
+                            total_timeouts,
+                            _MAX_TOTAL_TIMEOUTS,
+                        )
+                        self._append_model_error_placeholder(messages)
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        continue
+
+                    # Phase 3: Total timeout budget exhausted — fall through to break
+                    logger.error(
+                        "Total timeout budget exhausted ({}/{}) for {}; giving up",
+                        total_timeouts,
+                        _MAX_TOTAL_TIMEOUTS,
+                        spec.session_key or "default",
+                    )
+
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
