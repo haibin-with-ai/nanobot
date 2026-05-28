@@ -60,8 +60,33 @@ class CommandRewriteHook(AgentHook):
                 if self._verbose:
                     logger.info("rtk rewrite: {} → {}", cmd, rewritten)
 
+    @staticmethod
+    def _has_pipe(command: str) -> bool:
+        """Return True if *command* contains a shell pipe operator.
+
+        Skips ``|`` inside single/double quotes so that patterns like
+        ``grep -E "a|b"`` don't falsely trigger.
+        """
+        in_sq = False
+        in_dq = False
+        for ch in command:
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif ch == "|" and not in_sq and not in_dq:
+                return True
+        return False
+
     # ─── rewriter ───────────────────────────────────────────────────────
     async def _rewrite(self, command: str) -> str:
+        # rtk rewrites only the first segment of a pipeline but changes
+        # its output format (e.g. `rtk ls` appends file sizes).  Downstream
+        # commands (grep, sort, wc …) depend on the original format, so
+        # piped commands must not be rewritten.  (GH: diary mirror-field
+        # false-negative 2026-05-27.)
+        if self._has_pipe(command):
+            return command
         try:
             env = os.environ.copy()
             if self._path_append:

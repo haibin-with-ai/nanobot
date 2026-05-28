@@ -187,3 +187,52 @@ async def test_verbose_logs_rewrite(verbose_hook: CommandRewriteHook, caplog: An
 
     logger.remove(handler_id)
     assert tc.arguments["command"] == "rewritten-cmd"
+
+
+# ── pipe-skipping tests ──────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_pipe_command_skips_rewrite(enabled_hook: CommandRewriteHook) -> None:
+    """Commands containing a shell pipe must NOT be rewritten.
+
+    rtk rewrites only the first segment (e.g. ``ls`` → ``rtk ls``) but
+    changes its output format, breaking downstream grep/sort/wc.
+    """
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"rtk ls /dir | grep x\n", b""))
+    proc.returncode = 3
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc) as mock_exec:
+        tc = _make_tool_call("exec", {"command": 'ls /dir | grep -E "^[0-9]"'})
+        ctx = _FakeHookContext(tool_calls=[tc])
+        await enabled_hook.before_execute_tools(ctx)  # type: ignore[arg-type]
+
+    # rtk should never be called for piped commands
+    mock_exec.assert_not_called()
+    assert tc.arguments["command"] == 'ls /dir | grep -E "^[0-9]"'
+
+
+@pytest.mark.anyio
+async def test_pipe_inside_quotes_not_skipped(enabled_hook: CommandRewriteHook) -> None:
+    """A ``|`` inside quotes (e.g. ``grep -E "a|b"``) is NOT a shell pipe."""
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"rewritten\n", b""))
+    proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc):
+        tc = _make_tool_call("exec", {"command": 'grep -E "a|b" /tmp/f'})
+        ctx = _FakeHookContext(tool_calls=[tc])
+        await enabled_hook.before_execute_tools(ctx)  # type: ignore[arg-type]
+
+    # Pipe is inside quotes → rewrite should proceed
+    assert tc.arguments["command"] == "rewritten"
+
+
+@pytest.mark.anyio
+async def test_has_pipe_basic() -> None:
+    assert CommandRewriteHook._has_pipe("ls | grep foo") is True
+    assert CommandRewriteHook._has_pipe("ls") is False
+    assert CommandRewriteHook._has_pipe('grep -E "a|b" /tmp') is False
+    assert CommandRewriteHook._has_pipe("cat f | head | tail") is True
+    assert CommandRewriteHook._has_pipe("echo 'hello|world'") is False
