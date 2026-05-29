@@ -285,6 +285,7 @@ class AgentLoop:
             reasoning_effort=subagent_reasoning_effort,
             max_tokens=subagent_max_tokens,
             model_alias_resolver=model_alias_resolver,
+            preset_snapshot_loader=preset_snapshot_loader,
         )
         _subagent_snapshot = subagent_provider_snapshot
         self._subagent_has_independent_provider = False

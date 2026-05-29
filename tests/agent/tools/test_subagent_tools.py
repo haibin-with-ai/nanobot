@@ -59,6 +59,63 @@ async def test_subagent_exec_tool_receives_allowed_env_keys(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_subagent_preset_swaps_provider_and_model(tmp_path):
+    """A model preset that points to a different provider must swap BOTH provider and model.
+
+    Regression: previously only the model string was resolved (via model_alias_resolver),
+    so a preset like `codex` (different provider) ran its model name against the default
+    provider, causing not_found_error: model: gpt-5.5.
+    """
+    from nanobot.agent.subagent import SubagentManager, SubagentStatus
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    default_provider = MagicMock(name="default_provider")
+    default_provider.get_default_model.return_value = "default-model"
+
+    preset_provider = MagicMock(name="preset_provider")
+    snapshot = SimpleNamespace(provider=preset_provider, model="gpt-5.5")
+
+    mgr = SubagentManager(
+        provider=default_provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        preset_snapshot_loader=lambda name: snapshot if name == "codex" else None,
+        # alias resolver would silently win if snapshot path were skipped — make it observable
+        model_alias_resolver=lambda name: "WRONG-alias-model",
+    )
+    mgr._announce_result = AsyncMock()
+
+    captured = {}
+
+    async def fake_run(spec):
+        captured["model"] = spec.model
+        return SimpleNamespace(
+            stop_reason="done", final_content="ok", error=None, tool_events=[]
+        )
+
+    constructed = {}
+
+    class FakeRunner:
+        def __init__(self, provider):
+            constructed["provider"] = provider
+            self.run = AsyncMock(side_effect=fake_run)
+
+    status = SubagentStatus(
+        task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic()
+    )
+    with patch("nanobot.agent.subagent.AgentRunner", FakeRunner):
+        await mgr._run_subagent(
+            "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"},
+            status, model="codex",
+        )
+
+    assert captured["model"] == "gpt-5.5", "must use snapshot.model, not alias string"
+    assert constructed["provider"] is preset_provider, "must run on preset provider, not default"
+
+
+@pytest.mark.asyncio
 async def test_subagent_uses_configured_max_iterations(tmp_path):
     """Subagents should honor the configured tool-iteration limit."""
     from nanobot.agent.subagent import SubagentManager, SubagentStatus

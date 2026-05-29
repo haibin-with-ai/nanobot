@@ -84,6 +84,7 @@ class SubagentManager:
         reasoning_effort: str | None = None,
         max_tokens: int | None = None,
         model_alias_resolver: Callable[[str], str] | None = None,
+        preset_snapshot_loader: Callable[[str], Any] | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -109,6 +110,7 @@ class SubagentManager:
         self.reasoning_effort = reasoning_effort
         self.max_tokens = max_tokens
         self._model_alias_resolver = model_alias_resolver
+        self._preset_snapshot_loader = preset_snapshot_loader
         self._independent_provider = False
 
     def set_provider_snapshot(self, snapshot: Any | None = None) -> None:
@@ -243,8 +245,24 @@ class SubagentManager:
                 else subagent_hook
             )
             run_model = self.model
+            run_runner = self.runner
             if model is not None:
-                if self._model_alias_resolver is not None:
+                snapshot = None
+                if self._preset_snapshot_loader is not None:
+                    try:
+                        snapshot = self._preset_snapshot_loader(model)
+                    except (ValueError, KeyError):
+                        logger.warning(
+                            "Unknown model preset '{}' for subagent; "
+                            "falling back to alias/raw model string",
+                            model,
+                        )
+                if snapshot is not None:
+                    run_model = snapshot.model
+                    snapshot_provider = getattr(snapshot, "provider", None)
+                    if snapshot_provider is not None and snapshot_provider is not self.provider:
+                        run_runner = AgentRunner(snapshot_provider)
+                elif self._model_alias_resolver is not None:
                     try:
                         run_model = self._model_alias_resolver(model)
                     except (ValueError, KeyError):
@@ -252,7 +270,7 @@ class SubagentManager:
                         run_model = model
                 else:
                     run_model = model
-            run_coro = self.runner.run(AgentRunSpec(
+            run_coro = run_runner.run(AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
                 model=run_model,
