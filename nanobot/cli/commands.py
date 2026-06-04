@@ -1032,7 +1032,27 @@ def _run_gateway(
     # Register Dream system job (always-on, idempotent on restart)
     dream_cfg = config.agents.defaults.dream
     if dream_cfg.model_override:
-        agent.dream.model = dream_cfg.model_override
+        # model_override is a preset name (e.g. "codex"); resolve it to a full
+        # provider+model snapshot so Dream swaps provider too, not just the
+        # model string. Assigning the bare name would send e.g. "codex" to the
+        # default Anthropic endpoint and fail with not_found_error.
+        from nanobot.providers.factory import build_provider_snapshot
+        try:
+            _dream_snap = build_provider_snapshot(
+                config, preset_name=dream_cfg.model_override
+            )
+            agent.dream.set_provider(
+                _dream_snap.provider,
+                _dream_snap.model,
+            )
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "Dream model_override {!r} is not a known preset ({}); "
+                "falling back to model-name-only override with default provider",
+                dream_cfg.model_override,
+                exc,
+            )
+            agent.dream.model = dream_cfg.model_override
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
