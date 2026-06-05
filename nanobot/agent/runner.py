@@ -98,12 +98,17 @@ class AgentRunSpec:
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
     context_pruning: ContextPruningConfig | None = None
-    # Provider pinned at run start. A runtime model switch mutates the
-    # runner's live provider for *future* runs, but an in-flight run (including
-    # its output-truncation continuation loop) must keep the provider it began
-    # with, or it desyncs from the pinned `model` and sends e.g. an opus model
-    # name to the Codex provider → HTTP 400. None falls back to the live
-    # provider for callers that don't pin one.
+    # Provider pinned at run start, snapshotted as a pair with `model`.
+    #
+    # WHY pin instead of reading the runner's live self.provider: one AgentLoop
+    # serves many sessions that run CONCURRENTLY (loop._dispatch: per-session
+    # serial, cross-session concurrent), and a /model switch is GLOBAL — it
+    # mutates the shared provider for everyone. If the request path read the
+    # live provider, session A mid-turn on opus could have its provider swapped
+    # to Codex by session B's switch, then send the opus model name to Codex →
+    # HTTP 400. `model` was already snapshotted per-run; provider must be too,
+    # or the pair desyncs. Do NOT "simplify" this back to self.provider.
+    # None falls back to the live provider for callers that don't pin one.
     provider: LLMProvider | None = None
 
 
