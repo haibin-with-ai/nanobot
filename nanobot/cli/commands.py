@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -846,9 +847,17 @@ def _run_gateway(
             message_record_token = message_tool.set_record_channel_delivery(True)
 
         try:
+            # Per-run session: cron jobs are stateless (the news digest, paper
+            # analysis, etc. never need to recall what they produced yesterday).
+            # Keying by job.id alone made every run append to one ever-growing
+            # conversation, which (a) bloats the session file unboundedly and
+            # (b) grows the tail window until it replays a poisoned historical
+            # turn (see the thinking-block signature bug). A fresh key per run
+            # keeps each invocation isolated.
+            run_session_key = f"cron:{job.id}:{int(time.time() * 1000)}"
             resp = await agent.process_direct(
                 reminder_note,
-                session_key=f"cron:{job.id}",
+                session_key=run_session_key,
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
                 on_progress=_silent,
