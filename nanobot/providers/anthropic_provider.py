@@ -46,15 +46,22 @@ def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
 
 
-_TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9-]")
+# Anthropic's tool id/name pattern is ``^[a-zA-Z0-9_-]{1,64}$`` — underscores
+# ARE allowed (Anthropic's own ids look like ``toolu_01...``). Only replace
+# chars outside that set. Mangling underscores into hyphens was both
+# unnecessary and actively harmful: with extended thinking enabled, the
+# thinking block's signature commits to the exact tool_use ids, so rewriting
+# a native ``toolu_01...`` to ``toolu-01...`` invalidates the signature and
+# triggers "thinking blocks ... cannot be modified" on replay.
+_TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
 def _sanitize_tool_id(tool_id: str) -> str:
-    """Ensure tool IDs conform to Anthropic's ``^[a-zA-Z0-9-]+$`` pattern.
+    """Ensure tool IDs conform to Anthropic's ``^[a-zA-Z0-9_-]+$`` pattern.
 
-    OpenAI-style IDs (e.g. ``call_abc123``) contain underscores which
-    Anthropic rejects.  Replace illegal chars with hyphens and truncate
-    to the 64-character limit.
+    Replace only genuinely illegal chars (e.g. ``:``, ``|``, ``.``) with
+    hyphens and truncate to the 64-character limit. Underscores are kept so
+    native Anthropic ids round-trip unchanged.
     """
     if not tool_id:
         return _gen_tool_id()
