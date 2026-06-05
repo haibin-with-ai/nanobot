@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -46,6 +47,72 @@ class _FakeAsyncStream:
 
     async def __aexit__(self, *_exc: object) -> None:
         pass
+
+
+class _StallStream:
+    """Async stream whose first chunk read times out (simulates upstream silence)."""
+
+    def __init__(self) -> None:
+        self.get_final_message = AsyncMock(return_value=_final_message_stub())
+
+    async def __anext__(self) -> SimpleNamespace:
+        raise asyncio.TimeoutError
+
+    def __aiter__(self) -> "_StallStream":
+        return self
+
+    async def __aenter__(self) -> "_StallStream":
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        pass
+
+
+def _stream_cm(stream: object) -> MagicMock:
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=stream)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm
+
+
+@pytest.mark.asyncio
+async def test_zero_content_stall_rebuilds_client_before_retry() -> None:
+    """A stall must rebuild the client so the retry opens a fresh connection,
+    instead of re-grabbing the dead keep-alive socket and stalling again."""
+    provider = AnthropicProvider(api_key="sk-test")
+
+    dead_client = MagicMock()
+    dead_client.messages.stream = MagicMock(return_value=_stream_cm(_StallStream()))
+
+    fresh_client = MagicMock()
+    fresh_client.messages.stream = MagicMock(
+        return_value=_stream_cm(
+            _FakeAsyncStream([
+                SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(type="text_delta", text="Hi"),
+                )
+            ])
+        )
+    )
+
+    provider._client = dead_client
+    provider._build_client = MagicMock(return_value=fresh_client)
+
+    out: list[str] = []
+
+    async def on_delta(s: str) -> None:
+        out.append(s)
+
+    res = await provider.chat_stream(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=on_delta,
+    )
+
+    provider._build_client.assert_called_once()
+    assert provider._client is fresh_client
+    assert out == ["Hi"]
+    assert res.content == "Hi"
 
 
 @pytest.mark.asyncio

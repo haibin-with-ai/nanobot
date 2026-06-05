@@ -112,6 +112,15 @@ class AnthropicProvider(LLMProvider):
         client_kw["max_retries"] = 0
         return AsyncAnthropic(**client_kw)
 
+    def _reset_client(self) -> None:
+        """Drop the current client (with its connection pool) and build a fresh one.
+
+        Used after a stream stall to discard a poisoned keep-alive connection so
+        the next request opens a clean socket instead of re-grabbing the dead one.
+        Mirrors the rebuild already done on OAuth token reload.
+        """
+        self._client = self._build_client()
+
     @classmethod
     def _handle_error(cls, e: Exception) -> LLMResponse:
         response = getattr(e, "response", None)
@@ -789,10 +798,17 @@ class AnthropicProvider(LLMProvider):
         try:
             return await self._do_stream(kwargs, idle_timeout_s, on_content_delta, on_thinking_delta)
         except _StreamStall as stall:
+            # A stall = ~idle_timeout_s of total upstream silence, which almost
+            # always means a half-dead keep-alive connection still parked in the
+            # httpx pool. Reusing self._client on retry grabs that poisoned
+            # socket and stalls again — that is the 4×90s death spiral in
+            # runner.py's timeout recovery. Rebuild the client so both the local
+            # retry below AND any runner-level re-issue open a fresh connection.
+            self._reset_client()
             if not stall.had_content:
                 # Zero-content stall — retry once on the same model.
                 logger.warning(
-                    "Stream stalled with no content after {}s, retrying once",
+                    "Stream stalled with no content after {}s, rebuilt client, retrying once",
                     stall.idle_timeout_s,
                 )
                 try:
@@ -816,9 +832,11 @@ class AnthropicProvider(LLMProvider):
                 except Exception as e2:
                     return self._handle_error(e2)
             else:
-                # Partial-content stall — content already pushed, no retry.
+                # Partial-content stall — content already pushed, no local retry.
+                # Client was rebuilt above, so runner.py's re-issue gets a fresh
+                # connection instead of the dead one.
                 logger.warning(
-                    "Stream stalled after partial content ({}s), not retrying",
+                    "Stream stalled after partial content ({}s), rebuilt client, not retrying locally",
                     stall.idle_timeout_s,
                 )
                 return LLMResponse(
