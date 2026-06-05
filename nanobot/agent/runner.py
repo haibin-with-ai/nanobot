@@ -98,6 +98,13 @@ class AgentRunSpec:
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
     context_pruning: ContextPruningConfig | None = None
+    # Provider pinned at run start. A runtime model switch mutates the
+    # runner's live provider for *future* runs, but an in-flight run (including
+    # its output-truncation continuation loop) must keep the provider it began
+    # with, or it desyncs from the pinned `model` and sends e.g. an opus model
+    # name to the Codex provider → HTTP 400. None falls back to the live
+    # provider for callers that don't pin one.
+    provider: LLMProvider | None = None
 
 
 @dataclass(slots=True)
@@ -121,6 +128,10 @@ class AgentRunner:
 
     def __init__(self, provider: LLMProvider):
         self.provider = provider
+
+    def _provider_for(self, spec: "AgentRunSpec") -> LLMProvider:
+        """Provider pinned to this run; falls back to the live provider."""
+        return spec.provider or self.provider
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -685,6 +696,7 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        provider = self._provider_for(spec)
         kwargs = self._build_request_kwargs(
             spec,
             messages,
@@ -695,7 +707,7 @@ class AgentRunner:
             not wants_streaming
             and spec.stream_progress_deltas
             and spec.progress_callback is not None
-            and getattr(self.provider, "supports_progress_deltas", False) is True
+            and getattr(provider, "supports_progress_deltas", False) is True
         )
 
         progress_state: dict[str, bool] | None = None
@@ -712,7 +724,7 @@ class AgentRunner:
                 context.streamed_reasoning = True
                 await hook.emit_reasoning(delta)
 
-            coro = self.provider.chat_stream_with_retry(
+            coro = provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
                 on_thinking_delta=_thinking,
@@ -742,12 +754,12 @@ class AgentRunner:
                     context.streamed_content = True
                     await spec.progress_callback(incremental)
 
-            coro = self.provider.chat_stream_with_retry(
+            coro = provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream_progress,
             )
         else:
-            coro = self.provider.chat_with_retry(**kwargs)
+            coro = provider.chat_with_retry(**kwargs)
 
         # Streaming requests already have provider-level idle timeouts
         # (NANOBOT_STREAM_IDLE_TIMEOUT_S). Do not also apply the outer wall-clock
@@ -802,7 +814,7 @@ class AgentRunner:
         retry_messages.append(build_finalization_retry_message())
         kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
         start = time.monotonic()
-        response = await self.provider.chat_with_retry(**kwargs)
+        response = await self._provider_for(spec).chat_with_retry(**kwargs)
         elapsed_ms = max(0, int((time.monotonic() - start) * 1000))
         return response, elapsed_ms
 
@@ -1297,7 +1309,8 @@ class AgentRunner:
         if not messages or not spec.context_window_tokens:
             return messages
 
-        provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
+        provider = self._provider_for(spec)
+        provider_max_tokens = getattr(getattr(provider, "generation", None), "max_tokens", 4096)
         max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
         )
@@ -1308,7 +1321,7 @@ class AgentRunner:
             return messages
 
         estimate, _ = estimate_prompt_tokens_chain(
-            self.provider,
+            provider,
             spec.model,
             messages,
             spec.tools.get_definitions(),

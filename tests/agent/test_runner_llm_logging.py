@@ -140,6 +140,40 @@ async def test_request_model_no_tool_calls_no_extra_log(log_capture):
 
 
 @pytest.mark.asyncio
+async def test_pinned_provider_survives_mid_run_live_provider_swap():
+    """A run pins its provider; swapping runner.provider mid-run must not
+    redirect the in-flight request.
+
+    Regression: a runtime model switch (opus -> gpt-5.5) mutated
+    runner.provider to the Codex provider while an output-truncation
+    continuation was still in flight with the opus model name, sending opus to
+    Codex -> HTTP 400. The pinned spec.provider keeps provider+model paired.
+    """
+    pinned = MagicMock()
+    pinned.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="ok", finish_reason="stop")
+    )
+    live = MagicMock()
+    live.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="WRONG", finish_reason="stop")
+    )
+
+    runner = AgentRunner(pinned)
+    spec = _make_spec(model="anthropic/claude-opus-4-8", provider=pinned)
+    messages = [{"role": "user", "content": "continue"}]
+    hook = _CaptureHook()
+    context = AgentHookContext(iteration=1, messages=messages)
+
+    # Runtime model switch fires mid-run: live provider is replaced.
+    runner.provider = live
+
+    await runner._request_model(spec, messages, hook, context)
+
+    pinned.chat_with_retry.assert_awaited_once()
+    live.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_request_finalization_retry_silent_no_llm_logs(log_capture):
     """Finalization retry must not emit LLM request/response logs."""
     runner = AgentRunner(MagicMock())

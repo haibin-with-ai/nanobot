@@ -848,6 +848,12 @@ class AgentLoop:
                 initial_messages=initial_messages,
                 tools=self.tools,
                 model=self.model,
+                # Pin provider+model together at run start. A mid-run model
+                # switch mutates self.runner.provider for the next run, but this
+                # run (and its truncation-continuation loop) must finish on the
+                # provider that matches `model`, or we send an opus model name
+                # to the Codex provider → HTTP 400.
+                provider=self.provider,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
