@@ -205,6 +205,7 @@ class AgentLoop:
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         subagent_reasoning_effort: str | None = None,
         subagent_max_tokens: int | None = None,
+        max_concurrent_subagents: int | None = None,
         model_alias_resolver: Callable | None = None,
         subagent_provider_snapshot: Any | None = None,
         context_pruning: Any | None = None,
@@ -242,6 +243,11 @@ class AgentLoop:
             else defaults.max_tool_result_chars
         )
         self.provider_retry_mode = provider_retry_mode
+        self.max_concurrent_subagents = (
+            max_concurrent_subagents
+            if max_concurrent_subagents is not None
+            else defaults.max_concurrent_subagents
+        )
         self.tool_hint_max_length = (
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
@@ -284,6 +290,7 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
+            max_concurrent_subagents=self.max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
             extra_hooks=self._extra_hooks,
             reasoning_effort=subagent_reasoning_effort,
@@ -461,12 +468,14 @@ class AgentLoop:
             preset_snapshot_loader=preset_snapshot_loader,
             subagent_reasoning_effort=defaults.subagent.reasoning_effort,
             subagent_max_tokens=defaults.subagent.max_tokens,
+            max_concurrent_subagents=defaults.max_concurrent_subagents,
             **extra,
         )
 
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
+        self.subagents.max_concurrent_subagents = self.max_concurrent_subagents
 
     def _apply_provider_snapshot(
         self,

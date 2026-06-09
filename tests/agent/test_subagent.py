@@ -107,3 +107,24 @@ def test_subagent_no_soul_anchor(tmp_path):
     prompt = SubagentManager._build_subagent_prompt(sm)
     assert "## SOUL.md" not in prompt
     assert "## TOOLS.md" not in prompt
+
+
+def test_subagent_default_concurrency_limit(tmp_path):
+    """Without an explicit value, fall back to AgentDefaults (1)."""
+    sm = _make_manager(tmp_path)
+    assert sm.max_concurrent_subagents == 1
+
+
+def test_subagent_concurrency_limit_from_config(tmp_path):
+    """An explicit max_concurrent_subagents must be honored, not ignored."""
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    sm = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        model="test",
+        max_tool_result_chars=16_000,
+        max_concurrent_subagents=4,
+    )
+    assert sm.max_concurrent_subagents == 4
