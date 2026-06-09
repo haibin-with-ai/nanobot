@@ -14,7 +14,10 @@ from nanobot.command.builtin import (
     register_builtin_commands,
 )
 from nanobot.command.router import CommandContext, CommandRouter
-from nanobot.config.schema import ModelPresetConfig
+from nanobot.config.schema import ModelPresetConfig, _resolve_tool_config_refs
+
+# Resolve ToolsConfig forward refs so AgentLoop() works in isolated test runs.
+_resolve_tool_config_refs()
 
 
 def _provider(default_model: str, max_tokens: int = 123) -> MagicMock:
@@ -62,6 +65,23 @@ def _ctx_session(loop: AgentLoop, raw: str, args: str = "") -> CommandContext:
     )
 
 
+def _ctx_real_session(
+    loop: AgentLoop, raw: str, args: str = "", metadata: dict | None = None,
+) -> CommandContext:
+    """A context with a session carrying a real metadata dict.
+
+    `/model` switches are now per-session: they write session.metadata and never
+    mutate the global runtime model. Stub out sessions.save so the command can
+    persist without a real store.
+    """
+    loop.sessions.save = lambda session: None  # type: ignore[assignment]
+    msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content=raw)
+    session = SimpleNamespace(key=msg.session_key, metadata=dict(metadata or {}))
+    return CommandContext(
+        msg=msg, session=session, key=msg.session_key, raw=raw, args=args, loop=loop,
+    )
+
+
 @pytest.mark.asyncio
 async def test_model_command_lists_current_and_available_presets(tmp_path) -> None:
     loop = _make_loop(tmp_path)
@@ -76,42 +96,55 @@ async def test_model_command_lists_current_and_available_presets(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_model_command_switches_preset(tmp_path) -> None:
+async def test_model_command_switches_preset_for_session_only(tmp_path) -> None:
     loop = _make_loop(tmp_path)
+    ctx = _ctx_real_session(loop, "/model fast", args="fast")
 
-    out = await cmd_model(_ctx(loop, "/model fast", args="fast"))
+    out = await cmd_model(ctx)
 
-    assert "Switched model preset to `fast`." in out.content
+    assert "Switched model preset to `fast` for this session." in out.content
     assert "Model: `openai/gpt-4.1`" in out.content
-    assert loop.model_preset == "fast"
-    assert loop.model == "openai/gpt-4.1"
-    assert loop.subagents.model == "openai/gpt-4.1"
-    assert loop.consolidator.model == "openai/gpt-4.1"
-    assert loop.dream.model == "openai/gpt-4.1"
-
-
-@pytest.mark.asyncio
-async def test_model_command_switches_back_to_default(tmp_path) -> None:
-    loop = _make_loop(tmp_path)
-    loop.set_model_preset("fast")
-
-    out = await cmd_model(_ctx(loop, "/model default", args="default"))
-
-    assert "Switched model preset to `default`." in out.content
-    assert loop.model_preset == "default"
+    # Per-session override is recorded on the session.
+    assert ctx.session.metadata["model_preset"] == "fast"
+    # The global runtime model is NOT mutated.
+    assert loop.model_preset is None
     assert loop.model == "base-model"
     assert loop.context_window_tokens == 1000
 
 
 @pytest.mark.asyncio
+async def test_model_command_default_clears_session_override(tmp_path) -> None:
+    loop = _make_loop(tmp_path)
+    ctx = _ctx_real_session(
+        loop, "/model default", args="default", metadata={"model_preset": "fast"},
+    )
+
+    out = await cmd_model(ctx)
+
+    assert "Cleared session model override" in out.content
+    assert "model_preset" not in ctx.session.metadata
+    # Falls back to the global default for display.
+    assert "Current model: `base-model`" in out.content
+
+
+@pytest.mark.asyncio
+async def test_model_command_requires_session_to_switch(tmp_path) -> None:
+    loop = _make_loop(tmp_path)
+    out = await cmd_model(_ctx(loop, "/model fast", args="fast"))
+    assert "No active session." in out.content
+
+
+@pytest.mark.asyncio
 async def test_model_command_unknown_preset_keeps_old_state(tmp_path) -> None:
     loop = _make_loop(tmp_path)
+    ctx = _ctx_real_session(loop, "/model missing", args="missing")
 
-    out = await cmd_model(_ctx(loop, "/model missing", args="missing"))
+    out = await cmd_model(ctx)
 
     assert "Could not switch model preset" in out.content
-    assert "\"model_preset" not in out.content
     assert "Available presets: `default`, `fast`" in out.content
+    # Neither the session nor the global model changed.
+    assert "model_preset" not in ctx.session.metadata
     assert loop.model_preset is None
     assert loop.model == "base-model"
 
@@ -121,9 +154,10 @@ async def test_model_command_does_not_depend_on_my_allow_set(tmp_path) -> None:
     loop = _make_loop(tmp_path)
     assert loop.tools_config.my.allow_set is False
 
-    await cmd_model(_ctx(loop, "/model fast", args="fast"))
+    ctx = _ctx_real_session(loop, "/model fast", args="fast")
+    await cmd_model(ctx)
 
-    assert loop.model_preset == "fast"
+    assert ctx.session.metadata["model_preset"] == "fast"
 
 
 @pytest.mark.asyncio
@@ -131,12 +165,13 @@ async def test_model_command_registered_as_exact_and_prefix(tmp_path) -> None:
     router = CommandRouter()
     register_builtin_commands(router)
     loop = _make_loop(tmp_path)
+    ctx = _ctx_real_session(loop, "/model fast", args="fast")
 
-    out = await router.dispatch(_ctx(loop, "/model fast"))
+    out = await router.dispatch(ctx)
 
     assert out is not None
     assert "Switched model preset" in out.content
-    assert loop.model_preset == "fast"
+    assert ctx.session.metadata["model_preset"] == "fast"
 
 
 def test_model_command_in_help_and_palette() -> None:

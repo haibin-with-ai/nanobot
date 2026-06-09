@@ -29,6 +29,7 @@ class CronPayload:
     to: str | None = None  # e.g. phone number
     channel_meta: dict = field(default_factory=dict)  # channel-specific routing (e.g. Slack thread_ts)
     session_key: str | None = None  # original session key for correct session recording
+    preset: str | None = None  # per-job model preset; None → cron default (fast)
 
 
 @dataclass

@@ -177,19 +177,23 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     task_count = sum(1 for t in active_tasks if not t.done())
     with suppress(Exception):
         task_count += loop.subagents.get_running_count_by_session(ctx.key)
+    # Report the model effective for THIS session (per-session override else global).
+    eff_provider, eff_model, eff_ctx_tokens = loop._effective_run_model(session)
+    if eff_ctx_tokens is None:
+        eff_ctx_tokens = loop.context_window_tokens
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=build_status_content(
-            version=__version__, model=loop.model,
+            version=__version__, model=eff_model,
             start_time=loop._start_time, last_usage=loop._last_usage,
-            context_window_tokens=loop.context_window_tokens,
+            context_window_tokens=eff_ctx_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
             search_usage_text=search_usage_text,
             active_task_count=task_count,
             max_completion_tokens=getattr(
-                getattr(loop.provider, "generation", None), "max_tokens", 8192
+                getattr(eff_provider, "generation", None), "max_tokens", 8192
             ),
         ),
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
@@ -228,17 +232,31 @@ def _active_model_preset_name(loop) -> str:
     return loop.model_preset or "default"
 
 
+def _session_model_preset(session) -> str | None:
+    """The per-session model override preset name, if any."""
+    if session is None:
+        return None
+    return session.metadata.get("model_preset")
+
+
+def _effective_preset_name(loop, session) -> str:
+    """Effective preset for this session: per-session override else global."""
+    return _session_model_preset(session) or _active_model_preset_name(loop)
+
+
 def _command_error_message(exc: Exception) -> str:
     return str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
 
 
-def _model_command_status(loop) -> str:
+def _model_command_status(loop, session=None) -> str:
     names = _model_preset_names(loop)
-    active = _active_model_preset_name(loop)
+    active = _effective_preset_name(loop, session)
+    _provider, model, _ctx = loop._effective_run_model(session)
+    scope = "session override" if _session_model_preset(session) else "global default"
     return "\n".join([
         "## Model",
-        f"- Current model: `{loop.model}`",
-        f"- Current preset: `{active}`",
+        f"- Current model: `{model}`",
+        f"- Current preset: `{active}` ({scope})",
         f"- Available presets: {_format_preset_names(names)}",
     ])
 
@@ -280,8 +298,15 @@ async def cmd_tts(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_model(ctx: CommandContext) -> OutboundMessage:
-    """Show or switch model presets."""
+    """Show or switch the model preset for the CURRENT session only.
+
+    A switch is per-session: it sets session.metadata['model_preset'] and
+    never mutates the global runtime model, so other sessions and cron jobs are
+    unaffected. `/model default` (or `reset`) clears the override and falls back
+    to the global default.
+    """
     loop = ctx.loop
+    session = ctx.session
     args = ctx.args.strip()
     metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
 
@@ -289,7 +314,7 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content=_model_command_status(loop),
+            content=_model_command_status(loop, session),
             metadata=metadata,
         )
 
@@ -302,9 +327,33 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
             metadata=metadata,
         )
 
+    if session is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="No active session.",
+            metadata=metadata,
+        )
+
     name = parts[0]
+
+    # Clear the per-session override → fall back to global default.
+    if name.lower() in ("default", "reset"):
+        session.metadata.pop("model_preset", None)
+        loop.sessions.save(session)
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=(
+                "Cleared session model override; using global default.\n"
+                + _model_command_status(loop, session)
+            ),
+            metadata=metadata,
+        )
+
+    # Validate the preset name without touching global state.
     try:
-        loop.set_model_preset(name)
+        snapshot = loop._resolve_session_snapshot(name)
     except (KeyError, ValueError) as exc:
         names = _model_preset_names(loop)
         return OutboundMessage(
@@ -317,11 +366,14 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
             metadata=metadata,
         )
 
-    max_tokens = getattr(getattr(loop.provider, "generation", None), "max_tokens", None)
+    session.metadata["model_preset"] = name
+    loop.sessions.save(session)
+
+    max_tokens = getattr(getattr(snapshot.provider, "generation", None), "max_tokens", None)
     lines = [
-        f"Switched model preset to `{loop.model_preset}`.",
-        f"- Model: `{loop.model}`",
-        f"- Context window: {loop.context_window_tokens}",
+        f"Switched model preset to `{name}` for this session.",
+        f"- Model: `{snapshot.model}`",
+        f"- Context window: {snapshot.context_window_tokens}",
     ]
     if max_tokens is not None:
         lines.append(f"- Max output tokens: {max_tokens}")

@@ -65,6 +65,32 @@ def test_add_job_preserves_channel_meta_and_session_key(tmp_path) -> None:
     assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
 
 
+def test_add_job_persists_preset(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    job = service.add_job(
+        name="codex job",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
+        message="hello",
+        preset="codex",
+    )
+    assert job.payload.preset == "codex"
+
+    reloaded = service.get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.payload.preset == "codex"
+
+
+def test_add_job_defaults_preset_none(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    job = service.add_job(
+        name="no preset",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
+        message="hello",
+    )
+    # None → on_cron_job applies CRON_DEFAULT_PRESET (fast) at run time.
+    assert job.payload.preset is None
+
+
 @pytest.mark.asyncio
 async def test_channel_meta_and_session_key_survive_store_reload(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"

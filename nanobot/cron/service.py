@@ -484,6 +484,7 @@ class CronService:
         delete_after_run: bool = False,
         channel_meta: dict | None = None,
         session_key: str | None = None,
+        preset: str | None = None,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -502,6 +503,7 @@ class CronService:
                 to=to,
                 channel_meta=channel_meta or {},
                 session_key=session_key,
+                preset=preset,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

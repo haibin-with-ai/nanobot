@@ -220,6 +220,10 @@ class AgentLoop:
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
+        # Per-session model override resolution cache. Keyed by
+        # (preset_name, global_provider_signature) so a config refresh that
+        # changes the global signature invalidates stale per-session entries.
+        self._session_snapshot_cache: dict[tuple[str, object], ProviderSnapshot] = {}
         self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -532,6 +536,44 @@ class AgentLoop:
             loader=self._preset_snapshot_loader,
         )
 
+    def _resolve_session_snapshot(self, name: str) -> ProviderSnapshot:
+        """Resolve a preset name to a ProviderSnapshot for per-session use.
+
+        Pure with respect to global runtime state: it never mutates
+        self.provider/self.model. Cached by (name, current global signature)
+        so a config refresh invalidates stale per-session snapshots.
+        """
+        key: tuple[str, object] = (name, self._provider_signature)
+        cached = self._session_snapshot_cache.get(key)
+        if cached is not None:
+            return cached
+        snapshot = self._build_model_preset_snapshot(name)
+        self._session_snapshot_cache[key] = snapshot
+        return snapshot
+
+    def _effective_run_model(self, session) -> tuple[object, str, int | None]:
+        """Return (provider, model, context_window_tokens) for this turn.
+
+        A per-session override in session.metadata['model_preset'] wins;
+        otherwise fall back to the global runtime model. Unknown/invalid
+        presets fall back to global rather than crash the turn.
+        """
+        name = None
+        if session is not None:
+            name = session.metadata.get("model_preset")
+        if name:
+            try:
+                normalized = preset_helpers.normalize_preset_name(name, self.model_presets)
+                snapshot = self._resolve_session_snapshot(normalized)
+                return snapshot.provider, snapshot.model, snapshot.context_window_tokens
+            except Exception:
+                logger.warning(
+                    "Session {} has invalid model_preset {!r}; using global model",
+                    getattr(session, "key", "?"),
+                    name,
+                )
+        return self.provider, self.model, self.context_window_tokens
+
     def set_model_preset(self, name: str | None, *, publish_update: bool = True) -> None:
         """Resolve a preset by name and apply all runtime model dependents."""
         name = preset_helpers.normalize_preset_name(name, self.model_presets)
@@ -842,18 +884,26 @@ class AgentLoop:
             return items
 
         active_session_key = session.key if session else session_key
+        # Resolve the effective model for THIS session. A per-session override
+        # (session.metadata['model_preset']) wins; otherwise the global model.
+        # Resolving here keeps provider+model pinned together per run and means
+        # sessions never share a mutable live model — eliminating the
+        # cross-session provider/model mismatch (HTTP 400) hazard.
+        eff_provider, eff_model, eff_ctx_tokens = self._effective_run_model(session)
+        if eff_ctx_tokens is None:
+            eff_ctx_tokens = self.context_window_tokens
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=self.tools,
-                model=self.model,
+                model=eff_model,
                 # Pin provider+model together at run start. A mid-run model
                 # switch mutates self.runner.provider for the next run, but this
                 # run (and its truncation-continuation loop) must finish on the
                 # provider that matches `model`, or we send an opus model name
                 # to the Codex provider → HTTP 400.
-                provider=self.provider,
+                provider=eff_provider,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
@@ -861,7 +911,7 @@ class AgentLoop:
                 concurrent_tools=True,
                 workspace=self.workspace,
                 session_key=session.key if session else None,
-                context_window_tokens=self.context_window_tokens,
+                context_window_tokens=eff_ctx_tokens,
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
                 progress_callback=on_progress,
@@ -1751,9 +1801,19 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        model_preset: str | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        ``model_preset`` seeds the session's per-session model override before
+        the turn runs. Used by cron so scheduled jobs pin a stable model
+        (default ``fast``) instead of riding the global interactive model.
+        """
         await self._connect_mcp()
+        if model_preset:
+            session = self.sessions.get_or_create(session_key)
+            session.metadata["model_preset"] = model_preset
+            self.sessions.save(session)
         msg = InboundMessage(
             channel=channel, sender_id="user", chat_id=chat_id,
             content=content, media=media or [],
