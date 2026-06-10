@@ -128,21 +128,3 @@ def test_subagent_concurrency_limit_from_config(tmp_path):
         max_concurrent_subagents=4,
     )
     assert sm.max_concurrent_subagents == 4
-
-
-def test_subagent_slash_preset_strips_known_provider_prefix():
-    """'provider/model' form must split so the API gets a clean model name."""
-    from nanobot.agent.loop import _subagent_slash_preset
-
-    preset = _subagent_slash_preset("anthropic_claude_code/claude-sonnet-4-6")
-    assert preset.provider == "anthropic_claude_code"
-    assert preset.model == "claude-sonnet-4-6"
-
-
-def test_subagent_slash_preset_preserves_openrouter_style_model():
-    """A '/' that is part of the model id (no provider prefix) is preserved."""
-    from nanobot.agent.loop import _subagent_slash_preset
-
-    preset = _subagent_slash_preset("google/gemini-3.5-flash")
-    assert preset.provider == "auto"
-    assert preset.model == "google/gemini-3.5-flash"

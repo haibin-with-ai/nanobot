@@ -129,25 +129,6 @@ class TurnContext:
     trace: list[StateTraceEntry] = field(default_factory=list)
 
 
-def _subagent_slash_preset(model_str: str) -> "ModelPresetConfig":
-    """Build a ModelPresetConfig from a 'provider/model' subagent model string.
-
-    If the prefix is a known provider registry name, split it off so the model
-    sent to the API is clean (e.g. 'anthropic_claude_code/claude-sonnet-4-6'
-    -> provider='anthropic_claude_code', model='claude-sonnet-4-6'). Otherwise
-    the '/' is part of the model id itself (e.g. openrouter
-    'google/gemini-3.5-flash') and is preserved verbatim.
-    """
-    from nanobot.config.schema import ModelPresetConfig
-    from nanobot.providers.registry import find_by_name
-
-    prefix, rest = model_str.split("/", 1)
-    normalized = prefix.replace("-", "_")
-    if rest and find_by_name(normalized):
-        return ModelPresetConfig(provider=normalized, model=rest)
-    return ModelPresetConfig(model=model_str)
-
-
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -418,9 +399,10 @@ class AgentLoop:
             try:
                 from nanobot.providers.factory import build_provider_snapshot
                 if "/" in defaults.subagent.model:
+                    from nanobot.config.schema import ModelPresetConfig
                     subagent_provider_snapshot = build_provider_snapshot(
                         config,
-                        preset=_subagent_slash_preset(defaults.subagent.model),
+                        preset=ModelPresetConfig(model=defaults.subagent.model),
                     )
                 else:
                     subagent_provider_snapshot = build_provider_snapshot(

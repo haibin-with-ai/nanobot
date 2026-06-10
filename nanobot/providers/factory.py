@@ -19,13 +19,33 @@ class ProviderSnapshot:
     signature: tuple[object, ...]
 
 
+def _split_inline_provider(preset: ModelPresetConfig) -> ModelPresetConfig:
+    """Normalize an inline 'provider/model' string into explicit provider + model.
+
+    The '/' prefix is only a routing hint; the API must receive the bare model.
+    Split it off once, here, so no downstream resolver (provider lookup, api_base,
+    snapshot.model, default_model) ever sees the combined form. Only applies when
+    the provider is unset/'auto' and the prefix matches a registered provider
+    name — a '/' that is part of the model id itself (e.g. openrouter
+    'google/gemini-3.5-flash') is left untouched.
+    """
+    if preset.provider not in (None, "", "auto") or "/" not in preset.model:
+        return preset
+    prefix, rest = preset.model.split("/", 1)
+    normalized = prefix.replace("-", "_")
+    if rest and find_by_name(normalized):
+        return preset.model_copy(update={"provider": normalized, "model": rest})
+    return preset
+
+
 def _resolve_model_preset(
     config: Config,
     *,
     preset_name: str | None = None,
     preset: ModelPresetConfig | None = None,
 ) -> ModelPresetConfig:
-    return preset if preset is not None else config.resolve_preset(preset_name)
+    resolved = preset if preset is not None else config.resolve_preset(preset_name)
+    return _split_inline_provider(resolved)
 
 
 def _make_provider_core(
