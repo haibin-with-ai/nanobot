@@ -32,6 +32,30 @@ class LineAge:
     age_days: int  # days since last modification
 
 
+def _parse_blame_committer_times(output: str) -> list[int]:
+    """Parse `git blame --porcelain` output into per-line committer epochs.
+
+    Returns one Unix timestamp per content line, in final-file order.
+    Porcelain emits a full commit header the first time a commit is seen and
+    a short header (sha + line numbers) on subsequent lines, so we cache each
+    commit's committer-time by sha and resolve content lines (\\t-prefixed)
+    against the most recent header sha.
+    """
+    sha_to_time: dict[str, int] = {}
+    times: list[int] = []
+    current_sha = ""
+    for line in output.splitlines():
+        if line.startswith("\t"):
+            times.append(sha_to_time.get(current_sha, 0))
+        elif line.startswith("committer-time "):
+            sha_to_time[current_sha] = int(line.split(" ", 1)[1])
+        else:
+            head = line.split(" ", 1)[0]
+            if len(head) == 40 and all(c in "0123456789abcdef" for c in head):
+                current_sha = head
+    return times
+
+
 def _compute_line_ages(annotated) -> list[LineAge]:
     """Convert annotate results to per-line ages."""
     now = datetime.now(tz=timezone.utc).date()
@@ -262,17 +286,31 @@ class GitStore:
             return []
 
         try:
-            from dulwich import porcelain
+            import subprocess
 
-            annotated = porcelain.annotate(str(self._workspace), file_path)
+            result = subprocess.run(
+                ["git", "blame", "--porcelain", "--", file_path],
+                cwd=str(self._workspace),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
         except Exception:
-            logger.exception("Git line_ages annotate failed for {}", file_path)
+            logger.exception("Git line_ages blame failed for {}", file_path)
             return []
 
-        if not annotated:
+        times = _parse_blame_committer_times(result.stdout)
+        if not times:
             return []
 
-        return _compute_line_ages(annotated)
+        now = datetime.now(tz=timezone.utc).date()
+        return [
+            LineAge(
+                age_days=(now - datetime.fromtimestamp(ts, tz=timezone.utc).date()).days
+            )
+            for ts in times
+        ]
 
     def diff_commits(self, sha1: str, sha2: str) -> str:
         """Show diff between two commits."""

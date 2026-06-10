@@ -7,7 +7,32 @@ from unittest.mock import patch
 
 import pytest
 
-from nanobot.utils.gitstore import GitStore
+from nanobot.utils.gitstore import GitStore, _parse_blame_committer_times
+
+
+class TestParseBlamePorcelain:
+    def test_parses_committer_time_per_line(self):
+        """Each content line maps to its commit's committer-time, in order."""
+        output = (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 2\n"
+            "author A\n"
+            "committer-time 1000\n"
+            "committer-tz +0000\n"
+            "filename MEMORY.md\n"
+            "\tline one\n"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n"
+            "\tline two\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 3 3 1\n"
+            "author B\n"
+            "committer-time 2000\n"
+            "committer-tz +0000\n"
+            "filename MEMORY.md\n"
+            "\tline three\n"
+        )
+        assert _parse_blame_committer_times(output) == [1000, 1000, 2000]
+
+    def test_empty_output_returns_empty(self):
+        assert _parse_blame_committer_times("") == []
 
 
 @pytest.fixture
