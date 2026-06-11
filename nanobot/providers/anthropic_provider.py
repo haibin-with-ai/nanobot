@@ -612,6 +612,21 @@ class AnthropicProvider(LLMProvider):
             if cache_read:
                 usage["cached_tokens"] = cache_read
 
+        # A model-level refusal (stop_reason="refusal") is a policy/风控 decline,
+        # not a usable answer.  Surface it as a fallbackable error so the
+        # FallbackProvider fails over to another model instead of the runner
+        # swallowing the empty content as a blank-response retry loop.
+        if response.stop_reason == "refusal":
+            return LLMResponse(
+                content="".join(content_parts) or None,
+                tool_calls=tool_calls,
+                finish_reason="error",
+                usage=usage,
+                thinking_blocks=thinking_blocks or None,
+                error_kind="refusal",
+                error_should_retry=True,
+            )
+
         return LLMResponse(
             content="".join(content_parts) or None,
             tool_calls=tool_calls,

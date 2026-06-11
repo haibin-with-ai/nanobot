@@ -15,6 +15,7 @@ _PRIMARY_FAILURE_THRESHOLD = 3
 _PRIMARY_COOLDOWN_S = 60
 _MISSING = object()
 _FALLBACK_ERROR_KINDS = frozenset({
+    "refusal",
     "timeout",
     "connection",
     "server_error",
@@ -26,7 +27,6 @@ _FALLBACK_ERROR_KINDS = frozenset({
 })
 _NON_FALLBACK_ERROR_KINDS = frozenset({
     "content_filter",
-    "refusal",
     "context_length",
     "invalid_request",
 })
