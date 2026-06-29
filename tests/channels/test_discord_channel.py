@@ -183,12 +183,21 @@ def _make_message(
     attachments: list[object] | None = None,
     reply_to: int | None = None,
     reply_author_id: int | None = None,
+    reply_author_name: str | None = None,
+    reply_content: str | None = None,
     message_type=None,
 ):
     # Factory for incoming Discord message objects with optional guild/reply/attachments.
     guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
     referenced_message = (
-        SimpleNamespace(author=SimpleNamespace(id=reply_author_id))
+        SimpleNamespace(
+            author=SimpleNamespace(
+                id=reply_author_id,
+                display_name=reply_author_name or str(reply_author_id),
+            ),
+            content=reply_content or "",
+            id=reply_to,
+        )
         if reply_author_id is not None
         else None
     )
@@ -447,6 +456,63 @@ def test_build_inbound_metadata_dm_message() -> None:
     assert metadata["channel_name"] is None
     assert metadata["sender_name"] == "Bob"
     assert metadata["guild_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_on_message_includes_resolved_reply_content() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            content="写入日记",
+            reply_to=111,
+            reply_author_id=123,
+            reply_author_name="haibin",
+            reply_content="其实我单独陪佩奇爬山的次数远高于单独陪乔治。",
+            message_type=discord.MessageType.reply,
+        )
+    )
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == (
+        "[reply to haibin: 其实我单独陪佩奇爬山的次数远高于单独陪乔治。]\n"
+        "写入日记"
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_message_omits_reply_content_when_reference_unresolved() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            content="写入日记",
+            reply_to=111,
+            message_type=discord.MessageType.reply,
+        )
+    )
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "写入日记"
+    assert handled[0]["metadata"]["reply_to"] == "111"
 
 
 @pytest.mark.asyncio

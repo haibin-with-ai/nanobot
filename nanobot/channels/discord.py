@@ -637,7 +637,8 @@ class DiscordChannel(BaseChannel):
             return
 
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
-        full_content = self._compose_inbound_content(content, attachment_markers)
+        quoted_content = self._extract_reply_context(message)
+        full_content = self._compose_inbound_content(content, attachment_markers, quoted_content)
         metadata = self._build_inbound_metadata(message)
         parent_channel_id = self._channel_parent_key(message.channel)
         session_key = None
@@ -812,11 +813,31 @@ class DiscordChannel(BaseChannel):
         return media_paths, markers
 
     @staticmethod
-    def _compose_inbound_content(content: str, attachment_markers: list[str]) -> str:
-        """Combine message text with attachment markers."""
-        content_parts = [content] if content else []
+    def _compose_inbound_content(
+        content: str,
+        attachment_markers: list[str],
+        quoted_content: str | None = None,
+    ) -> str:
+        """Combine reply context, message text, and attachment markers."""
+        content_parts = [quoted_content] if quoted_content else []
+        if content:
+            content_parts.append(content)
         content_parts.extend(attachment_markers)
         return "\n".join(part for part in content_parts if part) or "[empty message]"
+
+    @staticmethod
+    def _extract_reply_context(message: discord.Message) -> str | None:
+        """Return resolved Discord reply content, when Discord provides it."""
+        reference = getattr(message, "reference", None)
+        referenced = getattr(reference, "resolved", None) if reference else None
+        quoted = getattr(referenced, "content", None)
+        if not quoted:
+            return None
+        author = getattr(referenced, "author", None)
+        author_name = getattr(author, "display_name", None) or getattr(author, "name", None)
+        if author_name:
+            return f"[reply to {author_name}: {quoted}]"
+        return f"[reply: {quoted}]"
 
     @staticmethod
     def _is_system_message(message: discord.Message) -> bool:
