@@ -47,16 +47,15 @@ def test_adaptive_no_budget_tokens() -> None:
     assert "budget_tokens" not in kw["thinking"]
 
 
-def test_high_uses_enabled_with_budget() -> None:
+def test_high_uses_adaptive_thinking() -> None:
     kw = _build(_make_provider(), "high", max_tokens=4096)
-    assert kw["thinking"]["type"] == "enabled"
-    assert kw["thinking"]["budget_tokens"] == max(8192, 4096)
-    assert kw["max_tokens"] >= kw["thinking"]["budget_tokens"] + 4096
+    assert kw["thinking"] == {"type": "adaptive"}
+    assert kw["max_tokens"] == 4096
 
 
-def test_low_uses_small_budget() -> None:
+def test_low_uses_adaptive_thinking() -> None:
     kw = _build(_make_provider(), "low")
-    assert kw["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert kw["thinking"] == {"type": "adaptive"}
 
 
 def test_none_does_not_enable_thinking() -> None:
@@ -71,11 +70,10 @@ def test_opus_4_7_omits_temperature_adaptive() -> None:
     assert kw["thinking"] == {"type": "adaptive"}
 
 
-def test_opus_4_7_omits_temperature_enabled() -> None:
-    """Enabled thinking (high) must also omit temperature for opus-4-7."""
+def test_opus_4_7_omits_temperature_for_thinking() -> None:
     kw = _build(_make_provider("claude-opus-4-7"), "high", max_tokens=4096)
     assert "temperature" not in kw
-    assert kw["thinking"]["type"] == "enabled"
+    assert kw["thinking"] == {"type": "adaptive"}
 
 
 def test_opus_4_7_omits_temperature_none() -> None:
@@ -83,6 +81,25 @@ def test_opus_4_7_omits_temperature_none() -> None:
     kw = _build(_make_provider("claude-opus-4-7"), None)
     assert "temperature" not in kw
     assert "thinking" not in kw
+
+
+def test_claude_sonnet_5_omits_temperature_none() -> None:
+    """Claude Sonnet 5 rejects deprecated sampling params such as temperature."""
+    kw = _build(_make_provider("claude-sonnet-5"), None)
+    assert "temperature" not in kw
+    assert "thinking" not in kw
+
+
+def test_claude_sonnet_5_omits_temperature_adaptive() -> None:
+    kw = _build(_make_provider("claude-sonnet-5"), "adaptive")
+    assert "temperature" not in kw
+    assert kw["thinking"] == {"type": "adaptive"}
+
+
+def test_claude_sonnet_5_omits_temperature_with_provider_prefix() -> None:
+    kw = _build(_make_provider("anthropic/claude-sonnet-5"), None)
+    assert kw["model"] == "claude-sonnet-5"
+    assert "temperature" not in kw
 
 
 def test_reasoning_effort_string_none_does_not_enable_thinking() -> None:

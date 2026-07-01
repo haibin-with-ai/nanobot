@@ -55,6 +55,17 @@ def _gen_tool_id() -> str:
 # triggers "thinking blocks ... cannot be modified" on replay.
 _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
+_MODELS_WITHOUT_SAMPLING_PARAMS = (
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+)
+
+
+def _model_rejects_sampling_params(model: str) -> bool:
+    model_id = model.split("/", 1)[-1].lower()
+    return any(name in model_id for name in _MODELS_WITHOUT_SAMPLING_PARAMS)
+
 
 def _sanitize_tool_id(tool_id: str) -> str:
     """Ensure tool IDs conform to Anthropic's ``^[a-zA-Z0-9_-]+$`` pattern.
@@ -525,9 +536,9 @@ class AnthropicProvider(LLMProvider):
         max_tokens = max(1, max_tokens)
         thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
 
-        # claude-opus-4-7 deprecated the `temperature` parameter entirely — the
-        # API returns 400 if it is present, on any code path.
-        omit_temperature = "opus-4-7" in model_name
+        # Some newer Claude models reject legacy sampling params entirely — the
+        # API returns 400 if `temperature` is present on any code path.
+        omit_temperature = _model_rejects_sampling_params(model_name)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
