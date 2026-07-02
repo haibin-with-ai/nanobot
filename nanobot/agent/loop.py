@@ -18,7 +18,7 @@ from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, CompositeHook
-from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.memory import Consolidator, MemoryStore
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
@@ -89,6 +89,15 @@ class AssistantTurnMetrics:
     latency_ms: int | None = None
     elapsed_ms: int | None = None
     llm_elapsed_ms: int | None = None
+
+
+@dataclass
+class DreamRunResult:
+    did_work: bool
+    cursor: int | None = None
+    reason: str = ""
+    response: AgentRunResult | None = None
+    committed: bool = False
 
 
 @dataclass
@@ -209,10 +218,12 @@ class AgentLoop:
         model_alias_resolver: Callable | None = None,
         subagent_provider_snapshot: Any | None = None,
         context_pruning: Any | None = None,
+        dream_config: Any | None = None,
     ):
-        from nanobot.config.schema import ToolsConfig
+        from nanobot.config.schema import DreamConfig, ToolsConfig
 
         _tc = tools_config or ToolsConfig()
+        self.dream_config = dream_config or DreamConfig()
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
@@ -337,11 +348,6 @@ class AgentLoop:
             sessions=self.sessions,
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
-        )
-        self.dream = Dream(
-            store=self.context.memory,
-            provider=provider,
-            model=self.model,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._context_pruning = context_pruning
@@ -469,6 +475,7 @@ class AgentLoop:
             subagent_reasoning_effort=defaults.subagent.reasoning_effort,
             subagent_max_tokens=defaults.subagent.max_tokens,
             max_concurrent_subagents=defaults.max_concurrent_subagents,
+            dream_config=defaults.dream,
             **extra,
         )
 
@@ -496,7 +503,6 @@ class AgentLoop:
         if not self._subagent_has_independent_provider:
             self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
-        self.dream.set_provider(provider, model)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
@@ -951,6 +957,63 @@ class AgentLoop:
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         return result
 
+    async def run_dream_once(self) -> DreamRunResult:
+        """Run one single-phase Dream consolidation cycle."""
+        dream_config = self.dream_config
+        if not dream_config.enabled:
+            return DreamRunResult(did_work=False, reason="disabled")
+
+        built = self.context.memory.build_dream_prompt(
+            max_entries=dream_config.max_batch_size,
+            annotate_line_ages=dream_config.annotate_line_ages,
+        )
+        if built is None:
+            return DreamRunResult(did_work=False, reason="no_history")
+
+        prompt, target_cursor = built
+        session_key = MemoryStore.dream_session_key()
+        resp = await self.process_direct(
+            prompt,
+            session_key=session_key,
+            channel="cron",
+            chat_id="dream",
+            media=None,
+            on_progress=None,
+            on_stream=None,
+            on_stream_end=None,
+            model_preset=dream_config.model_override,
+        )
+        completed = MemoryStore.dream_run_completed(resp)
+        if not completed:
+            # Leave the cursor untouched so the batch is retried next run.
+            return DreamRunResult(
+                did_work=False,
+                cursor=self.context.memory.get_last_dream_cursor(),
+                reason="not_completed",
+                response=resp,
+            )
+
+        # Advance the cursor in Python (upstream semantics): the model only
+        # maintains memory files, so a forgotten/mistyped cursor write can
+        # never cause silent batch loss or infinite reprocessing. Set it
+        # before auto_commit so the cursor file lands in the same commit.
+        self.context.memory.set_last_dream_cursor(target_cursor)
+        committed = self.context.memory.git.auto_commit(
+            MemoryStore.build_dream_commit_message(
+                f"dream: consolidate to cursor {target_cursor}",
+                resp,
+            )
+        )
+        MemoryStore.prune_dream_sessions(self.workspace / "sessions")
+
+        return DreamRunResult(
+            did_work=True,
+            cursor=target_cursor,
+            reason="completed",
+            response=resp,
+            committed=committed,
+        )
+
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
@@ -1382,6 +1445,7 @@ class AgentLoop:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
+        meta["_stop_reason"] = stop_reason
 
         return OutboundMessage(
             channel=msg.channel,

@@ -395,12 +395,17 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     async def _run_dream():
         t0 = time.monotonic()
         try:
-            did_work = await loop.dream.run()
+            result = await loop.run_dream_once()
             elapsed = time.monotonic() - t0
-            if did_work:
+            if result.did_work:
                 content = f"Dream completed in {elapsed:.1f}s."
+            elif result.reason in ("no_history", "disabled"):
+                content = f"Dream: nothing to process ({result.reason})."
             else:
-                content = "Dream: nothing to process."
+                content = (
+                    f"Dream did not complete after {elapsed:.1f}s "
+                    f"({result.reason}); memory cursor was not advanced."
+                )
         except Exception as e:
             elapsed = time.monotonic() - t0
             content = f"Dream failed after {elapsed:.1f}s: {e}"

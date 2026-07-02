@@ -822,8 +822,8 @@ def _run_gateway(
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
             try:
-                await agent.dream.run()
-                logger.info("Dream cron job completed")
+                result = await agent.run_dream_once()
+                logger.info("Dream cron job completed: {}", result.reason)
             except Exception:
                 logger.exception("Dream cron job failed")
             return None
@@ -1048,41 +1048,33 @@ def _run_gateway(
         console.print(f"[green]✓[/green] Health endpoint: http://{host}:{health_port}/health")
         async with server:
             await server.serve_forever()
-    # Register Dream system job (always-on, idempotent on restart)
+    # Register Dream system job (idempotent on restart). Dream now runs as a
+    # normal direct-processing task via AgentLoop.run_dream_once(); the
+    # model_override preset is resolved per-run through process_direct.
     dream_cfg = config.agents.defaults.dream
     if dream_cfg.model_override:
-        # model_override is a preset name (e.g. "codex"); resolve it to a full
-        # provider+model snapshot so Dream swaps provider too, not just the
-        # model string. Assigning the bare name would send e.g. "codex" to the
-        # default Anthropic endpoint and fail with not_found_error.
-        from nanobot.providers.factory import build_provider_snapshot
+        # Validate early so a typo'd preset fails loudly at startup instead of
+        # silently at the next scheduled Dream run.
         try:
-            _dream_snap = build_provider_snapshot(
-                config, preset_name=dream_cfg.model_override
-            )
-            agent.dream.set_provider(
-                _dream_snap.provider,
-                _dream_snap.model,
-            )
+            config.resolve_preset(dream_cfg.model_override)
         except (KeyError, ValueError) as exc:
             logger.warning(
                 "Dream model_override {!r} is not a known preset ({}); "
-                "falling back to model-name-only override with default provider",
+                "Dream runs will fail until the config is fixed",
                 dream_cfg.model_override,
                 exc,
             )
-            agent.dream.model = dream_cfg.model_override
-    agent.dream.max_batch_size = dream_cfg.max_batch_size
-    agent.dream.max_iterations = dream_cfg.max_iterations
-    agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
-    from nanobot.cron.types import CronJob, CronPayload
-    cron.register_system_job(CronJob(
-        id="dream",
-        name="dream",
-        schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
-        payload=CronPayload(kind="system_event"),
-    ))
-    console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+    if dream_cfg.enabled:
+        from nanobot.cron.types import CronJob, CronPayload
+        cron.register_system_job(CronJob(
+            id="dream",
+            name="dream",
+            schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
+            payload=CronPayload(kind="system_event"),
+        ))
+        console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+    else:
+        console.print("[yellow]•[/yellow] Dream: disabled")
 
     async def _open_browser_when_ready() -> None:
         """Wait for the gateway to bind, then point the user's browser at the webui."""
