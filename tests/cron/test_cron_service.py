@@ -65,30 +65,84 @@ def test_add_job_preserves_channel_meta_and_session_key(tmp_path) -> None:
     assert reloaded.payload.session_key == "slack:C123:1234567890.123456"
 
 
-def test_add_job_persists_preset(tmp_path) -> None:
+def test_add_job_persists_model(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
     job = service.add_job(
         name="codex job",
         schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
         message="hello",
-        preset="codex",
+        model="codex",
     )
-    assert job.payload.preset == "codex"
+    assert job.payload.model == "codex"
 
     reloaded = service.get_job(job.id)
     assert reloaded is not None
-    assert reloaded.payload.preset == "codex"
+    assert reloaded.payload.model == "codex"
 
 
-def test_add_job_defaults_preset_none(tmp_path) -> None:
+def test_add_job_defaults_model_none(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
     job = service.add_job(
-        name="no preset",
+        name="no model",
         schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
         message="hello",
     )
-    # None → on_cron_job applies CRON_DEFAULT_PRESET (fast) at run time.
-    assert job.payload.preset is None
+    # None → on_cron_job applies CRON_DEFAULT_PRESET (deep) at run time.
+    assert job.payload.model is None
+
+
+@pytest.mark.asyncio
+async def test_model_survives_store_reload(tmp_path) -> None:
+    """jobs.json round-trip must preserve the per-job model preset."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    await service.start()
+    try:
+        job = service.add_job(
+            name="codex job",
+            schedule=CronSchedule(kind="cron", expr="0 9 * * *"),
+            message="hello",
+            model="codex",
+        )
+    finally:
+        service.stop()
+
+    raw = json.loads(store_path.read_text(encoding="utf-8"))
+    assert raw["jobs"][0]["payload"]["model"] == "codex"
+
+    reloaded = CronService(store_path).get_job(job.id)
+    assert reloaded is not None
+    assert reloaded.payload.model == "codex"
+
+
+def test_hand_written_model_in_jobs_json_is_loaded(tmp_path) -> None:
+    """A hand-edited jobs.json with a `model` key must be honored on load."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "abc123",
+                        "name": "hand written",
+                        "enabled": True,
+                        "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                        "payload": {
+                            "kind": "agent_turn",
+                            "message": "hello",
+                            "model": "codex",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reloaded = CronService(store_path).get_job("abc123")
+    assert reloaded is not None
+    assert reloaded.payload.model == "codex"
 
 
 @pytest.mark.asyncio

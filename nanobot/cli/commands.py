@@ -51,9 +51,9 @@ from rich.text import Text
 from nanobot import __logo__, __version__
 from nanobot.agent.loop import AgentLoop
 
-# Default model preset for cron jobs when the job sets no explicit preset.
+# Default model preset for cron jobs when the job sets no explicit model.
 # Keeps scheduled jobs off transient interactive `/model` switches.
-CRON_DEFAULT_PRESET = "fast"
+CRON_DEFAULT_PRESET = "deep"
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -860,10 +860,10 @@ def _run_gateway(
             # keeps each invocation isolated.
             run_session_key = f"cron:{job.id}:{int(time.time() * 1000)}"
             # Cron jobs pin a stable model so they never ride a transient
-            # interactive `/model` switch. Per-job preset wins; otherwise the
-            # cron default (fast) — weak models (e.g. flash) can't survive
+            # interactive `/model` switch. Per-job model wins; otherwise the
+            # cron default (deep) — weak models (e.g. flash) can't survive
             # multi-step orchestrations like the Reading Rx playbook.
-            eff_preset = job.payload.preset or CRON_DEFAULT_PRESET
+            eff_preset = job.payload.model or CRON_DEFAULT_PRESET
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=run_session_key,

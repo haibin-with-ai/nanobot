@@ -42,10 +42,10 @@ _CRON_PARAMETERS = tool_parameters_schema(
         description="Whether to deliver the execution result to the user channel (default true)",
         default=True,
     ),
-    preset=StringSchema(
-        "Optional model preset for this job's run (e.g. 'fast', 'deep', 'codex'). "
-        "When omitted, cron jobs run on the default 'fast' preset. Use a stronger "
-        "preset only for multi-step orchestrations that need it."
+    model=StringSchema(
+        "Optional model preset name for this job's run (e.g. 'fast', 'deep', 'codex'). "
+        "When omitted, cron jobs run on the default 'deep' preset. Use 'fast' for "
+        "lightweight jobs to save cost."
     ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
@@ -147,13 +147,13 @@ class CronTool(Tool, ContextAware):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
-        preset: str | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver, preset)
+            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver, model)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -169,7 +169,7 @@ class CronTool(Tool, ContextAware):
         tz: str | None,
         at: str | None,
         deliver: bool = True,
-        preset: str | None = None,
+        model: str | None = None,
     ) -> str:
         if not message:
             return (
@@ -223,7 +223,7 @@ class CronTool(Tool, ContextAware):
             delete_after_run=delete_after,
             channel_meta=self._metadata.get(),
             session_key=self._session_key.get() or None,
-            preset=preset or None,
+            model=model or None,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
@@ -278,6 +278,7 @@ class CronTool(Tool, ContextAware):
             if j.payload.kind == "system_event":
                 parts.append(f"  Purpose: {self._system_job_purpose(j)}")
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
+            parts.append(f"  Model: {j.payload.model or 'deep (default)'}")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
         return "Scheduled jobs:\n" + "\n".join(lines)
