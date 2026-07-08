@@ -77,7 +77,7 @@ class TestMidTurnCommandDispatchedDirectly:
         loop = MagicMock()
         loop.sessions = MagicMock()
         loop.sessions.get_or_create = MagicMock(return_value=MagicMock(
-            messages=[], last_consolidated=0, clear=MagicMock(),
+            messages=[], last_consolidated=0, metadata={}, clear=MagicMock(),
         ))
         loop.sessions.save = MagicMock()
         loop.sessions.invalidate = MagicMock()
@@ -107,6 +107,24 @@ class TestMidTurnCommandDispatchedDirectly:
         assert result is not None
         assert "New session" in result.content
         fake_loop.sessions.get_or_create.assert_called_once_with("test:chat1")
+
+    @pytest.mark.asyncio
+    async def test_new_resets_session_model_override(
+        self, router: CommandRouter, fake_loop: MagicMock, fake_msg: MagicMock,
+    ) -> None:
+        """/new starts a fresh conversation and returns model selection to config defaults."""
+        session = fake_loop.sessions.get_or_create.return_value
+        session.metadata = {"model_preset": "codex", "goal_state": {"status": "active"}}
+        ctx = CommandContext(
+            msg=fake_msg, session=session,
+            key="test:chat1", raw="/new", loop=fake_loop,
+        )
+
+        result = await router.dispatch(ctx)
+
+        assert result is not None
+        assert "model_preset" not in session.metadata
+        assert session.metadata["goal_state"] == {"status": "active"}
 
     @pytest.mark.asyncio
     async def test_help_dispatched_with_session_none(

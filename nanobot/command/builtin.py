@@ -207,6 +207,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
     session.clear()
+    session.metadata.pop("model_preset", None)
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
