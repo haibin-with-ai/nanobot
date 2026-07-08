@@ -262,6 +262,29 @@ class TestDreamCursor:
         assert store.get_last_dream_cursor() == 1
 
 
+class TestDreamContentDiff:
+    def test_empty_when_git_not_initialized(self, tmp_path):
+        store = MemoryStore(tmp_path)
+        store.write_memory("a fact")
+        assert store.dream_content_diff() == ""
+
+    def test_empty_when_no_uncommitted_change(self, tmp_path):
+        store = MemoryStore(tmp_path)
+        store.write_memory("committed fact")
+        assert store.git.init() is True
+        # init committed the current memory; nothing dangling in the working tree.
+        assert store.dream_content_diff() == ""
+
+    def test_reports_uncommitted_memory_edit(self, tmp_path):
+        store = MemoryStore(tmp_path)
+        assert store.git.init() is True
+        store.write_memory("a durable new fact")
+        summary = store.dream_content_diff()
+        assert "MEMORY.md" in summary
+        assert "a durable new fact" in summary
+        assert "insertion" in summary
+
+
 class TestLegacyHistoryMigration:
     def test_read_unprocessed_history_handles_entries_without_cursor(self, store):
         """JSONL entries with cursor=1 are correctly parsed and returned."""

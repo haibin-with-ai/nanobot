@@ -27,11 +27,12 @@ def _response(*, stop_reason: str = "completed", content: str | None = None):
 
 
 class FakeDreamMemory:
-    def __init__(self, built=None, cursor=0):
+    def __init__(self, built=None, cursor=0, diff_body=""):
         self.built = built
         self.cursor = cursor
         self.git = SimpleNamespace(auto_commit=MagicMock(return_value=True))
         self.build_dream_prompt = MagicMock(return_value=built)
+        self.dream_content_diff = MagicMock(return_value=diff_body)
         self.get_last_dream_cursor = MagicMock(side_effect=lambda: self.cursor)
         self.set_last_dream_cursor = MagicMock(
             side_effect=lambda value: setattr(self, "cursor", value)
@@ -125,12 +126,15 @@ class TestDreamHelpers:
         assert MemoryStore.dream_run_completed(SimpleNamespace(metadata={})) is False
         assert MemoryStore.dream_run_completed(None) is False
 
-    def test_build_dream_commit_message_includes_response_content_when_present(self):
+    def test_build_dream_commit_message_grounds_on_diff_body_only(self):
+        # Empty diff → bare prefix (auto_commit turns it into a no-op).
+        assert MemoryStore.build_dream_commit_message("prefix", "") == "prefix"
         assert MemoryStore.build_dream_commit_message("prefix", None) == "prefix"
-        assert MemoryStore.build_dream_commit_message("prefix", SimpleNamespace(content="")) == "prefix"
+        assert MemoryStore.build_dream_commit_message("prefix", "   ") == "prefix"
+        # Real diff body is appended verbatim (after stripping).
         assert (
-            MemoryStore.build_dream_commit_message("prefix", SimpleNamespace(content="  changed memory  "))
-            == "prefix\n\nchanged memory"
+            MemoryStore.build_dream_commit_message("prefix", "  SOUL.md: +1 -0  ")
+            == "prefix\n\nSOUL.md: +1 -0"
         )
 
     def test_prune_dream_sessions_keeps_newest_n(self, tmp_path):
@@ -210,7 +214,12 @@ class TestRunDreamOnce:
         memory.git.auto_commit.assert_not_called()
 
     async def test_completed_response_advances_cursor_and_auto_commits(self, tmp_path):
-        memory = FakeDreamMemory(built=("dream prompt", 7), cursor=3)
+        # resp.content lies ("updated notes") but the real diff is what counts.
+        memory = FakeDreamMemory(
+            built=("dream prompt", 7),
+            cursor=3,
+            diff_body="memory/MEMORY.md: +2 -1\n1 file changed, 2 insertions(+), 1 deletions(-)",
+        )
         loop = object.__new__(AgentLoop)
         loop.dream_config = DreamConfig(model_override="dream-model")
         loop.context = SimpleNamespace(memory=memory)
@@ -225,7 +234,31 @@ class TestRunDreamOnce:
         assert result.reason == "completed"
         assert result.committed is True
         memory.set_last_dream_cursor.assert_called_once_with(7)
+        # The audit record is grounded in the real diff; the LLM's self-report
+        # ("updated notes") must never leak into the commit message.
         memory.git.auto_commit.assert_called_once_with(
-            "dream: consolidate to cursor 7\n\nupdated notes"
+            "dream: consolidate to cursor 7\n\n"
+            "memory/MEMORY.md: +2 -1\n1 file changed, 2 insertions(+), 1 deletions(-)"
         )
+        assert "updated notes" not in memory.git.auto_commit.call_args.args[0]
         prune.assert_called_once_with(tmp_path / "sessions")
+
+    async def test_completed_with_empty_diff_still_advances_cursor_with_bare_prefix(self, tmp_path):
+        # Model completed but made no durable edit: this fork advances the cursor
+        # anyway (Python-side semantics), and the bare-prefix message is a no-op
+        # commit since nothing is staged.
+        memory = FakeDreamMemory(built=("dream prompt", 9), cursor=4, diff_body="")
+        memory.git.auto_commit = MagicMock(return_value=False)
+        loop = object.__new__(AgentLoop)
+        loop.dream_config = DreamConfig(model_override="dream-model")
+        loop.context = SimpleNamespace(memory=memory)
+        loop.workspace = tmp_path
+        loop.process_direct = AsyncMock(return_value=_response(stop_reason="completed", content="I saved everything"))
+
+        with patch.object(MemoryStore, "prune_dream_sessions"):
+            result = await loop.run_dream_once()
+
+        assert result.cursor == 9
+        assert result.reason == "completed"
+        memory.set_last_dream_cursor.assert_called_once_with(9)
+        memory.git.auto_commit.assert_called_once_with("dream: consolidate to cursor 9")

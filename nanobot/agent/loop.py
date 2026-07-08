@@ -998,10 +998,15 @@ class AgentLoop:
         # never cause silent batch loss or infinite reprocessing. Set it
         # before auto_commit so the cursor file lands in the same commit.
         self.context.memory.set_last_dream_cursor(target_cursor)
+        # Ground the audit record in the real working-tree diff of the memory
+        # files, never the model's self-report. An empty diff (model completed
+        # but made no durable edit) yields a bare prefix, which auto_commit
+        # turns into a no-op — cursor still advances per this fork's semantics.
+        diff_body = self.context.memory.dream_content_diff()
         committed = self.context.memory.git.auto_commit(
             MemoryStore.build_dream_commit_message(
                 f"dream: consolidate to cursor {target_cursor}",
-                resp,
+                diff_body,
             )
         )
         MemoryStore.prune_dream_sessions(self.workspace / "sessions")
