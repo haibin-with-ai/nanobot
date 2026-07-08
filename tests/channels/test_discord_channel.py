@@ -963,7 +963,7 @@ async def test_slash_new_is_blocked_for_disallowed_user() -> None:
     assert handled == []
 
 
-@pytest.mark.parametrize("slash_name", ["stop", "restart", "status", "history"])
+@pytest.mark.parametrize("slash_name", ["stop", "restart", "status", "history", "dream"])
 @pytest.mark.asyncio
 async def test_slash_commands_forward_via_handle_message(slash_name: str) -> None:
     channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
@@ -987,6 +987,32 @@ async def test_slash_commands_forward_via_handle_message(slash_name: str) -> Non
     assert len(handled) == 1
     assert handled[0]["content"] == f"/{slash_name}"
     assert handled[0]["metadata"]["is_slash_command"] is True
+
+
+@pytest.mark.asyncio
+async def test_slash_dream_log_forwards_with_optional_sha() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    client = DiscordBotClient(channel, intents=discord.Intents.none())
+
+    cmd = client.tree.get_command("dream-log")
+    assert cmd is not None
+
+    interaction = _make_interaction()
+    interaction.command.qualified_name = "dream-log"
+    await cmd.callback(interaction, sha=None)
+    assert handled[-1]["content"] == "/dream-log"
+    assert handled[-1]["metadata"]["is_slash_command"] is True
+
+    interaction2 = _make_interaction()
+    interaction2.command.qualified_name = "dream-log"
+    await cmd.callback(interaction2, sha="abc1234")
+    assert handled[-1]["content"] == "/dream-log abc1234"
 
 
 @pytest.mark.asyncio

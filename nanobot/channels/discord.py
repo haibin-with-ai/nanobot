@@ -69,7 +69,7 @@ class DiscordConfig(Base):
 
 import re as _re
 
-_BUILTIN_SLASH_NAMES = {"new", "stop", "restart", "status", "history", "help"}
+_BUILTIN_SLASH_NAMES = {"new", "stop", "restart", "status", "history", "help", "dream", "dream-log"}
 _CMD_NAME_PATTERN = _re.compile(r"^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$|^[a-z0-9]$")
 
 
@@ -220,6 +220,7 @@ if DISCORD_AVAILABLE:
                 ("restart", "Restart the bot", "/restart"),
                 ("status", "Show bot status", "/status"),
                 ("history", "Show recent conversation messages", "/history"),
+                ("dream", "Manually trigger Dream memory consolidation", "/dream"),
             )
 
             for name, description, command_text in commands:
@@ -242,6 +243,19 @@ if DISCORD_AVAILABLE:
                     await self._reply_ephemeral(interaction, "This channel is not allowed for this bot.")
                     return
                 await self._reply_ephemeral(interaction, build_help_text())
+
+            # ── /dream-log command (optional commit SHA) ──
+            @self.tree.command(
+                name="dream-log",
+                description="Show what the last Dream changed (or a specific commit)",
+            )
+            @app_commands.describe(sha="Optional commit SHA to inspect")
+            async def dream_log_command(
+                interaction: discord.Interaction,
+                sha: str | None = None,
+            ) -> None:
+                command_text = f"/dream-log {sha}" if sha else "/dream-log"
+                await self._forward_slash_command(interaction, command_text)
 
             # ── Skill commands ──
             registered_names = set(_BUILTIN_SLASH_NAMES)
