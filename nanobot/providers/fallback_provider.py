@@ -148,23 +148,21 @@ class FallbackProvider(LLMProvider):
                 self._primary_tripped_at = None
                 return response
 
-            if has_streamed is not None and has_streamed[0]:
-                logger.warning(
-                    "Primary model error but content already streamed; skipping failover"
-                )
-                # Content already pushed to user — retrying would send duplicate
-                # partial content followed by the same stall.  Tell _run_with_retry
-                # to stop immediately.
-                response.error_should_retry = False
+            if not self._should_fallback(response):
+                if has_streamed is not None and has_streamed[0]:
+                    logger.warning(
+                        "Primary model error with partial content; "
+                        "non-fallbackable, skipping failover"
+                    )
+                    response.error_should_retry = False
                 return response
 
-            if not self._should_fallback(response):
+            if has_streamed is not None and has_streamed[0]:
                 logger.warning(
-                    "Primary model '{}' returned non-fallbackable error: {}",
+                    "Primary model '{}' error with partial content streamed; "
+                    "attempting failover anyway (error is fallbackable)",
                     primary_model,
-                    (response.content or "")[:120],
                 )
-                return response
 
             self._primary_failures += 1
             if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
@@ -180,8 +178,6 @@ class FallbackProvider(LLMProvider):
         primary_skipped = not self._primary_available()
         for idx, fallback in enumerate(self._fallback_presets):
             fallback_model = fallback.model
-            if has_streamed is not None and has_streamed[0]:
-                break
             if idx == 0 and primary_skipped:
                 logger.info(
                     "Primary model '{}' circuit open, trying fallback '{}'",
@@ -254,8 +250,6 @@ class FallbackProvider(LLMProvider):
 
     @staticmethod
     def _should_fallback(response: LLMResponse) -> bool:
-        if response.error_should_retry is False:
-            return False
         status = response.error_status_code
         kind = (response.error_kind or "").lower()
         error_type = (response.error_type or "").lower()
@@ -270,6 +264,12 @@ class FallbackProvider(LLMProvider):
             return False
         if response.error_should_retry is True:
             return True
+        # error_should_retry=False means "don't retry locally" (e.g. partial
+        # content already streamed). It does NOT mean "don't try other models".
+        # For fallbackable error kinds (timeout, etc.), failover is still the
+        # right call — losing partial content is better than session death.
+        if response.error_should_retry is False:
+            return kind in _FALLBACK_ERROR_KINDS
         if status is not None and (status in {408, 409, 429} or 500 <= status <= 599):
             return True
         if kind in _FALLBACK_ERROR_KINDS:

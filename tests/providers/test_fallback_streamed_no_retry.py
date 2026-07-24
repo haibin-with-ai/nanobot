@@ -1,9 +1,9 @@
-"""Regression: stream stall after partial content must NOT be retried.
+"""Regression: stream stall after partial content must trigger failover.
 
 When content has already been streamed to the user and the primary model
-stalls (timeout), the FallbackProvider must set ``error_should_retry = False``
-so that ``_run_with_retry`` stops immediately instead of retrying the same
-doomed primary 4 times (~7 min wasted).
+stalls (timeout), the FallbackProvider must attempt failover to another
+model.  Losing partial content is better than the entire session dying
+on a dead connection.
 """
 
 from __future__ import annotations
@@ -52,17 +52,69 @@ class _StubProvider(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+class _Preset:
+    def __init__(self, model: str):
+        self.model = model
+        self.max_tokens = None
+        self.temperature = None
+        self.reasoning_effort = None
+
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_streamed_stall_sets_error_should_retry_false():
-    """After partial stream + stall, response.error_should_retry must be False."""
+async def test_streamed_stall_falls_back_to_next_model():
+    """After partial stream + timeout, fallback should be attempted."""
     primary = _StubProvider(model="primary")
     fallback = _StubProvider(model="fallback")
     primary._behaviour = "stall_after_stream"
 
-    factory = lambda preset: _StubProvider(model=preset)
-    fp = FallbackProvider(primary, ["fallback"], factory)
+    streamed_chunks: list[str] = []
+
+    async def capture_delta(text: str) -> None:
+        streamed_chunks.append(text)
+
+    fp = FallbackProvider(primary, [_Preset("fallback")], lambda _p: fallback)
+
+    resp = await fp.chat_stream(on_content_delta=capture_delta)
+
+    # Partial content was streamed from primary
+    assert streamed_chunks, "delta callback should have been invoked"
+
+    # Fallback should have succeeded
+    assert resp.finish_reason != "error"
+    assert resp.content == "full response"
+
+    # Primary was called once, fallback was called once
+    assert primary._call_count == 1
+    assert fallback._call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streamed_stall_non_fallbackable_error_skips_failover():
+    """After partial stream + non-fallbackable error (e.g. content_filter),
+    failover should be skipped and error_should_retry=False returned."""
+    primary = _StubProvider(model="primary")
+    primary._behaviour = "stall_after_stream"
+    # Override to return content_filter instead of timeout
+    async def _stall_content_filter(**kw):
+        primary._call_count += 1
+        delta_cb = kw.get("on_content_delta")
+        if delta_cb:
+            await delta_cb("partial content…")
+        return LLMResponse(
+            content="content filtered",
+            finish_reason="error",
+            error_kind="content_filter",
+        )
+
+    primary.chat_stream = _stall_content_filter
+
+    factory = lambda preset: _StubProvider(model=preset.model)
+    fp = FallbackProvider(primary, [_Preset("fallback")], factory)
 
     streamed_chunks: list[str] = []
 
@@ -71,19 +123,9 @@ async def test_streamed_stall_sets_error_should_retry_false():
 
     resp = await fp.chat_stream(on_content_delta=capture_delta)
 
-    # Partial content was streamed
     assert streamed_chunks, "delta callback should have been invoked"
-
-    # Response is an error
     assert resp.finish_reason == "error"
-
-    # Critical: must tell retry loop to stop
-    assert resp.error_should_retry is False, (
-        "error_should_retry must be explicitly False when content was already "
-        "streamed — otherwise _run_with_retry retries the same stall 4 times"
-    )
-
-    # Primary was called once, no fallback attempted
+    assert resp.error_should_retry is False
     assert primary._call_count == 1
 
 

@@ -285,10 +285,20 @@ class TestFallbackOnPrimaryError:
         assert fallback.chat_calls[0]["model"] == "fallback-a"
 
 
-class TestNoFallbackWhenContentStreamed:
+class TestNoFallbackWhenContentStreamedNonFallbackable:
+    """When content was streamed but the error is NOT fallbackable
+    (e.g. content_filter), failover should still be skipped."""
+
     @pytest.mark.asyncio
     async def test(self) -> None:
-        primary = _FakeProvider("primary", _error_response())
+        primary = _FakeProvider(
+            "primary",
+            _make_response(
+                "content filtered",
+                finish_reason="error",
+                error_kind="content_filter",
+            ),
+        )
         factory = MagicMock()
         fb = FallbackProvider(
             primary=primary,
@@ -303,10 +313,48 @@ class TestNoFallbackWhenContentStreamed:
             messages=[{"role": "user", "content": "hi"}],
             on_content_delta=_delta,
         )
-        # Primary returns error but content was "streamed" (FakeProvider calls delta)
-        # so failover should be skipped
+        # Primary returns non-fallbackable error with content streamed
+        # → failover should be skipped
         assert result.finish_reason == "error"
         factory.assert_not_called()
+
+
+class TestFailoverWhenContentStreamedTimeout:
+    """When content was streamed and the error is a timeout (fallbackable),
+    failover should still be attempted — losing partial content is better
+    than session death."""
+
+    @pytest.mark.asyncio
+    async def test(self) -> None:
+        primary = _FakeProvider(
+            "primary",
+            _make_response(
+                "stream stalled",
+                finish_reason="error",
+                error_kind="timeout",
+                error_should_retry=False,
+            ),
+        )
+        fallback = _FakeProvider("fallback", _make_response("fallback ok"))
+        factory = MagicMock(return_value=fallback)
+        fb = FallbackProvider(
+            primary=primary,
+            fallback_presets=[_fallback("fallback-a")],
+            provider_factory=factory,
+        )
+
+        async def _delta(text: str) -> None:
+            pass
+
+        result = await fb.chat_stream(
+            messages=[{"role": "user", "content": "hi"}],
+            on_content_delta=_delta,
+        )
+        # Primary returns timeout with content streamed
+        # → failover should still happen
+        assert result.content == "fallback ok"
+        assert result.finish_reason == "stop"
+        factory.assert_called_once_with(_fallback("fallback-a"))
 
 
 class TestFailoverOnTransientError:
