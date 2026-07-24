@@ -14,6 +14,31 @@ from nanobot.providers.base import LLMProvider, LLMResponse
 _PRIMARY_FAILURE_THRESHOLD = 3
 _PRIMARY_COOLDOWN_S = 60
 _MISSING = object()
+
+# Quota / rate-limit cooldown: a model that reports quota exhaustion or a
+# rate-limit is silenced for a window so we stop hammering it on every request.
+# When the provider supplies retry_after we honour it (clamped to the bounds);
+# otherwise we fall back to the default window.
+_QUOTA_COOLDOWN_DEFAULT_S = 600.0  # 10 minutes
+_QUOTA_COOLDOWN_MIN_S = 60.0
+_QUOTA_COOLDOWN_MAX_S = 1800.0  # 30 minutes cap
+_QUOTA_ERROR_TOKENS = (
+    "quota exceeded",
+    "quota_exceeded",
+    "quota exhausted",
+    "quota_exhausted",
+    "insufficient_quota",
+    "insufficient quota",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "too_many_requests",
+    "resource_exhausted",
+    "resource exhausted",
+    "billing_hard_limit",
+    "insufficient_balance",
+    "out of credits",
+)
 _FALLBACK_ERROR_KINDS = frozenset({
     "refusal",
     "timeout",
@@ -83,6 +108,9 @@ class FallbackProvider(LLMProvider):
         self._has_fallbacks = bool(fallback_presets)
         self._primary_failures = 0
         self._primary_tripped_at: float | None = None
+        # model name -> monotonic deadline until which the model is silenced
+        # after a quota / rate-limit error.
+        self._quota_cooldowns: dict[str, float] = {}
 
     @property
     def generation(self):
@@ -107,6 +135,46 @@ class FallbackProvider(LLMProvider):
             # Half-open: allow one probe attempt.
             return True
         return False
+
+    def _quota_cooldown_remaining(self, model_key: str) -> float:
+        """Return remaining quota cooldown seconds for a model, else 0.0."""
+        deadline = self._quota_cooldowns.get(model_key)
+        if deadline is None:
+            return 0.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._quota_cooldowns.pop(model_key, None)
+            return 0.0
+        return remaining
+
+    @staticmethod
+    def _is_quota_error(response: LLMResponse) -> bool:
+        """True when the error is a quota-exhaustion / rate-limit condition."""
+        if response.finish_reason != "error":
+            return False
+        if response.error_status_code == 429:
+            return True
+        retry_after = response.retry_after or response.error_retry_after_s
+        if isinstance(retry_after, (int, float)) and retry_after > 0:
+            return True
+        kind = (response.error_kind or "").lower()
+        if kind in {"rate_limit", "quota", "insufficient_quota", "resource_exhausted"}:
+            return True
+        text = (response.content or "").lower()
+        return any(token in text for token in _QUOTA_ERROR_TOKENS)
+
+    def _trip_quota_cooldown(self, model_key: str, response: LLMResponse) -> None:
+        """Silence a model for a cooldown window after a quota/rate-limit error."""
+        retry_after = response.retry_after or response.error_retry_after_s
+        if isinstance(retry_after, (int, float)) and retry_after > 0:
+            cooldown = min(max(float(retry_after), _QUOTA_COOLDOWN_MIN_S), _QUOTA_COOLDOWN_MAX_S)
+        else:
+            cooldown = _QUOTA_COOLDOWN_DEFAULT_S
+        self._quota_cooldowns[model_key] = time.monotonic() + cooldown
+        logger.warning(
+            "Model '{}' hit quota/rate-limit; cooling down for {:.0f}s",
+            model_key, cooldown,
+        )
 
     async def chat(self, **kwargs: Any) -> LLMResponse:
         if not self._has_fallbacks:
@@ -141,12 +209,23 @@ class FallbackProvider(LLMProvider):
     ) -> LLMResponse:
         primary_model = kwargs.get("model") or self._primary.get_default_model()
 
-        if self._primary_available():
+        primary_quota_cd = self._quota_cooldown_remaining(primary_model)
+        if primary_quota_cd > 0:
+            logger.info(
+                "Primary model '{}' cooling down after quota/rate-limit "
+                "({:.0f}s left); skipping to fallbacks",
+                primary_model, primary_quota_cd,
+            )
+
+        if primary_quota_cd <= 0 and self._primary_available():
             response = await call(self._primary, kwargs)
             if response.finish_reason != "error":
                 self._primary_failures = 0
                 self._primary_tripped_at = None
                 return response
+
+            if self._is_quota_error(response):
+                self._trip_quota_cooldown(primary_model, response)
 
             if not self._should_fallback(response):
                 if has_streamed is not None and has_streamed[0]:
@@ -175,9 +254,17 @@ class FallbackProvider(LLMProvider):
             logger.debug("Primary model '{}' circuit open; skipping", primary_model)
 
         last_response: LLMResponse | None = None
-        primary_skipped = not self._primary_available()
+        primary_skipped = primary_quota_cd > 0 or not self._primary_available()
         for idx, fallback in enumerate(self._fallback_presets):
             fallback_model = fallback.model
+            cooldown_remaining = self._quota_cooldown_remaining(fallback_model)
+            if cooldown_remaining > 0:
+                logger.info(
+                    "Fallback '{}' cooling down after quota/rate-limit "
+                    "({:.0f}s left); skipping",
+                    fallback_model, cooldown_remaining,
+                )
+                continue
             if idx == 0 and primary_skipped:
                 logger.info(
                     "Primary model '{}' circuit open, trying fallback '{}'",
@@ -228,6 +315,9 @@ class FallbackProvider(LLMProvider):
                 )
                 return fallback_response
 
+            if self._is_quota_error(fallback_response):
+                self._trip_quota_cooldown(fallback_model, fallback_response)
+
             last_response = fallback_response
             logger.warning(
                 "Fallback '{}' also failed: {}",
@@ -242,7 +332,20 @@ class FallbackProvider(LLMProvider):
         # Return the last error response we saw (primary or last fallback).
         if last_response is not None:
             return last_response
-        # Primary was tripped and we have no fallbacks — synthesize an error.
+        # Everything was skipped. Distinguish quota cooldown from circuit-open
+        # so the surfaced error is diagnosable.
+        cooling = [
+            m for m in (primary_model, *(f.model for f in self._fallback_presets))
+            if self._quota_cooldown_remaining(m) > 0
+        ]
+        if cooling:
+            return LLMResponse(
+                content=(
+                    "All models are cooling down after quota/rate-limit: "
+                    + ", ".join(cooling)
+                ),
+                finish_reason="error",
+            )
         return LLMResponse(
             content=f"Primary model '{primary_model}' circuit open and no fallbacks available",
             finish_reason="error",
