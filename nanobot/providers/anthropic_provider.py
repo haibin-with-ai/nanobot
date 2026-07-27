@@ -58,13 +58,30 @@ _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 _MODELS_WITHOUT_SAMPLING_PARAMS = (
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "claude-sonnet-5",
 )
 
+_EFFORT_MODELS = ("claude-opus-5",)
+_DEFAULT_THINKING_ON_MODELS = ("claude-opus-5",)
+_THINKING_SUMMARIZATION_MODELS = ("claude-opus-5",)
+_ADAPTIVE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _matches_model(model: str, candidates: tuple[str, ...]) -> bool:
+    model_id = model.rsplit("/", 1)[-1].lower()
+    return any(
+        model_id == name or model_id.startswith(f"{name}-")
+        for name in candidates
+    )
+
 
 def _model_rejects_sampling_params(model: str) -> bool:
-    model_id = model.split("/", 1)[-1].lower()
-    return any(name in model_id for name in _MODELS_WITHOUT_SAMPLING_PARAMS)
+    return _matches_model(model, _MODELS_WITHOUT_SAMPLING_PARAMS)
+
+
+def _model_supports_effort(model: str) -> bool:
+    return _matches_model(model, _EFFORT_MODELS)
 
 
 def _sanitize_tool_id(tool_id: str) -> str:
@@ -549,15 +566,19 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
-        if reasoning_effort == "adaptive":
-            # Adaptive thinking: model decides when and how much to think
-            # Supported on claude-sonnet-4-6 and claude-opus-4-6.
-            # Also auto-enables interleaved thinking between tool calls.
-            kwargs["thinking"] = {"type": "adaptive"}
-            if not omit_temperature:
-                kwargs["temperature"] = 1.0
+        if (
+            reasoning_effort
+            and reasoning_effort.lower() == "none"
+            and _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS)
+        ):
+            kwargs["thinking"] = {"type": "disabled"}
         elif thinking_enabled:
             kwargs["thinking"] = {"type": "adaptive"}
+            if _matches_model(model_name, _THINKING_SUMMARIZATION_MODELS):
+                kwargs["thinking"]["display"] = "summarized"
+            effort = reasoning_effort.lower() if reasoning_effort else None
+            if effort in _ADAPTIVE_EFFORT_LEVELS and _model_supports_effort(model_name):
+                kwargs["output_config"] = {"effort": effort}
             if not omit_temperature:
                 kwargs["temperature"] = 1.0
         elif not omit_temperature:
