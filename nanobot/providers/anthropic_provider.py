@@ -572,7 +572,7 @@ class AnthropicProvider(LLMProvider):
             and _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS)
         ):
             kwargs["thinking"] = {"type": "disabled"}
-        elif thinking_enabled:
+        elif thinking_enabled or _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS):
             kwargs["thinking"] = {"type": "adaptive"}
             if _matches_model(model_name, _THINKING_SUMMARIZATION_MODELS):
                 kwargs["thinking"]["display"] = "summarized"

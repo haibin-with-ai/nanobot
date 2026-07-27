@@ -67,6 +67,13 @@ def test_opus5_sends_full_effort_range(effort: str) -> None:
     assert kwargs["output_config"] == {"effort": effort}
 
 
+def test_opus5_default_requests_summarized_adaptive_thinking() -> None:
+    kwargs = _kwargs(_provider())
+
+    assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert "output_config" not in kwargs
+
+
 def test_opus5_adaptive_alias_keeps_provider_default_effort() -> None:
     kwargs = _kwargs(_provider(), reasoning_effort="adaptive")
 
