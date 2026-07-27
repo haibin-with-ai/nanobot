@@ -48,7 +48,6 @@ def _kwargs(
         "claude-opus-5",
         "anthropic/claude-opus-5",
         "provider-prefix/anthropic/claude-opus-5",
-        "claude-opus-5-20260727",
     ],
 )
 def test_opus5_omits_sampling_parameters(model: str) -> None:
@@ -81,8 +80,9 @@ def test_opus5_adaptive_alias_keeps_provider_default_effort() -> None:
     assert "output_config" not in kwargs
 
 
-def test_opus5_explicit_none_disables_default_thinking() -> None:
-    kwargs = _kwargs(_provider(), reasoning_effort="none")
+@pytest.mark.parametrize("effort", ["none", "disabled"])
+def test_opus5_explicit_disable_aliases_disable_default_thinking(effort: str) -> None:
+    kwargs = _kwargs(_provider(), reasoning_effort=effort)
 
     assert kwargs["thinking"] == {"type": "disabled"}
     assert "output_config" not in kwargs
@@ -103,6 +103,20 @@ def test_opus47_keeps_existing_adaptive_thinking_behavior() -> None:
     assert kwargs["thinking"] == {"type": "adaptive"}
     assert "output_config" not in kwargs
     assert "temperature" not in kwargs
+
+
+def test_opus48_keeps_existing_default_behavior() -> None:
+    kwargs = _kwargs(_provider("claude-opus-4-8"))
+
+    assert "thinking" not in kwargs
+    assert "output_config" not in kwargs
+    assert "temperature" not in kwargs
+
+
+def test_legacy_model_keeps_temperature() -> None:
+    kwargs = _kwargs(_provider("claude-3-5-sonnet-latest"))
+
+    assert kwargs["temperature"] == 0.7
 
 
 @pytest.mark.asyncio

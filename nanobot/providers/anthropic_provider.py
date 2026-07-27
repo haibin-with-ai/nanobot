@@ -551,7 +551,8 @@ class AnthropicProvider(LLMProvider):
             system.insert(0, _CLAUDE_CODE_SYSTEM_BLOCK)
 
         max_tokens = max(1, max_tokens)
-        thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
+        thinking_disabled = bool(reasoning_effort) and reasoning_effort.lower() in {"none", "disabled"}
+        thinking_enabled = bool(reasoning_effort) and not thinking_disabled
 
         # Some newer Claude models reject legacy sampling params entirely — the
         # API returns 400 if `temperature` is present on any code path.
@@ -566,11 +567,7 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
-        if (
-            reasoning_effort
-            and reasoning_effort.lower() == "none"
-            and _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS)
-        ):
+        if thinking_disabled and _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS):
             kwargs["thinking"] = {"type": "disabled"}
         elif thinking_enabled or _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS):
             kwargs["thinking"] = {"type": "adaptive"}
