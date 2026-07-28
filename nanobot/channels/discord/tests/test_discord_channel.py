@@ -1672,3 +1672,119 @@ class TestVoiceAttachmentTranscription:
 
         assert markers == ["[attachment: long.ogg - too large]"]
         ch.transcribe_audio.assert_not_awaited()
+
+
+def _replied(content: str = "原来的话", name: str = "alice", bot: bool = False):
+    return SimpleNamespace(
+        content=content,
+        author=SimpleNamespace(id=111, display_name=name, bot=bot),
+    )
+
+
+def _msg_replying_to(resolved, *, content: str = "所以呢") -> SimpleNamespace:
+    return SimpleNamespace(
+        content=content,
+        reference=SimpleNamespace(message_id=1, resolved=resolved, cached_message=None),
+    )
+
+
+class TestInboundQuotedContext:
+    """回复别人时，被引用的正文要跟进来，否则 agent 只看到一句'所以呢'。"""
+
+    def test_quotes_user_message(self) -> None:
+        ch = _open_channel()
+        quoted = ch._build_quoted_context(_msg_replying_to(_replied()))
+        assert quoted == "[replying to alice: 原来的话]"
+
+    def test_quotes_bot_message(self) -> None:
+        ch = _open_channel()
+        quoted = ch._build_quoted_context(_msg_replying_to(_replied(name="nanobot", bot=True)))
+        assert quoted == "[replying to nanobot: 原来的话]"
+
+    def test_no_reference_yields_nothing(self) -> None:
+        ch = _open_channel()
+        assert ch._build_quoted_context(SimpleNamespace(reference=None)) is None
+
+    def test_unresolved_reference_yields_nothing(self) -> None:
+        """引用了一条没被缓存的旧消息，不能编造内容。"""
+        ch = _open_channel()
+        assert ch._build_quoted_context(_msg_replying_to(None)) is None
+
+    def test_deleted_reference_yields_nothing(self) -> None:
+        """DeletedReferencedMessage 没有 content 属性，取不到就闭嘴。"""
+        ch = _open_channel()
+        deleted = SimpleNamespace(id=1)
+        assert ch._build_quoted_context(_msg_replying_to(deleted)) is None
+
+    def test_attachment_only_reference_yields_nothing(self) -> None:
+        ch = _open_channel()
+        assert ch._build_quoted_context(_msg_replying_to(_replied(content=""))) is None
+
+    def test_long_quote_is_truncated(self) -> None:
+        ch = _open_channel()
+        quoted = ch._build_quoted_context(_msg_replying_to(_replied(content="长" * 500)))
+        assert len(quoted) < 400
+        assert quoted.endswith("...]")
+
+    def test_quote_precedes_original_content(self) -> None:
+        """引用是上下文，必须排在本人这句话前面。"""
+        ch = _open_channel()
+        composed = ch._compose_inbound_content("所以呢", [], "[replying to alice: 原来的话]")
+        assert composed == "[replying to alice: 原来的话]\n所以呢"
+
+    def test_quote_precedes_attachments_too(self) -> None:
+        ch = _open_channel()
+        composed = ch._compose_inbound_content("看图", ["[attachment: a.png]"], "[replying to a: x]")
+        assert composed == "[replying to a: x]\n看图\n[attachment: a.png]"
+
+    def test_compose_without_quote_unchanged(self) -> None:
+        """老调用形态不能被破坏。"""
+        ch = _open_channel()
+        assert ch._compose_inbound_content("hi", []) == "hi"
+        assert ch._compose_inbound_content("", []) == "[empty message]"
+
+    def test_quote_alone_is_not_empty_message(self) -> None:
+        ch = _open_channel()
+        composed = ch._compose_inbound_content("", [], "[replying to a: x]")
+        assert composed == "[replying to a: x]"
+
+
+@pytest.mark.asyncio
+async def test_on_message_carries_quoted_context_into_content() -> None:
+    """端到端守住接线：只测 _build_quoted_context 会让调用点悄悄断掉。"""
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["123"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    message = _make_message(author_id=123, content="所以呢")
+    message.reference = SimpleNamespace(
+        message_id=1,
+        resolved=SimpleNamespace(
+            content="原来的话", author=SimpleNamespace(id=111, display_name="alice", bot=False)
+        ),
+        cached_message=None,
+    )
+
+    await channel._on_message(message)
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "[replying to alice: 原来的话]\n所以呢"
+
+
+@pytest.mark.asyncio
+async def test_on_message_without_reply_has_no_quote_prefix() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["123"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(_make_message(author_id=123, content="干净的一句"))
+
+    assert handled[0]["content"] == "干净的一句"

@@ -36,6 +36,7 @@ if DISCORD_AVAILABLE:
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 # Fallback only: Discord usually sends content_type, but voice notes sometimes arrive bare.
 AUDIO_EXTENSIONS = frozenset({".ogg", ".opus", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".wma"})
+QUOTED_CONTEXT_LIMIT = 280
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
 
@@ -573,7 +574,8 @@ class DiscordChannel(BaseChannel):
             return
 
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
-        full_content = self._compose_inbound_content(content, attachment_markers)
+        quoted = self._build_quoted_context(message)
+        full_content = self._compose_inbound_content(content, attachment_markers, quoted)
         metadata = self._build_inbound_metadata(message)
         parent_channel_id = self._channel_parent_key(message.channel)
         session_key = None
@@ -738,11 +740,37 @@ class DiscordChannel(BaseChannel):
         return suffix in AUDIO_EXTENSIONS
 
     @staticmethod
-    def _compose_inbound_content(content: str, attachment_markers: list[str]) -> str:
-        """Combine message text with attachment markers."""
-        content_parts = [content] if content else []
+    def _compose_inbound_content(
+        content: str, attachment_markers: list[str], quoted: str | None = None
+    ) -> str:
+        """Combine quoted context, message text and attachment markers, in that order."""
+        content_parts = [quoted] if quoted else []
+        if content:
+            content_parts.append(content)
         content_parts.extend(attachment_markers)
         return "\n".join(part for part in content_parts if part) or "[empty message]"
+
+    @staticmethod
+    def _build_quoted_context(message: discord.Message) -> str | None:
+        """Carry the replied-to text inbound, so a bare "so?" still has its referent.
+
+        Anything we cannot read for sure (unresolved, deleted, attachment-only)
+        degrades to None rather than a guess.
+        """
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return None
+        referenced = getattr(reference, "resolved", None) or getattr(
+            reference, "cached_message", None
+        )
+        text = (getattr(referenced, "content", None) or "").strip()
+        if not text:
+            return None
+        author = getattr(referenced, "author", None)
+        name = getattr(author, "display_name", None) or getattr(author, "name", None) or "unknown"
+        if len(text) > QUOTED_CONTEXT_LIMIT:
+            text = text[:QUOTED_CONTEXT_LIMIT] + "..."
+        return f"[replying to {name}: {text}]"
 
     @staticmethod
     def _is_system_message(message: discord.Message) -> bool:
