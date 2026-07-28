@@ -101,3 +101,10 @@ exp/
 .playwright-mcp/
 bridge/node_modules/
 webui/.verify-*
+
+# 本地生成物（fork 侧）
+data-gym-cache/
+graphify-out/
+pytest-of-root/
+tmp*.jpg
+tmp*.png
