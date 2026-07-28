@@ -34,6 +34,8 @@ if DISCORD_AVAILABLE:
     from discord.abc import Messageable
 
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
+# Fallback only: Discord usually sends content_type, but voice notes sometimes arrive bare.
+AUDIO_EXTENSIONS = frozenset({".ogg", ".opus", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".wma"})
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
 
@@ -702,12 +704,38 @@ class DiscordChannel(BaseChannel):
                 file_path = media_dir / f"{attachment.id}_{safe_name}"
                 await attachment.save(file_path)
                 media_paths.append(str(file_path))
-                markers.append(f"[attachment: {file_path.name}]")
+                markers.append(await self._describe_attachment(attachment, file_path))
             except Exception as e:
                 self.logger.warning("Failed to download attachment: {}", e)
                 markers.append(f"[attachment: {filename} - download failed]")
 
         return media_paths, markers
+
+    async def _describe_attachment(self, attachment: discord.Attachment, file_path: Path) -> str:
+        """Voice notes read better as text; everything else keeps the file marker.
+
+        Transcription is best-effort. An empty result or a transcriber crash must
+        degrade to the plain attachment marker, never swallow the message.
+        """
+        if not self._is_audio_attachment(attachment):
+            return f"[attachment: {file_path.name}]"
+        try:
+            transcription = await self.transcribe_audio(file_path)
+        except Exception as e:
+            self.logger.warning("Failed to transcribe {}: {}", file_path.name, e)
+            return f"[attachment: {file_path.name}]"
+        if not transcription:
+            return f"[attachment: {file_path.name}]"
+        self.logger.info("Transcribed {}: {}...", file_path.name, transcription[:50])
+        return f"[transcription: {transcription}]"
+
+    @staticmethod
+    def _is_audio_attachment(attachment: discord.Attachment) -> bool:
+        content_type = (getattr(attachment, "content_type", None) or "").lower()
+        if content_type:
+            return content_type.startswith("audio/")
+        suffix = Path(getattr(attachment, "filename", "") or "").suffix.lower()
+        return suffix in AUDIO_EXTENSIONS
 
     @staticmethod
     def _compose_inbound_content(content: str, attachment_markers: list[str]) -> str:

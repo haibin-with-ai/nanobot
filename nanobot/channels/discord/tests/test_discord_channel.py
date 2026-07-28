@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1500,3 +1501,174 @@ class TestOpenPolicyBotCrosstalk:
             mentions=[SimpleNamespace(id=555, bot=True)],
         )
         assert ch._should_respond_in_group(msg, msg.content) is True
+
+
+def _attachment(
+    *,
+    aid: int = 1,
+    filename: str = "note.txt",
+    size: int = 100,
+    content_type: str | None = "text/plain",
+    save_error: Exception | None = None,
+) -> SimpleNamespace:
+    """Minimal stand-in for discord.Attachment."""
+
+    async def _save(path) -> None:
+        if save_error is not None:
+            raise save_error
+        Path(path).write_bytes(b"x")
+
+    return SimpleNamespace(
+        id=aid,
+        filename=filename,
+        size=size,
+        content_type=content_type,
+        save=_save,
+    )
+
+
+@pytest.fixture
+def discord_media_dir(tmp_path, monkeypatch):
+    target = tmp_path / "discord-media"
+    monkeypatch.setattr(
+        "nanobot.channels.discord.runtime.get_media_dir", lambda _channel: target
+    )
+    return target
+
+
+class TestDownloadAttachmentsBaseline:
+    """先钉住既有行为，再往里加转写，避免改一段没有护栏的代码。"""
+
+    @pytest.mark.asyncio
+    async def test_normal_attachment_saved(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        paths, markers = await ch._download_attachments([_attachment()])
+
+        assert len(paths) == 1
+        assert Path(paths[0]).exists()
+        assert markers == ["[attachment: 1_note.txt]"]
+
+    @pytest.mark.asyncio
+    async def test_oversize_attachment_skipped(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        paths, markers = await ch._download_attachments(
+            [_attachment(filename="big.bin", size=21 * 1024 * 1024)]
+        )
+
+        assert paths == []
+        assert markers == ["[attachment: big.bin - too large]"]
+
+    @pytest.mark.asyncio
+    async def test_download_failure_is_reported_not_raised(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        paths, markers = await ch._download_attachments(
+            [_attachment(save_error=OSError("disk full"))]
+        )
+
+        assert paths == []
+        assert markers == ["[attachment: note.txt - download failed]"]
+
+    @pytest.mark.asyncio
+    async def test_one_bad_attachment_does_not_drop_the_others(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        paths, markers = await ch._download_attachments(
+            [
+                _attachment(aid=1, save_error=OSError("boom")),
+                _attachment(aid=2, filename="ok.txt"),
+            ]
+        )
+
+        assert len(paths) == 1
+        assert markers == ["[attachment: note.txt - download failed]", "[attachment: 2_ok.txt]"]
+
+
+class TestVoiceAttachmentTranscription:
+    """语音附件走统一转写，失败必须安全降级为普通附件。"""
+
+    @pytest.mark.asyncio
+    async def test_voice_attachment_is_transcribed(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(return_value="hello there")
+
+        paths, markers = await ch._download_attachments(
+            [_attachment(filename="voice.ogg", content_type="audio/ogg")]
+        )
+
+        assert markers == ["[transcription: hello there]"]
+        ch.transcribe_audio.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transcribed_voice_file_is_still_delivered(self, discord_media_dir) -> None:
+        """转写成功不代表音频没用了，路径照常交给 agent。"""
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(return_value="hello there")
+
+        paths, _ = await ch._download_attachments(
+            [_attachment(filename="voice.ogg", content_type="audio/ogg")]
+        )
+
+        assert len(paths) == 1
+        assert Path(paths[0]).exists()
+
+    @pytest.mark.asyncio
+    async def test_empty_transcription_falls_back_to_attachment(self, discord_media_dir) -> None:
+        """transcribe_audio 失败时返回空串，不能让整条消息变成空正文。"""
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(return_value="")
+
+        paths, markers = await ch._download_attachments(
+            [_attachment(filename="voice.ogg", content_type="audio/ogg")]
+        )
+
+        assert markers == ["[attachment: 1_voice.ogg]"]
+        assert len(paths) == 1
+
+    @pytest.mark.asyncio
+    async def test_transcription_crash_does_not_kill_the_message(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(side_effect=RuntimeError("whisper down"))
+
+        paths, markers = await ch._download_attachments(
+            [_attachment(filename="voice.ogg", content_type="audio/ogg")]
+        )
+
+        assert markers == ["[attachment: 1_voice.ogg]"]
+        assert len(paths) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_audio_attachment_never_calls_transcription(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(return_value="should not happen")
+
+        _, markers = await ch._download_attachments(
+            [_attachment(filename="pic.png", content_type="image/png")]
+        )
+
+        assert markers == ["[attachment: 1_pic.png]"]
+        ch.transcribe_audio.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_audio_detected_by_extension_when_content_type_missing(
+        self, discord_media_dir
+    ) -> None:
+        """Discord 偶尔不给 content_type，扩展名兜底。"""
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(return_value="from ext")
+
+        _, markers = await ch._download_attachments(
+            [_attachment(filename="clip.m4a", content_type=None)]
+        )
+
+        assert markers == ["[transcription: from ext]"]
+
+    @pytest.mark.asyncio
+    async def test_oversize_voice_is_not_transcribed(self, discord_media_dir) -> None:
+        ch = _open_channel()
+        ch.transcribe_audio = AsyncMock(return_value="never")
+
+        _, markers = await ch._download_attachments(
+            [_attachment(filename="long.ogg", content_type="audio/ogg", size=21 * 1024 * 1024)]
+        )
+
+        assert markers == ["[attachment: long.ogg - too large]"]
+        ch.transcribe_audio.assert_not_awaited()
