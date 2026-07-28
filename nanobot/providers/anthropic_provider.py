@@ -694,6 +694,40 @@ class AnthropicProvider(LLMProvider):
         on substring so a future SDK message tweak doesn't break detection."""
         return isinstance(e, ValueError) and "streaming is required" in str(e).lower()
 
+    @staticmethod
+    def _is_auth_error(e: Exception) -> bool:
+        status = getattr(e, "status_code", None) or getattr(
+            getattr(e, "response", None), "status_code", None
+        )
+        return status in (401, 403)
+
+    def _refresh_credentials(self) -> bool:
+        """OAuth token 过期后换一个并重建 client；API key 模式无事可做。"""
+        if self.product_mode != "claude_code":
+            return False
+        from nanobot.providers.oauth_store import OAuthCredentialStore
+
+        try:
+            creds = OAuthCredentialStore().get_token(force_refresh=True)
+        except Exception as exc:
+            logger.warning("Claude Code token refresh failed: %s", exc)
+            return False
+        if not creds or not creds.access_token:
+            return False
+        self.api_key = creds.access_token
+        self._rebuild_client(creds.access_token)
+        return True
+
+    def _rebuild_client(self, token: str) -> None:
+        import anthropic
+
+        client_kw: dict[str, Any] = {"auth_token": token, "max_retries": 0}
+        if self.api_base:
+            client_kw["base_url"] = self.api_base
+        if self.extra_headers:
+            client_kw["default_headers"] = self.extra_headers
+        self._client = anthropic.AsyncAnthropic(**client_kw)
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -727,6 +761,13 @@ class AnthropicProvider(LLMProvider):
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice,
                 )
+            if self._is_auth_error(e) and self._refresh_credentials():
+                # 只重试一次：换过 token 还是 401，说明不是过期问题。
+                try:
+                    response = await self._client.messages.create(**kwargs)
+                    return self._parse_response(response)
+                except Exception as retry_error:
+                    return self._handle_error(retry_error)
             return self._handle_error(e)
 
     async def chat_stream(

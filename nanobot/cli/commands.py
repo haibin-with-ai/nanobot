@@ -2721,12 +2721,14 @@ _PROVIDER_DISPLAY: dict[str, str] = {
     "openai_codex": "OpenAI Codex",
     "xai_grok": "xAI Grok",
     "github_copilot": "GitHub Copilot",
+    "anthropic_claude_code": "Anthropic Claude Code",
 }
 
 _OAUTH_PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "openai_codex": "openai-codex/gpt-5.6-sol",
     "xai_grok": "xai-grok/grok-4.5",
     "github_copilot": "github-copilot/gpt-5.4-mini",
+    "anthropic_claude_code": "anthropic-claude-code/claude-opus-4-6",
 }
 
 
@@ -2903,6 +2905,56 @@ def _logout_openai_codex() -> None:
 
     storage = FileTokenStorage(token_filename=OPENAI_CODEX_PROVIDER.token_filename)
     _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["openai_codex"])
+
+
+@_register_login("anthropic_claude_code")
+def _login_anthropic_claude_code() -> None:
+    """Authenticate with Anthropic Claude Code via OAuth."""
+    try:
+        from oauth_cli_kit import login_oauth_interactive
+        from oauth_cli_kit.flow import OAuthProviderConfig
+
+        from nanobot.providers.oauth_store import _ANTHROPIC_CLIENT_ID
+    except ImportError:
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+
+    console.print("[cyan]Starting Anthropic Claude Code OAuth login...[/cyan]\n")
+    provider = OAuthProviderConfig(
+        client_id=_ANTHROPIC_CLIENT_ID,
+        authorize_url="https://claude.ai/oauth/authorize",
+        token_url="https://platform.claude.com/v1/oauth/token",
+        redirect_uri="https://platform.claude.com/oauth/code/callback",
+        scope="user:inference user:profile user:sessions:claude_code user:mcp_servers",
+        token_filename="claude-code.json",
+    )
+    try:
+        token = login_oauth_interactive(
+            print_fn=lambda s: console.print(s),
+            prompt_fn=lambda s: typer.prompt(s),
+            provider=provider,
+        )
+        if not (token and token.access):
+            console.print("[red]✗ Authentication failed[/red]")
+            raise typer.Exit(1)
+        account = token.account_id or "Anthropic"
+        console.print(
+            f"[green]✓ Authenticated with Anthropic Claude Code[/green]  [dim]{account}[/dim]"
+        )
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+
+@_register_logout("anthropic_claude_code")
+def _logout_anthropic_claude_code() -> None:
+    """Clear local OAuth credentials for Anthropic Claude Code."""
+    from nanobot.providers.oauth_store import OAuthCredentialStore
+
+    store = OAuthCredentialStore()
+    _delete_oauth_files(store.get_token_path(), _PROVIDER_DISPLAY["anthropic_claude_code"])
 
 
 @_register_login("xai_grok")
