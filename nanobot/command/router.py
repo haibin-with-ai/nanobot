@@ -75,6 +75,12 @@ class CommandRouter:
         self._prefix.append((pfx, handler))
         self._prefix.sort(key=lambda p: len(p[0]), reverse=True)
 
+    def command_names(self) -> set[str]:
+        """Names of every registered command, without the leading slash."""
+        registered = set(self._priority) | set(self._exact)
+        registered.update(prefix.rstrip() for prefix, _ in self._prefix)
+        return {name.lstrip("/") for name in registered}
+
     def is_priority(self, text: str) -> bool:
         return normalize_command_text(text).lower() in self._priority
 

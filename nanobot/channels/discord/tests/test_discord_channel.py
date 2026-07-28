@@ -1794,7 +1794,7 @@ class TestNativeSkillCommands:
         channel = DiscordChannel(DiscordConfig(token="test"), MessageBus(), workspace=workspace)
 
         class Loader:
-            def __init__(self, actual_workspace, *, builtin_skills_dir):
+            def __init__(self, actual_workspace, *, builtin_skills_dir, disabled_skills=None):
                 assert actual_workspace == workspace
                 assert builtin_skills_dir is not None
 
@@ -1840,7 +1840,8 @@ class TestNativeSkillCommands:
         await commands["beta-skill"].callback(interaction)
         assert forwarded.await_args_list == [call(interaction, "/alpha_skill"), call(interaction, "/beta-skill")]
 
-    def test_invalid_builtin_and_sanitized_collisions_are_skipped(self, monkeypatch) -> None:
+    @pytest.mark.asyncio
+    async def test_invalid_builtin_and_sanitized_collisions_are_skipped(self, monkeypatch) -> None:
         client = self._client(monkeypatch, [
             {"name": "!!!"}, {"name": "help"}, {"name": "alpha_skill"}, {"name": "alpha-skill"},
         ])
@@ -1848,13 +1849,32 @@ class TestNativeSkillCommands:
         assert names.count("help") == 1
         assert names.count("alpha-skill") == 1
         assert "!!!" not in names
+        # The surviving command must be the first in sorted order, and it must
+        # still forward the skill's own name rather than the sanitized one.
+        forwarded = AsyncMock()
+        client._forward_slash_command = forwarded
+        commands = {command.name: command for command in client.tree.get_commands()}
+        interaction = SimpleNamespace()
+        await commands["alpha-skill"].callback(interaction)
+        assert forwarded.await_args_list == [call(interaction, "/alpha-skill")]
+
+    def test_skills_never_shadow_router_only_builtin_commands(self, monkeypatch) -> None:
+        client = self._client(monkeypatch, [{"name": "skill"}, {"name": "goal"}, {"name": "alpha"}])
+        names = self._names(client)
+        assert "alpha" in names
+        assert names.count("skill") == 0
+        assert names.count("goal") == 0
 
     def test_global_command_limit_caps_dynamic_skills_at_ninety(self, monkeypatch) -> None:
-        skills = [{"name": f"skill-{index}"} for index in range(110)]
+        skills = [{"name": f"askill-{index:03d}"} for index in range(110)]
+        skills.reverse()
         client = self._client(monkeypatch, skills)
+        names = self._names(client)
         assert len(client.tree.get_commands()) <= 100
-        assert "skill-89" in self._names(client)
-        assert "skill-90" not in self._names(client)
+        # Deterministic truncation: the first 90 by sorted name, regardless of
+        # the order the loader happened to return them in.
+        assert "askill-089" in names
+        assert "askill-090" not in names
 
     def test_loader_failure_does_not_block_builtin_commands(self, monkeypatch) -> None:
         client = self._client(monkeypatch, error=RuntimeError("broken loader"))
@@ -1885,3 +1905,84 @@ def test_forward_only_slash_commands_expose_no_internal_parameters(tmp_path) -> 
     assert commands["new"].parameters == []
     assert commands["dream"].parameters == []
     assert commands["alpha-skill"].parameters == []
+
+
+def _skill_names_from(client) -> set[str]:
+    return {command.name for command in client.tree.get_commands()}
+
+
+def test_disabled_skills_are_not_exposed_as_commands(tmp_path) -> None:
+    """A skill disabled in config must not come back as a Discord command."""
+    with patch("nanobot.channels.discord.runtime.SkillsLoader") as loader_cls:
+        loader_cls.return_value.list_skills.return_value = [{"name": "alpha_skill"}]
+        channel = DiscordChannel(
+            DiscordConfig(token="test"),
+            MessageBus(),
+            workspace=tmp_path,
+            disabled_skills={"beta_skill"},
+        )
+        DiscordBotClient(channel, intents=discord.Intents.none())
+
+    assert loader_cls.call_args.kwargs["disabled_skills"] == {"beta_skill"}
+
+
+def test_router_builtin_names_are_reserved_against_skills(tmp_path) -> None:
+    """Skills must never shadow a builtin command the router already owns."""
+    with patch("nanobot.channels.discord.runtime.SkillsLoader") as loader_cls:
+        loader_cls.return_value.list_skills.return_value = [
+            {"name": "skill"},
+            {"name": "goal"},
+            {"name": "pairing"},
+            {"name": "dream-restore"},
+            {"name": "alpha"},
+        ]
+        channel = DiscordChannel(
+            DiscordConfig(token="test"), MessageBus(), workspace=tmp_path
+        )
+        client = DiscordBotClient(channel, intents=discord.Intents.none())
+
+    names = _skill_names_from(client)
+    assert "alpha" in names
+    for hijacked in ("skill", "goal", "pairing", "dream-restore"):
+        assert hijacked not in names
+
+
+def test_skill_commands_are_truncated_in_deterministic_order(tmp_path) -> None:
+    """Truncation must not depend on filesystem iteration order."""
+    unsorted = [{"name": f"skill-{index:03d}"} for index in range(200)]
+    unsorted.reverse()
+    with patch("nanobot.channels.discord.runtime.SkillsLoader") as loader_cls:
+        loader_cls.return_value.list_skills.return_value = unsorted
+        channel = DiscordChannel(
+            DiscordConfig(token="test"), MessageBus(), workspace=tmp_path
+        )
+        client = DiscordBotClient(channel, intents=discord.Intents.none())
+
+    names = _skill_names_from(client)
+    assert len(names) <= 100
+    registered = sorted(name for name in names if name.startswith("skill-"))
+    assert registered[0] == "skill-000"
+    assert registered == [f"skill-{index:03d}" for index in range(len(registered))]
+
+
+def test_skipped_skills_are_counted_not_silently_swallowed(tmp_path) -> None:
+    """Deliberate skips must be observable, not indistinguishable from crashes."""
+    with patch("nanobot.channels.discord.runtime.SkillsLoader") as loader_cls:
+        loader_cls.return_value.list_skills.return_value = [
+            {"name": "Alpha_Skill"},
+            {"name": "!!!"},
+            {"name": "x" * 40},
+            {"name": "alpha-skill"},
+            {"name": "help"},
+        ]
+        channel = DiscordChannel(
+            DiscordConfig(token="test"), MessageBus(), workspace=tmp_path
+        )
+        client = DiscordBotClient(channel, intents=discord.Intents.none())
+
+    assert client._skill_command_name("!!!") is None
+    assert client._skill_command_name("x" * 40) is None
+    assert client._skill_command_name("Alpha_Skill") == "alpha-skill"
+    names = _skill_names_from(client)
+    assert list(names).count("help") == 1
+    assert sorted(name for name in names if name.startswith("alpha")) == ["alpha-skill"]

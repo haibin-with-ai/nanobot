@@ -154,6 +154,7 @@ class ChannelManager:
         kwargs: dict[str, Any] = {}
         if cls.name == "discord":
             kwargs["workspace"] = self.config.workspace_path
+            kwargs["disabled_skills"] = set(self.config.agents.defaults.disabled_skills)
         if cls.name == "websocket":
             from nanobot.channels.websocket.runtime import WebSocketConfig
             from nanobot.webui.gateway_services import build_gateway_services

@@ -40,6 +40,17 @@ AUDIO_EXTENSIONS = frozenset({".ogg", ".opus", ".mp3", ".m4a", ".wav", ".flac", 
 QUOTED_CONTEXT_LIMIT = 280
 MAX_GLOBAL_SLASH_COMMANDS = 100
 _SKILL_COMMAND_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+
+
+def _builtin_command_names() -> set[str]:
+    """Ask the router which command names exist, instead of duplicating the list."""
+    from nanobot.command.builtin import register_builtin_commands
+    from nanobot.command.router import CommandRouter
+
+    router = CommandRouter()
+    register_builtin_commands(router)
+    return router.command_names()
+
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
 
@@ -291,16 +302,24 @@ if DISCORD_AVAILABLE:
             if workspace is None:
                 return
             try:
-                skills = SkillsLoader(workspace, builtin_skills_dir=BUILTIN_SKILLS_DIR).list_skills()
+                skills = SkillsLoader(
+                    workspace,
+                    builtin_skills_dir=BUILTIN_SKILLS_DIR,
+                    disabled_skills=self._channel.disabled_skills,
+                ).list_skills()
             except Exception as exc:
                 self._channel.logger.warning("could not load Discord skill commands: {}", exc)
                 return
 
+            # Reserve every router-owned command, not just the ones mirrored as
+            # native slash commands: a same-named skill would silently dispatch
+            # to the builtin handler instead of the skill.
             reserved = {command.name for command in self.tree.get_commands()}
-            slots = max(0, MAX_GLOBAL_SLASH_COMMANDS - len(reserved))
+            reserved |= _builtin_command_names()
+            slots = max(0, MAX_GLOBAL_SLASH_COMMANDS - len(self.tree.get_commands()))
             registered = 0
             skipped = 0
-            for skill in skills:
+            for skill in sorted(skills, key=lambda entry: entry.get("name", "")):
                 original_name = skill.get("name", "")
                 command_name = self._skill_command_name(original_name)
                 if command_name is None or command_name in reserved or registered >= slots:
@@ -458,13 +477,19 @@ class DiscordChannel(BaseChannel):
         return None
 
     def __init__(
-        self, config: Any, bus: MessageBus, *, workspace: Path | None = None
+        self,
+        config: Any,
+        bus: MessageBus,
+        *,
+        workspace: Path | None = None,
+        disabled_skills: set[str] | None = None,
     ):
         if isinstance(config, dict):
             config = DiscordConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: DiscordConfig = config
         self.workspace = workspace
+        self.disabled_skills = disabled_skills
         self._client: DiscordBotClient | None = None
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._bot_user_id: str | None = None
