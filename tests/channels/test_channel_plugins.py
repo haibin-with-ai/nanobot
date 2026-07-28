@@ -3495,3 +3495,17 @@ async def test_restart_notice_retries_until_running_channel_accepts_delivery():
     assert channel.attempts == 2
     assert channel.sent is not None
     assert channel.sent.content == "Restart completed."
+
+
+def test_manager_passes_workspace_to_discord_channel(monkeypatch, tmp_path) -> None:
+    from nanobot.channels.discord.runtime import DiscordChannel, DiscordConfig
+
+    manager = object.__new__(ChannelManager)
+    manager.bus = MessageBus()
+    manager.config = Config.model_validate({"agents": {"defaults": {"workspace": str(tmp_path)}}})
+    manager.workspace = tmp_path
+
+    channel = manager._build_channel("discord", DiscordChannel, DiscordConfig(token="test"))
+
+    assert isinstance(channel, DiscordChannel)
+    assert channel.workspace == tmp_path

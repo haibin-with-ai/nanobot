@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
@@ -1788,3 +1788,100 @@ async def test_on_message_without_reply_has_no_quote_prefix() -> None:
     await channel._on_message(_make_message(author_id=123, content="干净的一句"))
 
     assert handled[0]["content"] == "干净的一句"
+
+class TestNativeSkillCommands:
+    def _client(self, monkeypatch, skills=None, *, workspace=Path("/tmp/workspace"), error=None):
+        channel = DiscordChannel(DiscordConfig(token="test"), MessageBus(), workspace=workspace)
+
+        class Loader:
+            def __init__(self, actual_workspace, *, builtin_skills_dir):
+                assert actual_workspace == workspace
+                assert builtin_skills_dir is not None
+
+            def list_skills(self):
+                if error:
+                    raise error
+                return skills or []
+
+        monkeypatch.setattr("nanobot.channels.discord.runtime.SkillsLoader", Loader)
+        return DiscordBotClient(channel, intents=discord.Intents.default())
+
+    @staticmethod
+    def _names(client):
+        return [command.name for command in client.tree.get_commands()]
+
+    def test_dream_commands_registered_but_restore_and_prompt_are_not(self, monkeypatch) -> None:
+        client = self._client(monkeypatch)
+        names = self._names(client)
+        assert "dream" in names
+        assert "dream-log" in names
+        assert "dream-restore" not in names
+        assert "dream-prompt" not in names
+
+    @pytest.mark.asyncio
+    async def test_dream_commands_forward_builtin_commands(self, monkeypatch) -> None:
+        client = self._client(monkeypatch)
+        forwarded = AsyncMock()
+        client._forward_slash_command = forwarded
+        commands = {command.name: command for command in client.tree.get_commands()}
+        interaction = SimpleNamespace()
+        await commands["dream"].callback(interaction)
+        await commands["dream-log"].callback(interaction)
+        assert forwarded.await_args_list == [call(interaction, "/dream"), call(interaction, "/dream-log")]
+
+    @pytest.mark.asyncio
+    async def test_skill_handlers_keep_original_names_without_late_binding(self, monkeypatch) -> None:
+        client = self._client(monkeypatch, [{"name": "alpha_skill"}, {"name": "beta-skill"}])
+        forwarded = AsyncMock()
+        client._forward_slash_command = forwarded
+        commands = {command.name: command for command in client.tree.get_commands()}
+        interaction = SimpleNamespace()
+        await commands["alpha-skill"].callback(interaction)
+        await commands["beta-skill"].callback(interaction)
+        assert forwarded.await_args_list == [call(interaction, "/alpha_skill"), call(interaction, "/beta-skill")]
+
+    def test_invalid_builtin_and_sanitized_collisions_are_skipped(self, monkeypatch) -> None:
+        client = self._client(monkeypatch, [
+            {"name": "!!!"}, {"name": "help"}, {"name": "alpha_skill"}, {"name": "alpha-skill"},
+        ])
+        names = self._names(client)
+        assert names.count("help") == 1
+        assert names.count("alpha-skill") == 1
+        assert "!!!" not in names
+
+    def test_global_command_limit_caps_dynamic_skills_at_ninety(self, monkeypatch) -> None:
+        skills = [{"name": f"skill-{index}"} for index in range(110)]
+        client = self._client(monkeypatch, skills)
+        assert len(client.tree.get_commands()) <= 100
+        assert "skill-89" in self._names(client)
+        assert "skill-90" not in self._names(client)
+
+    def test_loader_failure_does_not_block_builtin_commands(self, monkeypatch) -> None:
+        client = self._client(monkeypatch, error=RuntimeError("broken loader"))
+        assert set(self._names(client)) == {
+            "new", "stop", "restart", "status", "history", "model", "trigger", "help", "dream", "dream-log"
+        }
+
+    def test_workspace_none_registers_only_builtins(self, monkeypatch) -> None:
+        channel = DiscordChannel(DiscordConfig(token="test"), MessageBus(), workspace=None)
+        monkeypatch.setattr(
+            "nanobot.channels.discord.runtime.SkillsLoader",
+            lambda *args, **kwargs: pytest.fail("loader must not be constructed"),
+        )
+        client = DiscordBotClient(channel, intents=discord.Intents.default())
+        assert len(client.tree.get_commands()) == 10
+
+
+def test_forward_only_slash_commands_expose_no_internal_parameters(tmp_path) -> None:
+    """Closure capture must not leak implementation defaults into Discord's schema."""
+    with patch("nanobot.channels.discord.runtime.SkillsLoader") as loader_cls:
+        loader_cls.return_value.list_skills.return_value = [{"name": "alpha_skill"}]
+        channel = DiscordChannel(
+            DiscordConfig(token="test"), MessageBus(), workspace=tmp_path
+        )
+        client = DiscordBotClient(channel, intents=discord.Intents.default())
+
+    commands = {command.name: command for command in client.tree.get_commands()}
+    assert commands["new"].parameters == []
+    assert commands["dream"].parameters == []
+    assert commands["alpha-skill"].parameters == []

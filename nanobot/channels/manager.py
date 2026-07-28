@@ -152,6 +152,8 @@ class ChannelManager:
         runtime_name: str | None = None,
     ) -> BaseChannel:
         kwargs: dict[str, Any] = {}
+        if cls.name == "discord":
+            kwargs["workspace"] = self.config.workspace_path
         if cls.name == "websocket":
             from nanobot.channels.websocket.runtime import WebSocketConfig
             from nanobot.webui.gateway_services import build_gateway_services

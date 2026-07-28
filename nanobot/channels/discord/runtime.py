@@ -8,10 +8,11 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from pydantic import Field
 
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
@@ -37,6 +38,8 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 # Fallback only: Discord usually sends content_type, but voice notes sometimes arrive bare.
 AUDIO_EXTENSIONS = frozenset({".ogg", ".opus", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".wma"})
 QUOTED_CONTEXT_LIMIT = 280
+MAX_GLOBAL_SLASH_COMMANDS = 100
+_SKILL_COMMAND_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
 
@@ -200,16 +203,18 @@ if DISCORD_AVAILABLE:
                 ("restart", "Restart the bot", "/restart"),
                 ("status", "Show bot status", "/status"),
                 ("history", "Show recent conversation messages", "/history"),
+                ("dream", "Consolidate recent conversations into memory", "/dream"),
+                ("dream-log", "Show recent Dream consolidation activity", "/dream-log"),
             )
 
             for name, description, command_text in commands:
-
-                @self.tree.command(name=name, description=description)
-                async def command_handler(
-                    interaction: discord.Interaction,
-                    _command_text: str = command_text,
-                ) -> None:
-                    await self._forward_slash_command(interaction, _command_text)
+                self.tree.add_command(
+                    app_commands.Command(
+                        name=name,
+                        description=description,
+                        callback=self._forwarder(command_text),
+                    )
+                )
 
             @self.tree.command(name="model", description="Show or switch runtime model preset")
             @app_commands.describe(preset="Optional model preset name, such as default")
@@ -243,6 +248,8 @@ if DISCORD_AVAILABLE:
                     return
                 await self._reply_ephemeral(interaction, build_help_text())
 
+            self._register_skill_commands()
+
             @self.tree.error
             async def on_app_command_error(
                 interaction: discord.Interaction,
@@ -255,6 +262,70 @@ if DISCORD_AVAILABLE:
                     interaction.channel_id,
                     command_name,
                     error,
+                )
+
+
+        def _forwarder(
+            self, command_text: str
+        ) -> Callable[[discord.Interaction], Awaitable[None]]:
+            """Capture text without leaking a default argument into Discord's schema."""
+
+            async def handler(interaction: discord.Interaction) -> None:
+                await self._forward_slash_command(interaction, command_text)
+
+            return handler
+
+        @staticmethod
+        def _skill_command_name(name: str) -> str | None:
+            """Map a skill directory name to a conservative Discord command name."""
+            command_name = name.lower().replace("_", "-")
+            if not command_name or len(command_name) > 32:
+                return None
+            if any(char not in _SKILL_COMMAND_CHARS for char in command_name):
+                return None
+            return command_name
+
+        def _register_skill_commands(self) -> None:
+            """Register workspace skills without risking Discord client startup."""
+            workspace = self._channel.workspace
+            if workspace is None:
+                return
+            try:
+                skills = SkillsLoader(workspace, builtin_skills_dir=BUILTIN_SKILLS_DIR).list_skills()
+            except Exception as exc:
+                self._channel.logger.warning("could not load Discord skill commands: {}", exc)
+                return
+
+            reserved = {command.name for command in self.tree.get_commands()}
+            slots = max(0, MAX_GLOBAL_SLASH_COMMANDS - len(reserved))
+            registered = 0
+            skipped = 0
+            for skill in skills:
+                original_name = skill.get("name", "")
+                command_name = self._skill_command_name(original_name)
+                if command_name is None or command_name in reserved or registered >= slots:
+                    skipped += 1
+                    continue
+
+                try:
+                    command = app_commands.Command(
+                        name=command_name,
+                        description=f"Run the {original_name} skill"[:100],
+                        callback=self._forwarder(f"/{original_name}"),
+                    )
+                    self.tree.add_command(command)
+                except Exception as exc:
+                    self._channel.logger.warning(
+                        "could not register Discord skill command {}: {}", original_name, exc
+                    )
+                    skipped += 1
+                    continue
+                reserved.add(command_name)
+                registered += 1
+
+            if skipped:
+                self._channel.logger.info(
+                    "registered {} Discord skill commands; skipped {}", registered, skipped
                 )
 
         async def send_outbound(self, msg: OutboundMessage) -> None:
@@ -386,11 +457,14 @@ class DiscordChannel(BaseChannel):
             return cls._channel_key(parent)
         return None
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(
+        self, config: Any, bus: MessageBus, *, workspace: Path | None = None
+    ):
         if isinstance(config, dict):
             config = DiscordConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: DiscordConfig = config
+        self.workspace = workspace
         self._client: DiscordBotClient | None = None
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._bot_user_id: str | None = None
