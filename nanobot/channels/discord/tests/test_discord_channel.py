@@ -1421,3 +1421,82 @@ async def test_send_succeeds_normally() -> None:
     assert len(sent_messages) == 1
     assert sent_messages[0].content == "hello world"
     assert sent_messages[0].chat_id == "123"
+
+
+def _open_channel() -> DiscordChannel:
+    ch = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    ch._bot_user_id = "999"
+    return ch
+
+
+class TestOpenPolicyBotCrosstalk:
+    """group_policy=open 时别人 @ 另一个 bot，我不能抢答。"""
+
+    def test_mentions_only_other_bot_is_ignored(self) -> None:
+        ch = _open_channel()
+        msg = _make_message(
+            guild_id=1,
+            content="<@555> help me",
+            mentions=[SimpleNamespace(id=555, bot=True)],
+        )
+        assert ch._should_respond_in_group(msg, msg.content) is False
+
+    def test_mentions_me_is_answered(self) -> None:
+        ch = _open_channel()
+        msg = _make_message(
+            guild_id=1,
+            content="<@999> help me",
+            mentions=[SimpleNamespace(id=999, bot=True)],
+        )
+        assert ch._should_respond_in_group(msg, msg.content) is True
+
+    def test_mentions_me_and_other_bot_is_answered(self) -> None:
+        ch = _open_channel()
+        msg = _make_message(
+            guild_id=1,
+            content="<@555> <@999> compare",
+            mentions=[SimpleNamespace(id=555, bot=True), SimpleNamespace(id=999, bot=True)],
+        )
+        assert ch._should_respond_in_group(msg, msg.content) is True
+
+    def test_plain_message_still_answered(self) -> None:
+        """open 策略的本意不能被破坏：没 @ 任何人照样响应。"""
+        ch = _open_channel()
+        msg = _make_message(guild_id=1, content="anyone around?")
+        assert ch._should_respond_in_group(msg, msg.content) is True
+
+    def test_mentioning_human_users_still_answered(self) -> None:
+        ch = _open_channel()
+        msg = _make_message(
+            guild_id=1,
+            content="<@111> take a look",
+            mentions=[SimpleNamespace(id=111, bot=False)],
+        )
+        assert ch._should_respond_in_group(msg, msg.content) is True
+
+    def test_reply_to_me_answered_even_if_other_bot_mentioned(self) -> None:
+        """回复我的消息是明确指向，优先级高于'@了别的 bot'。"""
+        ch = _open_channel()
+        msg = _make_message(
+            guild_id=1,
+            content="<@555> what about this",
+            mentions=[SimpleNamespace(id=555, bot=True)],
+            reply_to=1,
+            reply_author_id=999,
+        )
+        assert ch._should_respond_in_group(msg, msg.content) is True
+
+    def test_identity_unknown_does_not_silence_open_policy(self) -> None:
+        """bot 身份未就绪时宁可多答，不能把 open 频道整个静音。"""
+        ch = _open_channel()
+        ch._bot_user_id = None
+        ch._client = None
+        msg = _make_message(
+            guild_id=1,
+            content="<@555> help me",
+            mentions=[SimpleNamespace(id=555, bot=True)],
+        )
+        assert ch._should_respond_in_group(msg, msg.content) is True

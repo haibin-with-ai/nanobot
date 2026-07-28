@@ -739,12 +739,19 @@ class DiscordChannel(BaseChannel):
     def _should_respond_in_group(self, message: discord.Message, content: str) -> bool:
         """Check if the bot should respond in a guild channel based on policy."""
         if self.config.group_policy == "open":
+            bot_user_id = self._resolve_bot_user_id()
+            # Identity not ready yet: stay chatty rather than muting the whole channel.
+            if bot_user_id is None:
+                return True
+            if self._addresses_other_bot_only(message, content, bot_user_id):
+                self.logger.debug(
+                    "message in {} ignored (addressed to another bot)", message.channel.id
+                )
+                return False
             return True
 
         if self.config.group_policy == "mention":
-            bot_user_id = self._bot_user_id
-            if bot_user_id is None and self._client and self._client.user:
-                bot_user_id = str(self._client.user.id)
+            bot_user_id = self._resolve_bot_user_id()
             if bot_user_id is None:
                 self.logger.debug(
                     "message in {} ignored (bot identity unavailable)", message.channel.id
@@ -764,6 +771,37 @@ class DiscordChannel(BaseChannel):
             return False
 
         return True
+
+    def _resolve_bot_user_id(self) -> str | None:
+        """Best-effort identity lookup: cached id first, then the live client."""
+        if self._bot_user_id is not None:
+            return self._bot_user_id
+        if self._client and self._client.user:
+            return str(self._client.user.id)
+        return None
+
+    def _addresses_other_bot_only(
+        self, message: discord.Message, content: str, bot_user_id: str
+    ) -> bool:
+        """Return True when the message @s some bot but never this one.
+
+        Guards `open` channels where several bots coexist: a mention aimed at a
+        sibling bot must not be answered by us. Human mentions are irrelevant,
+        and any signal addressing us (mention, raw mention, inline tag, reply)
+        cancels the guard.
+        """
+        mentioned_bots = [
+            user for user in getattr(message, "mentions", []) or [] if getattr(user, "bot", False)
+        ]
+        if not mentioned_bots:
+            return False
+        if any(str(user.id) == bot_user_id for user in mentioned_bots):
+            return False
+        if bot_user_id in {str(user_id) for user_id in getattr(message, "raw_mentions", [])}:
+            return False
+        if f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content:
+            return False
+        return not self._references_bot_message(message, bot_user_id)
 
     @staticmethod
     def _references_bot_message(message: discord.Message, bot_user_id: str) -> bool:
