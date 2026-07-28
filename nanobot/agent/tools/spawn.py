@@ -18,10 +18,18 @@ if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
 
 
+class _UnknownPreset(LookupError):
+    """Model asked for a preset that does not exist; surface it as a tool error."""
+
+
 @tool_parameters(
     tool_parameters_schema(
         task=StringSchema("The task for the subagent to complete"),
         label=StringSchema("Optional short label for the task (for display)"),
+        model=StringSchema(
+            "Optional model preset name for the subagent (e.g. 'fast', 'deep'). "
+            "Defaults to the current model. Use a cheaper preset for routine work."
+        ),
         temperature=NumberSchema(
             description=(
                 "Optional sampling temperature for the subagent "
@@ -45,12 +53,16 @@ if TYPE_CHECKING:
 class SpawnTool(Tool):
     """Tool to spawn a subagent for background task execution."""
 
-    def __init__(self, manager: "SubagentManager"):
+    def __init__(self, manager: "SubagentManager", runtime_resolver: Any = None):
         self._manager = manager
+        self._resolver = runtime_resolver
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls(manager=ctx.subagent_manager)
+        return cls(
+            manager=ctx.subagent_manager,
+            runtime_resolver=getattr(ctx, "runtime_resolver", None),
+        )
 
     @property
     def name(self) -> str:
@@ -67,10 +79,22 @@ class SpawnTool(Tool):
             "and use a dedicated subdirectory when helpful."
         )
 
+    def _resolve_runtime(self, model: str | None, default: Any) -> Any:
+        """未指定 preset 就沿用父 runtime；resolver 缺席时忽略 model 而不是报错。"""
+        if not model or self._resolver is None:
+            return default
+        try:
+            return self._resolver.resolve_preset(model)
+        except (KeyError, ValueError) as e:
+            # resolver 的报错已经带上可用 preset 列表，原样透出别再拼一遍
+            detail = e.args[0] if e.args else str(e)
+            raise _UnknownPreset(str(detail)) from None
+
     async def execute(
         self,
         task: str,
         label: str | None = None,
+        model: str | None = None,
         temperature: float | None = None,
         wait: bool = False,
         **kwargs: Any,
@@ -87,13 +111,17 @@ class SpawnTool(Tool):
         request_ctx = current_request_context()
         if request_ctx is None or request_ctx.runtime is None:
             return ToolResult.error("Error: spawn requires an active model runtime")
+        try:
+            runtime = self._resolve_runtime(model, request_ctx.runtime)
+        except _UnknownPreset as e:
+            return ToolResult.error(str(e))
         origin_channel = request_ctx.channel
         origin_chat_id = request_ctx.chat_id
         session_key = request_ctx.session_key or f"{origin_channel}:{origin_chat_id}"
         method = self._manager.run_inline if wait else self._manager.spawn
         return await method(
             task=task,
-            runtime=request_ctx.runtime,
+            runtime=runtime,
             label=label,
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
