@@ -100,20 +100,20 @@ class TestLoadBootstrapFiles:
         assert "Rules." in result
         assert "Soul." in result
 
-    def test_all_bootstrap_files(self, tmp_path):
-        for name in ContextBuilder.BOOTSTRAP_FILES:
-            (tmp_path / name).write_text(f"Content of {name}", encoding="utf-8")
-        builder = _builder(tmp_path)
-        result = builder._load_bootstrap_files()
-        for name in ContextBuilder.BOOTSTRAP_FILES:
-            assert f"## {name}" in result
+    def test_all_bootstrap_files_enter_context_in_required_order(self, tmp_path):
+        expected_files = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
+        for name in expected_files:
+            (tmp_path / name).write_text(f"unique content from {name}", encoding="utf-8")
 
-    def test_legacy_tools_md_is_not_bootstrapped(self, tmp_path):
-        (tmp_path / "TOOLS.md").write_text("workspace tool notes", encoding="utf-8")
-        builder = _builder(tmp_path)
-        result = builder._load_bootstrap_files()
-        assert "TOOLS.md" not in result
-        assert "workspace tool notes" not in result
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        assert ContextBuilder.BOOTSTRAP_FILES == expected_files
+        headings = [f"## {name}" for name in expected_files]
+        assert [result.index(heading) for heading in headings] == sorted(
+            result.index(heading) for heading in headings
+        )
+        for name in expected_files:
+            assert f"unique content from {name}" in result
 
     def test_utf8_content(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("用中文回复", encoding="utf-8")

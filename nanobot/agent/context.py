@@ -54,7 +54,7 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
+    BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
     _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
     _RUNTIME_CONTEXT_TAG = RUNTIME_CONTEXT_TAG
     _MAX_RECENT_HISTORY = 50
@@ -159,13 +159,15 @@ class ContextBuilder:
         """Load project instructions plus the agent's global profile files."""
         parts = []
         project_root = workspace or self.workspace
-        sources = [
-            ("AGENTS.md", project_root),
-            ("SOUL.md", self.workspace),
-            ("USER.md", self.workspace),
-        ]
+        roots = {
+            "SOUL.md": self.workspace,
+            "USER.md": self.workspace,
+            "AGENTS.md": project_root,
+            "TOOLS.md": self.workspace,
+        }
 
-        for filename, root in sources:
+        for filename in self.BOOTSTRAP_FILES:
+            root = roots[filename]
             file_path = root / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
