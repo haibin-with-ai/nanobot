@@ -180,3 +180,52 @@ class TestMessageToolTurnTracking:
             "Do not use this for a normal reply in the current chat"
             in tool.parameters["properties"]["content"]["description"]
         )
+
+
+class TestMessageToolSendFailure:
+    """发送失败时不能置位 _sent_in_turn，否则同轮最终回复会被误判为已发过。"""
+
+    @pytest.mark.asyncio
+    async def test_send_failure_returns_error_and_leaves_turn_unsent(self) -> None:
+        from nanobot.agent.tools.context import RequestContext, request_context
+
+        tool = MessageTool()
+        tool.set_send_callback(AsyncMock(side_effect=RuntimeError("network down")))
+
+        with request_context(RequestContext(channel="feishu", chat_id="chat1")):
+            tool.start_turn()
+            result = await tool.execute(content="hi", channel="feishu", chat_id="chat1")
+
+            assert result.startswith("Error sending message:")
+            assert "network down" in result
+            assert not tool._sent_in_turn
+
+    @pytest.mark.asyncio
+    async def test_successful_send_still_sets_turn_flag(self) -> None:
+        """对照组：确认上面那条红是失败路径造成的，不是 flag 永远不置位。"""
+        from nanobot.agent.tools.context import RequestContext, request_context
+
+        tool = MessageTool()
+        tool.set_send_callback(AsyncMock())
+
+        with request_context(RequestContext(channel="feishu", chat_id="chat1")):
+            tool.start_turn()
+            result = await tool.execute(content="hi", channel="feishu", chat_id="chat1")
+
+            assert result.startswith("Message sent to")
+            assert tool._sent_in_turn
+
+    @pytest.mark.asyncio
+    async def test_send_failure_to_other_target_also_returns_error(self) -> None:
+        """跨渠道投递失败同样要显式报错，不能静默当成功。"""
+        from nanobot.agent.tools.context import RequestContext, request_context
+
+        tool = MessageTool()
+        tool.set_send_callback(AsyncMock(side_effect=OSError("socket closed")))
+
+        with request_context(RequestContext(channel="feishu", chat_id="chat1")):
+            tool.start_turn()
+            result = await tool.execute(content="hi", channel="telegram", chat_id="other")
+
+            assert result.startswith("Error sending message:")
+            assert not tool._sent_in_turn
