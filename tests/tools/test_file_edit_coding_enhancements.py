@@ -5,19 +5,63 @@ import asyncio
 from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool
 
 
-def test_read_file_force_bypasses_dedup(tmp_path):
+def test_read_file_returns_full_content_by_default(tmp_path):
+    """默认全文：重复读拿到 dedup 桩会让模型误以为自己已经掌握内容。"""
     target = tmp_path / "data.txt"
     target.write_text("alpha\n")
     tool = ReadFileTool(workspace=tmp_path)
 
     first = asyncio.run(tool.execute(path=str(target)))
     second = asyncio.run(tool.execute(path=str(target)))
-    forced = asyncio.run(tool.execute(path=str(target), force=True))
+
+    assert "alpha" in first
+    assert "alpha" in second
+    assert "unchanged" not in second.lower()
+
+
+def test_read_file_force_false_still_dedups(tmp_path):
+    """dedup 机制本身保留，只是要显式要。"""
+    target = tmp_path / "data.txt"
+    target.write_text("alpha\n")
+    tool = ReadFileTool(workspace=tmp_path)
+
+    first = asyncio.run(tool.execute(path=str(target), force=False))
+    second = asyncio.run(tool.execute(path=str(target), force=False))
 
     assert "alpha" in first
     assert "unchanged" in second.lower()
+
+
+def test_read_file_force_bypasses_dedup(tmp_path):
+    target = tmp_path / "data.txt"
+    target.write_text("alpha\n")
+    tool = ReadFileTool(workspace=tmp_path)
+
+    asyncio.run(tool.execute(path=str(target), force=False))
+    asyncio.run(tool.execute(path=str(target), force=False))
+    forced = asyncio.run(tool.execute(path=str(target), force=True))
+
     assert "alpha" in forced
     assert "unchanged" not in forced.lower()
+
+
+def test_dedup_hash_fallback_survives_identical_mtime(tmp_path):
+    """mtime 被写回原值时靠内容哈希兜底，这条不能因默认值翻转而丢。"""
+    import os
+
+    target = tmp_path / "data.txt"
+    target.write_text("alpha\n")
+    tool = ReadFileTool(workspace=tmp_path)
+
+    asyncio.run(tool.execute(path=str(target), force=False))
+    stat = os.stat(target)
+    target.write_text("beta\n")
+    os.utime(target, (stat.st_atime, stat.st_mtime))
+
+    second = asyncio.run(tool.execute(path=str(target), force=False))
+
+    assert "beta" in second
+    assert "unchanged" not in second.lower()
 
 
 def test_edit_file_can_select_occurrence(tmp_path):

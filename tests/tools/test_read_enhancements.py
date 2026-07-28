@@ -49,11 +49,12 @@ class TestReadDedup:
 
     @pytest.mark.asyncio
     async def test_second_read_returns_unchanged_stub(self, tool, tmp_path):
+        # 默认已翻转为总返回全文，dedup 桩需显式 force=False 索取
         f = tmp_path / "data.txt"
         f.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
-        first = await tool.execute(path=str(f))
+        first = await tool.execute(path=str(f), force=False)
         assert "line 0" in first
-        second = await tool.execute(path=str(f))
+        second = await tool.execute(path=str(f), force=False)
         assert "unchanged" in second.lower()
         # Stub should not contain file content
         assert "line 0" not in second
@@ -140,8 +141,8 @@ class TestReadDedupSessionIsolation:
 
         token = file_state.bind_file_states(session_a)
         try:
-            first = await shared_tool.execute(path=str(f))
-            repeat = await shared_tool.execute(path=str(f))
+            first = await shared_tool.execute(path=str(f), force=False)
+            repeat = await shared_tool.execute(path=str(f), force=False)
         finally:
             file_state.reset_file_states(token)
 
@@ -150,7 +151,7 @@ class TestReadDedupSessionIsolation:
 
         token = file_state.bind_file_states(session_b)
         try:
-            second_session_read = await shared_tool.execute(path=str(f))
+            second_session_read = await shared_tool.execute(path=str(f), force=False)
         finally:
             file_state.reset_file_states(token)
 

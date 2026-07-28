@@ -235,8 +235,11 @@ def _builtin_skill_read_path(path: str) -> Path | None:
         ),
         pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
         force=BooleanSchema(
-            description="Bypass same-file read deduplication and return content again.",
-            default=False,
+            description=(
+                "Read deduplication switch. Defaults to true: always return full content. "
+                "Pass false to get a short stub when the file is unchanged since last read."
+            ),
+            default=True,
         ),
         required=["path"],
     )
@@ -265,7 +268,8 @@ class ReadFileTool(_FsTool):
             "Read the relevant range before editing so replacements or patches "
             "are based on current content. "
             "Use offset and limit for large text files. "
-            "Use force=true to re-read content even if unchanged. "
+            "Repeated reads return the full content by default; "
+            "pass force=false to get a short stub when the file is unchanged. "
             "Reads exceeding ~128K chars are truncated."
         )
 
@@ -279,7 +283,7 @@ class ReadFileTool(_FsTool):
         offset: int = 1,
         limit: int | None = None,
         pages: str | None = None,
-        force: bool = False,
+        force: bool = True,
         **kwargs: Any,
     ) -> Any:
         try:
