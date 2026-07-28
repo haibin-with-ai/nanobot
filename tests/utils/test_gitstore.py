@@ -67,7 +67,7 @@ class TestLineAges:
         (tmp_path / "MEMORY.md").write_text("important\n", encoding="utf-8")
         git.auto_commit("initial")
 
-        with patch("dulwich.porcelain.annotate", side_effect=OSError("broken repo")):
+        with patch("subprocess.run", side_effect=OSError("broken repo")):
             with pytest.raises(GitStoreError, match="annotation failed"):
                 git.line_ages("MEMORY.md")
 
@@ -310,3 +310,92 @@ class TestNestedRepoProtection:
 
         assert result is False
         assert not (workspace / ".git").exists()
+
+
+class TestLineAgesPerCommit:
+    """行龄必须逐行反映各自最后修改的那次提交，不是整文件一个时间。"""
+
+    @staticmethod
+    def _commit_at(repo: Path, days_ago: int, message: str) -> None:
+        stamp = datetime.now(tz=timezone.utc) - timedelta(days=days_ago)
+        iso = stamp.strftime("%Y-%m-%dT%H:%M:%S+0000")
+        env = {
+            "GIT_COMMITTER_DATE": iso,
+            "GIT_AUTHOR_DATE": iso,
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(repo),
+        }
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", message, "--no-gpg-sign"],
+            cwd=repo,
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+
+    def test_old_and_new_lines_get_distinct_ages(self, git, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("old line\n", encoding="utf-8")
+        self._commit_at(tmp_path, 40, "old")
+        (tmp_path / "MEMORY.md").write_text("old line\nnew line\n", encoding="utf-8")
+        self._commit_at(tmp_path, 0, "new")
+
+        ages = git.line_ages("MEMORY.md")
+
+        assert len(ages) == 2
+        assert ages[0].age_days >= 39
+        assert ages[1].age_days == 0
+
+    def test_untouched_line_keeps_its_original_age(self, git, tmp_path):
+        """改第二行不该让第一行跟着变新。"""
+        (tmp_path / "MEMORY.md").write_text("keep\nedit me\n", encoding="utf-8")
+        self._commit_at(tmp_path, 30, "base")
+        (tmp_path / "MEMORY.md").write_text("keep\nedited\n", encoding="utf-8")
+        self._commit_at(tmp_path, 0, "touch second")
+
+        ages = git.line_ages("MEMORY.md")
+
+        assert ages[0].age_days >= 29
+        assert ages[1].age_days == 0
+
+    def test_path_with_spaces(self, tmp_path):
+        g = GitStore(tmp_path, tracked_files=["my notes.md"])
+        g.init()
+        (tmp_path / "my notes.md").write_text("a\nb\n", encoding="utf-8")
+        self._commit_at(tmp_path, 5, "spaced")
+
+        ages = g.line_ages("my notes.md")
+
+        assert len(ages) == 2
+        assert all(a.age_days >= 4 for a in ages)
+
+    def test_untracked_file_returns_empty(self, git, tmp_path):
+        """从未进过 git 的文件没有行龄可言。"""
+        (tmp_path / "NOTES.md").write_text("never committed\n", encoding="utf-8")
+
+        assert git.line_ages("NOTES.md") == []
+
+    def test_uncommitted_lines_are_blamed_as_today(self, git, tmp_path):
+        """blame 看工作区而非 HEAD：行号必须对齐调用方手上的文件内容。"""
+        (tmp_path / "MEMORY.md").write_text("committed\n", encoding="utf-8")
+        self._commit_at(tmp_path, 20, "base")
+        (tmp_path / "MEMORY.md").write_text("committed\ndraft\n", encoding="utf-8")
+
+        ages = git.line_ages("MEMORY.md")
+
+        assert len(ages) == 2
+        assert ages[0].age_days >= 19
+        assert ages[1].age_days == 0
+
+    def test_blame_failure_is_not_faked_as_success(self, git, tmp_path):
+        """blame 挂了要抛错，不能返回空列表让调用方以为文件没内容。"""
+        (tmp_path / "MEMORY.md").write_text("a\n", encoding="utf-8")
+        git.auto_commit("initial")
+
+        with patch("subprocess.run", side_effect=OSError("git missing")):
+            with pytest.raises(GitStoreError):
+                git.line_ages("MEMORY.md")

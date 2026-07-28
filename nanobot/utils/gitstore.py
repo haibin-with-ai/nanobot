@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,12 +47,33 @@ class LineAge:
     age_days: int  # days since last modification
 
 
-def _compute_line_ages(annotated) -> list[LineAge]:
-    """Convert annotate results to per-line ages."""
+def _parse_blame_porcelain(stdout: str) -> list[int]:
+    """Pull one committer-time per output line out of `git blame --porcelain`.
+
+    ┌─ porcelain 格式：hunk 头是 `<40位sha> <orig> <final> [<n>]`，
+    │  同一个 sha 的 header 只在首次出现时发送，后续 hunk 只有头行，
+    └─ 所以要缓存 sha -> committer-time；正文行以 TAB 开头。
+    """
+    times: dict[str, int] = {}
+    ages: list[int] = []
+    current = ""
+    for line in stdout.split("\n"):
+        if line.startswith("\t"):
+            if current in times:
+                ages.append(times[current])
+        elif line.startswith("committer-time "):
+            times[current] = int(line.split(" ", 1)[1])
+        elif len(line) > 40 and line[40] == " ":
+            current = line[:40]
+    return ages
+
+
+def _compute_line_ages(commit_times: list[int]) -> list[LineAge]:
+    """Convert committer timestamps to per-line ages."""
     now = datetime.now(tz=timezone.utc).date()
     ages: list[LineAge] = []
-    for (commit, _tree_entry), _line_bytes in annotated:
-        dt = datetime.fromtimestamp(commit.commit_time, tz=timezone.utc).date()
+    for ts in commit_times:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
         ages.append(LineAge(age_days=(now - dt).days))
     return ages
 
@@ -288,17 +310,37 @@ class GitStore:
         if not target.exists() or target.stat().st_size == 0:
             return []
 
+        # dulwich 的 annotate 随历史深度超线性劣化（12k 行/120 commits 实测
+        # 1.58s vs git blame 0.23s），MEMORY.md 恰好是只增不减的深历史文件。
         try:
-            from dulwich import porcelain
-
-            annotated = porcelain.annotate(str(self._workspace), file_path)
-        except Exception as exc:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--", file_path],
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
             raise GitStoreError(f"Git line annotation failed for {file_path}") from exc
 
-        if not annotated:
+        if tracked.returncode != 0 or not tracked.stdout.strip():
             return []
 
-        return _compute_line_ages(annotated)
+        try:
+            blame = subprocess.run(
+                ["git", "blame", "--porcelain", "--", file_path],
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise GitStoreError(f"Git line annotation failed for {file_path}") from exc
+
+        if blame.returncode != 0:
+            raise GitStoreError(
+                f"Git line annotation failed for {file_path}: {blame.stderr.strip()}"
+            )
+
+        return _compute_line_ages(_parse_blame_porcelain(blame.stdout))
 
     def diff_commits(self, sha1: str, sha2: str) -> str:
         """Show diff between two commits."""
