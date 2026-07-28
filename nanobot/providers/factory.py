@@ -40,6 +40,16 @@ def _provider_extra_headers(
     return headers or None
 
 
+def _anthropic_credential(provider_config: ProviderConfig | None, *, oauth: bool) -> str | None:
+    """OAuth 订阅没有 api_key，凭据从本地 token store 取。"""
+    if not oauth:
+        return provider_config.api_key if provider_config else None
+    from nanobot.providers.oauth_store import OAuthCredentialStore
+
+    creds = OAuthCredentialStore().get_token()
+    return creds.access_token if creds else None
+
+
 def _make_provider_core(
     config: Config,
     *,
@@ -118,11 +128,13 @@ def _make_provider_core(
     elif backend == "anthropic":
         from nanobot.providers.anthropic_provider import AnthropicProvider
 
+        oauth = bool(spec and spec.is_oauth)
         provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
+            api_key=_anthropic_credential(p, oauth=oauth),
             api_base=config.get_api_base(model, preset=resolved),
             default_model=model,
             extra_headers=_provider_extra_headers(spec, p),
+            product_mode="claude_code" if oauth else "",
         )
     elif backend == "bedrock":
         from nanobot.providers.bedrock_provider import BedrockProvider

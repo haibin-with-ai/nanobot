@@ -360,6 +360,22 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         supports_prompt_caching=True,
     ),
+    # Anthropic Claude Code subscription: OAuth-based, no API key.
+    # Identity also has to go in as the first system block — see
+    # AnthropicProvider._inject_identity(). Headers alone are not enough.
+    ProviderSpec(
+        name="anthropic_claude_code",
+        keywords=("claude-code", "claude_code"),
+        env_key="",
+        display_name="Claude Code",
+        backend="anthropic",
+        default_extra_headers=(
+            ("anthropic-beta", "oauth-2025-04-20,claude-code-20250219"),
+            ("x-app", "cli"),
+        ),
+        is_oauth=True,
+        supports_prompt_caching=True,
+    ),
     # OpenAI: SDK default base URL (no override needed)
     ProviderSpec(
         name="openai",

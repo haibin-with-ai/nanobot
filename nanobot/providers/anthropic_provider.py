@@ -30,6 +30,10 @@ def _gen_tool_id() -> str:
 
 
 _VALID_TOOL_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
+_MAX_TOOL_ID_LEN = 64
+
+# Anthropic 按精确字符串识别 Claude Code 客户端，一个字都不能改。
+_CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
 def _sanitize_tool_id(tid: str) -> str:
@@ -40,7 +44,9 @@ def _sanitize_tool_id(tid: str) -> str:
     providers or restored sessions can contain pipes, dots or other invalid
     characters, so coerce them to the allowed charset.
     """
-    if not tid or _VALID_TOOL_ID.match(tid):
+    if not tid:
+        return tid
+    if _VALID_TOOL_ID.match(tid) and len(tid) <= _MAX_TOOL_ID_LEN:
         return tid
     safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", tid)[:48].strip("_") or "toolu"
     digest = hashlib.sha1(tid.encode()).hexdigest()[:8]
@@ -60,23 +66,27 @@ class AnthropicProvider(LLMProvider):
         api_base: str | None = None,
         default_model: str = "claude-sonnet-4-6",
         extra_headers: dict[str, str] | None = None,
+        product_mode: str = "",
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self.product_mode = product_mode
 
-        from anthropic import AsyncAnthropic
+        import anthropic
 
         client_kw: dict[str, Any] = {}
         if api_key:
-            client_kw["api_key"] = api_key
+            # OAuth 凭据是 bearer token，走 api_key 会被当成 x-api-key 发出去。
+            key_field = "auth_token" if product_mode == "claude_code" else "api_key"
+            client_kw[key_field] = api_key
         if api_base:
             client_kw["base_url"] = self._normalize_base_url(api_base)
         if extra_headers:
             client_kw["default_headers"] = extra_headers
         # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
         client_kw["max_retries"] = 0
-        self._client = AsyncAnthropic(**client_kw)
+        self._client = anthropic.AsyncAnthropic(**client_kw)
 
     @staticmethod
     def _normalize_base_url(api_base: str) -> str:
@@ -480,6 +490,21 @@ class AnthropicProvider(LLMProvider):
                 return {"type": "tool", "name": name}
         return {"type": "auto"}
 
+    def _inject_identity(
+        self, system: str | list[dict[str, Any]]
+    ) -> str | list[dict[str, Any]]:
+        """Claude Code 身份必须以 system 首块出现，HTTP 头碰不到请求体。"""
+        if self.product_mode != "claude_code":
+            return system
+        blocks = (
+            [{"type": "text", "text": system}]
+            if isinstance(system, str) and system
+            else list(system) if isinstance(system, list) else []
+        )
+        if blocks and blocks[0].get("text") == _CLAUDE_CODE_IDENTITY:
+            return blocks
+        return [{"type": "text", "text": _CLAUDE_CODE_IDENTITY}, *blocks]
+
     # ------------------------------------------------------------------
     # Prompt caching
     # ------------------------------------------------------------------
@@ -558,6 +583,7 @@ class AnthropicProvider(LLMProvider):
             "max_tokens": max_tokens,
         }
 
+        system = self._inject_identity(system)
         if system:
             kwargs["system"] = system
 
