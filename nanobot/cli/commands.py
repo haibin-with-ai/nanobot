@@ -1697,10 +1697,8 @@ def _run_gateway(
     session_manager = SessionManager(config.workspace_path)
     # Unbound cron runs each leave a session file behind; sweep once at startup
     # so they cannot accumulate unbounded.
-    prune_cron_sessions = getattr(session_manager, "prune_cron_run_sessions", None)
-    if callable(prune_cron_sessions):
-        with suppress(OSError):
-            prune_cron_sessions()
+    with suppress(OSError):
+        session_manager.prune_cron_run_sessions()
 
     # Self-heal the gateway state file with the current PID after any restart.
     from nanobot.config.loader import get_config_path
