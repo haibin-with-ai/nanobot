@@ -2015,3 +2015,72 @@ def test_save_turn_drops_duplicate_tool_result_ids() -> None:
 
     assert [m["role"] for m in session.messages] == ["assistant", "tool"]
     assert session.messages[1]["content"] == "first"
+
+
+class TestRunStatsAndSenderLandInSession:
+    """Fields are only real once they survive persistence."""
+
+    def _session(self):
+        return SimpleNamespace(key="s1", messages=[], metadata={}, files={})
+
+    def _loop(self, tmp_path):
+        provider = MagicMock()
+        provider.get_default_model.return_value = "m"
+        return AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="m")
+
+    def test_assistant_record_carries_model_usage_and_timing(self, tmp_path):
+        loop = self._loop(tmp_path)
+        session = self._session()
+        loop._save_turn(
+            session,
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}],
+            0,
+            turn_latency_ms=1234,
+            run_stats={
+                "model": "claude-x", "usage": {"prompt_tokens": 7},
+                "elapsed_ms": 900, "llm_elapsed_ms": 800,
+            },
+        )
+        assistant = session.messages[-1]
+        assert assistant["model"] == "claude-x"
+        assert assistant["usage"] == {"prompt_tokens": 7}
+        assert assistant["elapsed_ms"] == 900
+        assert assistant["llm_elapsed_ms"] == 800
+        assert assistant["latency_ms"] == 1234
+
+    def test_absent_stats_write_no_keys(self, tmp_path):
+        loop = self._loop(tmp_path)
+        session = self._session()
+        loop._save_turn(
+            session,
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}],
+            0,
+            run_stats={"model": None, "usage": {}, "elapsed_ms": 0},
+        )
+        assistant = session.messages[-1]
+        assert "model" not in assistant
+        assert "usage" not in assistant
+
+
+class TestSenderIdentityOnUserRecord:
+    """Identity is attached to the user record, where it belongs."""
+
+    def _msg(self, **kw):
+        from nanobot.bus.events import InboundMessage
+        base = dict(channel="cli", sender_id="u-1", chat_id="c-1", content="hi", metadata={})
+        return InboundMessage(**(base | kw))
+
+    def test_sender_id_and_name_are_recorded(self):
+        from nanobot.agent.loop import _sender_identity
+        assert _sender_identity(self._msg(metadata={"sender_name": "haibin"})) == {
+            "sender_id": "u-1", "sender_name": "haibin",
+        }
+
+    def test_missing_name_is_omitted_not_blanked(self):
+        """A blank string would read as a real sender named nothing."""
+        from nanobot.agent.loop import _sender_identity
+        assert _sender_identity(self._msg()) == {"sender_id": "u-1"}
+
+    def test_anonymous_sender_yields_nothing(self):
+        from nanobot.agent.loop import _sender_identity
+        assert _sender_identity(self._msg(sender_id="")) == {}

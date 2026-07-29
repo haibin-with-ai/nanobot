@@ -634,3 +634,35 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     args = mgr._announce_result.await_args.args
     assert args[3] == "Task completed but no final response was generated."
     assert args[5] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_run_stats_and_sender_reach_the_persisted_turn(tmp_path):
+    """End to end: the run's own numbers must survive into the session file."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="answer", usage={"prompt_tokens": 11, "completion_tokens": 3},
+    ))
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
+    session = loop.sessions.get_or_create("cli:direct")
+
+    await loop._process_message(InboundMessage(
+        channel="cli", sender_id="user-9", chat_id="direct", content="hi",
+        metadata={"sender_name": "haibin"},
+    ))
+
+    user_record = session.messages[0]
+    assistant_record = session.messages[-1]
+    assert user_record["sender_id"] == "user-9"
+    assert user_record["sender_name"] == "haibin"
+    assert assistant_record["model"] == "test-model"
+    assert assistant_record["usage"]["prompt_tokens"] == 11
+    assert "elapsed_ms" in assistant_record
+    assert assistant_record["llm_elapsed_ms"] <= assistant_record["elapsed_ms"]

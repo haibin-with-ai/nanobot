@@ -9,6 +9,7 @@ import os
 import time
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import partial
@@ -159,6 +160,24 @@ class TurnContext:
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
     turn_latency_ms: int | None = None
+    run_stats: dict[str, Any] | None = None
+
+
+# _run_agent_loop returns a tuple that predates these fields and is referenced
+# across the test suite. Rather than widen it, the run's own measurements make
+# one hop through a turn-scoped var and become explicit TurnContext fields.
+_turn_run_stats: ContextVar[dict[str, Any] | None] = ContextVar("_turn_run_stats", default=None)
+
+
+def _sender_identity(msg: InboundMessage) -> dict[str, str]:
+    """Who sent this turn, for stored history to stay attributable.
+
+    Absent fields are omitted rather than stored blank, so a reader never
+    mistakes a placeholder for a real sender.
+    """
+    metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+    fields = {"sender_id": msg.sender_id, "sender_name": metadata.get("sender_name")}
+    return {key: str(value) for key, value in fields.items() if value}
 
 
 class AgentLoop:
@@ -668,6 +687,7 @@ class AgentLoop:
         has_text = isinstance(msg.content, str) and msg.content.strip()
         if has_text or media_paths or runtime_context_blocks:
             extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
+            extra.update(_sender_identity(msg))
             extra.update(kwargs)
             text = msg.content if isinstance(msg.content, str) else ""
             text_override, automation_extra = automation_history_overrides(msg.metadata)
@@ -1041,6 +1061,13 @@ class AgentLoop:
             reset_request_context(request_token)
             reset_file_states(file_state_token)
         self._last_usage = result.usage
+        if (stats := _turn_run_stats.get()) is not None:
+            stats.update(
+                model=runtime.model,
+                usage=result.usage,
+                elapsed_ms=result.elapsed_ms,
+                llm_elapsed_ms=result.llm_elapsed_ms,
+            )
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
@@ -1651,29 +1678,35 @@ class AgentLoop:
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
-        result = await self._run_agent_loop(
-            ctx.initial_messages,
-            runtime=ctx.runtime,
-            on_progress=ctx.on_progress,
-            on_stream=ctx.on_stream,
-            on_stream_end=ctx.on_stream_end,
-            on_retry_wait=ctx.on_retry_wait,
-            session=ctx.session,
-            channel=ctx.delivery.route.channel,
-            chat_id=ctx.delivery.route.chat_id,
-            message_id=ctx.msg.metadata.get("message_id"),
-            metadata=ctx.msg.metadata,
-            session_key=ctx.session_key,
-            original_user_text=ctx.original_user_text,
-            pending_queue=ctx.pending_queue,
-            ephemeral=ctx.ephemeral,
-            run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
-            hooks=ctx.hooks,
-            hook_factories=ctx.hook_factories,
-            turn_scopes=ctx.turn_scopes,
-            tools=ctx.tools,
-            request_context=ctx.request_context,
-        )
+        stats: dict[str, Any] = {}
+        stats_token = _turn_run_stats.set(stats)
+        try:
+            result = await self._run_agent_loop(
+                ctx.initial_messages,
+                runtime=ctx.runtime,
+                on_progress=ctx.on_progress,
+                on_stream=ctx.on_stream,
+                on_stream_end=ctx.on_stream_end,
+                on_retry_wait=ctx.on_retry_wait,
+                session=ctx.session,
+                channel=ctx.delivery.route.channel,
+                chat_id=ctx.delivery.route.chat_id,
+                message_id=ctx.msg.metadata.get("message_id"),
+                metadata=ctx.msg.metadata,
+                session_key=ctx.session_key,
+                original_user_text=ctx.original_user_text,
+                pending_queue=ctx.pending_queue,
+                ephemeral=ctx.ephemeral,
+                run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
+                hooks=ctx.hooks,
+                hook_factories=ctx.hook_factories,
+                turn_scopes=ctx.turn_scopes,
+                tools=ctx.tools,
+                request_context=ctx.request_context,
+            )
+        finally:
+            _turn_run_stats.reset(stats_token)
+        ctx.run_stats = stats or None
         final_content, _, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
         ctx.all_messages = all_msgs
@@ -1705,6 +1738,7 @@ class AgentLoop:
         self._save_turn(
             ctx.session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
+            run_stats=ctx.run_stats,
         )
         ctx.delivery.record_latency(ctx.turn_latency_ms)
         if not ctx.ephemeral:
@@ -1785,6 +1819,7 @@ class AgentLoop:
         skip: int,
         *,
         turn_latency_ms: int | None = None,
+        run_stats: dict[str, Any] | None = None,
     ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
@@ -1858,6 +1893,12 @@ class AgentLoop:
                 )
         if turn_latency_ms is not None and last_assistant_idx is not None:
             session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+        if last_assistant_idx is not None:
+            # What the run actually cost, so a stored turn can be audited later
+            # without replaying it.
+            for key, value in (run_stats or {}).items():
+                if value not in (None, "", {}):
+                    session.messages[last_assistant_idx][key] = value
         session.updated_at = datetime.now()
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 
 from loguru import logger
@@ -115,6 +117,14 @@ class AgentRunResult:
     had_injections: bool = False
     # Terminal tail to emit when the preceding final-content prefix was already streamed.
     pending_stream_content: str | None = None
+    # Wall clock for the whole run, and the share of it spent waiting on the model.
+    elapsed_ms: int = 0
+    llm_elapsed_ms: int = 0
+
+
+# Per-run timing accumulator. A ContextVar rather than instance state because
+# one AgentRunner serves concurrent turns, which would otherwise sum together.
+_llm_timing: ContextVar[dict[str, float] | None] = ContextVar("_llm_timing", default=None)
 
 
 class AgentRunner:
@@ -334,6 +344,9 @@ class AgentRunner:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
+        timing: dict[str, float] = {"llm_ms": 0.0, "depth": 0.0}
+        timing_token = _llm_timing.set(timing)
+        started_at = perf_counter()
 
         try:
             await hook.before_run(context)
@@ -364,8 +377,11 @@ class AgentRunner:
             if context.error is not None:
                 await hook.on_error(context)
             await hook.after_run(context)
+            result.elapsed_ms = int((perf_counter() - started_at) * 1000)
+            result.llm_elapsed_ms = int(timing["llm_ms"])
             return result
         finally:
+            _llm_timing.reset(timing_token)
             context.messages = deepcopy(messages)
             if context.exception is None:
                 await hook.on_finally(context)
@@ -790,7 +806,22 @@ class AgentRunner:
         kwargs["reasoning_effort"] = generation.reasoning_effort
         return kwargs
 
-    async def _request_model(
+    async def _request_model(self, *args: Any, **kwargs: Any):
+        """Time the model request, counting nested retries only once."""
+        timing = _llm_timing.get()
+        if timing is None:
+            return await self._request_model_timed(*args, **kwargs)
+        outermost = timing["depth"] == 0
+        timing["depth"] += 1
+        started_at = perf_counter()
+        try:
+            return await self._request_model_timed(*args, **kwargs)
+        finally:
+            timing["depth"] -= 1
+            if outermost:
+                timing["llm_ms"] += (perf_counter() - started_at) * 1000
+
+    async def _request_model_timed(
         self,
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
