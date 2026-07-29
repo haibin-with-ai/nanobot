@@ -790,7 +790,8 @@ done
 3. 将生产 `main` 快进/重置到已审查的 sync branch；禁止在生产 checkout 手工解冲突。
 4. 安装锁定依赖。
 5. 用新代码加载真实 config。
-6. 启动 gateway。
+6. 一次性清掉旧命名的 cron 会话文件：`/root/workspace/sessions` 下 191 个 `cron_<job>_<ms>.jsonl` 是 fork 旧键写出的历史残留，新基座只写 base64 规范名，回收逻辑按设计不认这批文件，新代码也不会再产生它们。切换后确认 gateway 正常，再删除这批文件，不写进代码路径。
+7. 启动 gateway。
 
 ### Task 12.3：健康验证
 
