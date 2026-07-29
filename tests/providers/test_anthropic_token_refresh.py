@@ -237,7 +237,7 @@ async def test_refresh_failure_returns_original_error(
         "nanobot.providers.oauth_store.OAuthCredentialStore.get_token",
         lambda self, **kw: (_ for _ in ()).throw(RuntimeError("refresh dead")),
     )
-    fake = _attach(oauth_provider, spy_client, [_AuthError("401 unauthorized")])
+    _attach(oauth_provider, spy_client, [_AuthError("401 unauthorized")])
 
     result = await oauth_provider.chat(messages=[{"role": "user", "content": "hi"}])
 

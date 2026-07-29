@@ -17,7 +17,6 @@ from nanobot.providers.anthropic_provider import (
 )
 from nanobot.providers.registry import find_by_name
 
-
 # ---------------------------------------------------------------------------
 # registry spec
 # ---------------------------------------------------------------------------

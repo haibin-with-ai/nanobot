@@ -18,7 +18,6 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cli import commands as cli_commands
 from nanobot.cli.commands import app
 from nanobot.config.schema import Config
-from nanobot.cron.service import CronJobSkippedError
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
