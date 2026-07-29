@@ -754,14 +754,19 @@ class AnthropicProvider(LLMProvider):
         )
         return status in (401, 403)
 
-    def _refresh_credentials(self) -> bool:
-        """OAuth token 过期后换一个并重建 client；API key 模式无事可做。"""
+    async def _refresh_credentials(self) -> bool:
+        """OAuth token 过期后换一个并重建 client；API key 模式无事可做。
+
+        刷新是同步 httpx 加跨进程文件锁，必须扔进线程，别把事件循环冻住。
+        """
         if self.product_mode != "claude_code":
             return False
         from nanobot.providers.oauth_store import OAuthCredentialStore
 
         try:
-            creds = OAuthCredentialStore().get_token(force_refresh=True)
+            creds = await asyncio.to_thread(
+                lambda: OAuthCredentialStore().get_token(force_refresh=True)
+            )
         except Exception as exc:
             logger.warning("Claude Code token refresh failed: %s", exc)
             return False
@@ -807,7 +812,7 @@ class AnthropicProvider(LLMProvider):
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice,
                 )
-            if self._is_auth_error(e) and self._refresh_credentials():
+            if self._is_auth_error(e) and await self._refresh_credentials():
                 # 只重试一次：换过 token 还是 401，说明不是过期问题。
                 try:
                     response = await self._client.messages.create(**kwargs)
@@ -854,7 +859,7 @@ class AnthropicProvider(LLMProvider):
             )
         except Exception as e:
             # 401 在建连阶段抛出，此时还没有 delta 发出去，重试不会重复输出。
-            if self._is_auth_error(e) and self._refresh_credentials():
+            if self._is_auth_error(e) and await self._refresh_credentials():
                 try:
                     return await self._stream_once(
                         kwargs,

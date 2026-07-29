@@ -148,3 +148,29 @@ class TestToolIdLengthCap:
         from nanobot.providers.anthropic_provider import _sanitize_tool_id
 
         assert _sanitize_tool_id("toolu_01ABC") == "toolu_01ABC"
+
+
+class TestRefreshDoesNotBlockTheLoop:
+    """刷新走同步 httpx + 文件锁，必须挪到线程里，别冻住事件循环。"""
+
+    @pytest.mark.asyncio
+    async def test_refresh_runs_off_the_event_loop(self, monkeypatch) -> None:
+        import threading
+
+        from nanobot.providers.oauth_store import OAuthCredentials
+
+        claude_code = AnthropicProvider(api_key="old", product_mode="claude_code")
+        caller_thread = threading.get_ident()
+        seen: list[int] = []
+
+        def _get_token(self, force_refresh: bool = False, min_ttl_ms: int = 0):
+            seen.append(threading.get_ident())
+            return OAuthCredentials("fresh", "r", 0, "acct")
+
+        monkeypatch.setattr(
+            "nanobot.providers.oauth_store.OAuthCredentialStore.get_token", _get_token
+        )
+
+        assert await claude_code._refresh_credentials() is True
+        assert seen and seen[0] != caller_thread
+        assert claude_code.api_key == "fresh"
