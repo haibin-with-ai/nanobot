@@ -11,7 +11,11 @@ from typing import Any, Protocol
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
-from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
+from nanobot.cron.session_turns import (
+    CRON_DEFER_UNTIL_IDLE_META,
+    CRON_TRIGGER_META,
+    is_bound_cron_job,
+)
 from nanobot.cron.types import CronJob
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.utils.prompt_templates import render_template
@@ -76,7 +80,9 @@ async def run_cron_job(
     cron: CronRunRecorder,
 ) -> str | None:
     """Run a cron job in its bound session, or in one created just for this run."""
-    if job.payload.session_key:
+    # A bare session_key is not a binding: the bound path needs the origin
+    # channel and chat too, and refuses jobs that only push a message out.
+    if is_bound_cron_job(job):
         return await run_bound_cron_job(job, agent=agent, cron=cron)
     return await run_unbound_cron_job(job, agent=agent, cron=cron)
 

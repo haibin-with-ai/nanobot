@@ -205,3 +205,33 @@ class TestBoundStillUsesTheSessionTurnPath:
             _job(**_BOUND, model="fast"), agent=agent, cron=cron
         )
         assert agent.sessions.presets == {}
+
+
+class TestIncompleteBindingFallsBackToItsOwnSession:
+    """A session key alone is not a binding: without an origin channel and chat
+    the bound path can only raise, so such a job must run isolated instead."""
+
+    @pytest.mark.asyncio
+    async def test_session_key_without_origin_runs_unbound(self):
+        agent, cron = _Agent(), _Recorder()
+        await run_cron_job(_job(session_key="discord:123"), agent=agent, cron=cron)
+        assert agent.bound_calls == []
+        assert agent.direct_calls[0]["session_key"].startswith("cron:job-1:")
+
+    @pytest.mark.asyncio
+    async def test_partial_origin_runs_unbound(self):
+        agent, cron = _Agent(), _Recorder()
+        job = _job(session_key="discord:123", origin_channel="discord")
+        await run_cron_job(job, agent=agent, cron=cron)
+        assert agent.bound_calls == []
+        assert cron.last["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_proactive_delivery_payload_runs_unbound(self):
+        """deliver/channel/to means the job pushes a message somewhere; it does
+        not continue a conversation, so it must not hijack a bound session."""
+        agent, cron = _Agent(), _Recorder()
+        job = _job(**_BOUND, deliver=True, channel="discord", to="chat-9")
+        await run_cron_job(job, agent=agent, cron=cron)
+        assert agent.bound_calls == []
+        assert agent.direct_calls[0]["session_key"].startswith("cron:job-1:")
