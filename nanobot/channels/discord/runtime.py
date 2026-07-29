@@ -17,7 +17,11 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.command.builtin import build_help_text
+from nanobot.command.builtin import (
+    BUILTIN_COMMAND_SPECS,
+    BuiltinCommandSpec,
+    build_help_text,
+)
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename, split_message
@@ -52,6 +56,10 @@ def _builtin_command_names() -> set[str]:
     return router.command_names()
 
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
+
+# 这三条在下面手写注册（自动补全、参数校验各有特殊处理），派生时跳过。
+_HANDWRITTEN_SLASH_COMMANDS = frozenset({"/model", "/trigger", "/help"})
+
 TYPING_INTERVAL_S = 8
 
 
@@ -208,24 +216,10 @@ if DISCORD_AVAILABLE:
             )
 
         def _register_app_commands(self) -> None:
-            commands = (
-                ("new", "Stop current task and start a new conversation", "/new"),
-                ("stop", "Stop the current task", "/stop"),
-                ("restart", "Restart the bot", "/restart"),
-                ("status", "Show bot status", "/status"),
-                ("history", "Show recent conversation messages", "/history"),
-                ("dream", "Consolidate recent conversations into memory", "/dream"),
-                ("dream-log", "Show recent Dream consolidation activity", "/dream-log"),
-            )
-
-            for name, description, command_text in commands:
-                self.tree.add_command(
-                    app_commands.Command(
-                        name=name,
-                        description=description,
-                        callback=self._forwarder(command_text),
-                    )
-                )
+            for spec in BUILTIN_COMMAND_SPECS:
+                if spec.command in _HANDWRITTEN_SLASH_COMMANDS:
+                    continue
+                self.tree.add_command(self._builtin_command(spec))
 
             @self.tree.command(name="model", description="Show or switch runtime model preset")
             @app_commands.describe(preset="Optional model preset name, such as default")
@@ -276,6 +270,21 @@ if DISCORD_AVAILABLE:
                 )
 
 
+        def _builtin_command(self, spec: BuiltinCommandSpec) -> "app_commands.Command":
+            """Derive one slash command from the builtin table, args included."""
+            if not spec.accepts_args:
+                callback = self._forwarder(spec.command)
+            else:
+                callback = self._arg_forwarder(spec.command)
+                app_commands.describe(
+                    args=(spec.arg_hint or "Optional arguments")[:100]
+                )(callback)
+            return app_commands.Command(
+                name=spec.command.lstrip("/"),
+                description=spec.description[:100],
+                callback=callback,
+            )
+
         def _forwarder(
             self, command_text: str
         ) -> Callable[[discord.Interaction], Awaitable[None]]:
@@ -283,6 +292,20 @@ if DISCORD_AVAILABLE:
 
             async def handler(interaction: discord.Interaction) -> None:
                 await self._forward_slash_command(interaction, command_text)
+
+            return handler
+
+        def _arg_forwarder(
+            self, command_text: str
+        ) -> Callable[[discord.Interaction, str | None], Awaitable[None]]:
+            """Same, for commands that take a free-form argument string."""
+
+            async def handler(
+                interaction: discord.Interaction, args: str | None = None
+            ) -> None:
+                suffix = (args or "").strip()
+                text = f"{command_text} {suffix}" if suffix else command_text
+                await self._forward_slash_command(interaction, text)
 
             return handler
 

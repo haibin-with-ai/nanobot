@@ -16,12 +16,14 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.discord.runtime import (
+    _HANDWRITTEN_SLASH_COMMANDS,
+    MAX_GLOBAL_SLASH_COMMANDS,
     MAX_MESSAGE_LEN,
     DiscordBotClient,
     DiscordChannel,
     DiscordConfig,
 )
-from nanobot.command.builtin import build_help_text
+from nanobot.command.builtin import BUILTIN_COMMAND_SPECS, build_help_text
 
 
 # Minimal Discord client test double used to control startup/readiness behavior.
@@ -1810,13 +1812,11 @@ class TestNativeSkillCommands:
     def _names(client):
         return [command.name for command in client.tree.get_commands()]
 
-    def test_dream_commands_registered_but_restore_and_prompt_are_not(self, monkeypatch) -> None:
+    def test_the_whole_dream_family_is_registered(self, monkeypatch) -> None:
         client = self._client(monkeypatch)
         names = self._names(client)
-        assert "dream" in names
-        assert "dream-log" in names
-        assert "dream-restore" not in names
-        assert "dream-prompt" not in names
+        for name in ("dream", "dream-log", "dream-restore", "dream-prompt"):
+            assert name in names
 
     @pytest.mark.asyncio
     async def test_dream_commands_forward_builtin_commands(self, monkeypatch) -> None:
@@ -1858,28 +1858,30 @@ class TestNativeSkillCommands:
         await commands["alpha-skill"].callback(interaction)
         assert forwarded.await_args_list == [call(interaction, "/alpha-skill")]
 
-    def test_skills_never_shadow_router_only_builtin_commands(self, monkeypatch) -> None:
+    def test_skills_never_shadow_router_owned_builtin_commands(self, monkeypatch) -> None:
+        """同名技能不得再注册一条命令，那条名字归 builtin。"""
         client = self._client(monkeypatch, [{"name": "skill"}, {"name": "goal"}, {"name": "alpha"}])
         names = self._names(client)
         assert "alpha" in names
-        assert names.count("skill") == 0
-        assert names.count("goal") == 0
+        assert names.count("skill") == 1
+        assert names.count("goal") == 1
 
-    def test_global_command_limit_caps_dynamic_skills_at_ninety(self, monkeypatch) -> None:
+    def test_global_command_limit_caps_dynamic_skills(self, monkeypatch) -> None:
         skills = [{"name": f"askill-{index:03d}"} for index in range(110)]
         skills.reverse()
         client = self._client(monkeypatch, skills)
         names = self._names(client)
-        assert len(client.tree.get_commands()) <= 100
-        # Deterministic truncation: the first 90 by sorted name, regardless of
-        # the order the loader happened to return them in.
-        assert "askill-089" in names
-        assert "askill-090" not in names
+        assert len(client.tree.get_commands()) <= MAX_GLOBAL_SLASH_COMMANDS
+        # Deterministic truncation: the first N by sorted name fill whatever
+        # slots the builtin commands leave behind.
+        slots = MAX_GLOBAL_SLASH_COMMANDS - len(BUILTIN_COMMAND_SPECS)
+        assert f"askill-{slots - 1:03d}" in names
+        assert f"askill-{slots:03d}" not in names
 
     def test_loader_failure_does_not_block_builtin_commands(self, monkeypatch) -> None:
         client = self._client(monkeypatch, error=RuntimeError("broken loader"))
         assert set(self._names(client)) == {
-            "new", "stop", "restart", "status", "history", "model", "trigger", "help", "dream", "dream-log"
+            spec.command.lstrip("/") for spec in BUILTIN_COMMAND_SPECS
         }
 
     def test_workspace_none_registers_only_builtins(self, monkeypatch) -> None:
@@ -1889,7 +1891,7 @@ class TestNativeSkillCommands:
             lambda *args, **kwargs: pytest.fail("loader must not be constructed"),
         )
         client = DiscordBotClient(channel, intents=discord.Intents.default())
-        assert len(client.tree.get_commands()) == 10
+        assert len(client.tree.get_commands()) == len(BUILTIN_COMMAND_SPECS)
 
 
 def test_forward_only_slash_commands_expose_no_internal_parameters(tmp_path) -> None:
@@ -1941,10 +1943,10 @@ def test_router_builtin_names_are_reserved_against_skills(tmp_path) -> None:
         )
         client = DiscordBotClient(channel, intents=discord.Intents.none())
 
-    names = _skill_names_from(client)
+    names = [command.name for command in client.tree.get_commands()]
     assert "alpha" in names
-    for hijacked in ("skill", "goal", "pairing", "dream-restore"):
-        assert hijacked not in names
+    for reserved in ("skill", "goal", "pairing", "dream-restore"):
+        assert names.count(reserved) == 1
 
 
 def test_skill_commands_are_truncated_in_deterministic_order(tmp_path) -> None:
@@ -2023,3 +2025,57 @@ class TestInboundIdentityMetadata:
         assert metadata["message_id"] == "99"
         assert metadata["guild_id"] == "5"
         assert metadata["reply_to"] is None
+
+
+class TestBuiltinSlashCoverage:
+    """Discord 的命令表必须由 BUILTIN_COMMAND_SPECS 派生，不能手写第二份。"""
+
+    def _client(self, tmp_path):
+        with patch("nanobot.channels.discord.runtime.SkillsLoader") as loader_cls:
+            loader_cls.return_value.list_skills.return_value = []
+            channel = DiscordChannel(
+                DiscordConfig(token="test"), MessageBus(), workspace=tmp_path
+            )
+            return DiscordBotClient(channel, intents=discord.Intents.default())
+
+    def test_every_builtin_command_is_exposed(self, tmp_path) -> None:
+        client = self._client(tmp_path)
+        names = {command.name for command in client.tree.get_commands()}
+        expected = {spec.command.lstrip("/") for spec in BUILTIN_COMMAND_SPECS}
+        assert expected <= names
+
+    def test_arg_taking_commands_expose_one_optional_parameter(self, tmp_path) -> None:
+        client = self._client(tmp_path)
+        commands = {command.name: command for command in client.tree.get_commands()}
+        for spec in BUILTIN_COMMAND_SPECS:
+            if not spec.accepts_args or spec.command in _HANDWRITTEN_SLASH_COMMANDS:
+                continue
+            parameters = commands[spec.command.lstrip("/")].parameters
+            assert len(parameters) == 1, spec.command
+            assert parameters[0].required is False, spec.command
+
+    def test_no_arg_commands_stay_parameterless(self, tmp_path) -> None:
+        client = self._client(tmp_path)
+        commands = {command.name: command for command in client.tree.get_commands()}
+        for spec in BUILTIN_COMMAND_SPECS:
+            if spec.accepts_args or spec.command in _HANDWRITTEN_SLASH_COMMANDS:
+                continue
+            assert commands[spec.command.lstrip("/")].parameters == [], spec.command
+
+    @pytest.mark.asyncio
+    async def test_argument_is_appended_to_the_forwarded_command(self, tmp_path) -> None:
+        client = self._client(tmp_path)
+        forwarded = AsyncMock()
+        client._forward_slash_command = forwarded
+        commands = {command.name: command for command in client.tree.get_commands()}
+        interaction = SimpleNamespace()
+
+        await commands["dream-restore"].callback(interaction, "3")
+        await commands["dream-restore"].callback(interaction, "  ")
+        await commands["history"].callback(interaction, None)
+
+        assert forwarded.await_args_list == [
+            call(interaction, "/dream-restore 3"),
+            call(interaction, "/dream-restore"),
+            call(interaction, "/history"),
+        ]
