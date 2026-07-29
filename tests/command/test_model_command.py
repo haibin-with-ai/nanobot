@@ -100,10 +100,24 @@ async def test_model_command_switches_preset(tmp_path) -> None:
     assert loop.model_preset is None
     assert loop.model == "base-model"
 
-    await loop.process_direct("/new", session_key="cli:direct")
+
+@pytest.mark.asyncio
+async def test_new_drops_the_session_model_override(tmp_path) -> None:
+    """Deliberate divergence from upstream #4866.
+
+    Upstream keeps the preset across /new because it is scoped to the session
+    key. This fork treats /new as a full reset: an override picked for one
+    conversation should not silently govern the next one in the same channel.
+    """
+    loop = _make_loop(tmp_path)
+    await cmd_model(_ctx(loop, "/model fast", args="fast"))
     assert _saved_model_preset(loop) == "fast"
+
+    await loop.process_direct("/new", session_key="cli:direct")
+
+    assert _saved_model_preset(loop) is None
     status = await loop.process_direct("/status", session_key="cli:direct")
-    assert status is not None and "openai/gpt-4.1" in status.content
+    assert status is not None and "base-model" in status.content
 
 
 @pytest.mark.asyncio

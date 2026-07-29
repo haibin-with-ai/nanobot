@@ -252,3 +252,34 @@ async def test_sdk_invalid_internal_model_preset_metadata_fails_explicitly(
         await bot.run("hello", session_key="sdk:invalid-internal-metadata")
 
     assert base.calls == []
+
+
+class TestClearDropsModelOverride:
+    """A reset session must not keep answering on a preset the user chose earlier."""
+
+    def _session(self):
+        from nanobot.session.manager import Session
+        s = Session(key="k")
+        s.messages = [{"role": "user", "content": "hi"}]
+        return s
+
+    def test_clear_removes_the_preset(self):
+        from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
+        s = self._session()
+        s.metadata[SESSION_MODEL_PRESET_METADATA_KEY] = "fast"
+        s.clear()
+        assert SESSION_MODEL_PRESET_METADATA_KEY not in s.metadata
+
+    def test_clear_keeps_unrelated_metadata(self):
+        """Only the model override is transient; goals and the rest survive."""
+        from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
+        s = self._session()
+        s.metadata.update({SESSION_MODEL_PRESET_METADATA_KEY: "fast", "goal_state": {"a": 1}})
+        s.clear()
+        assert s.metadata["goal_state"] == {"a": 1}
+
+    def test_clear_without_a_preset_is_a_noop(self):
+        s = self._session()
+        s.metadata["goal_state"] = {"a": 1}
+        s.clear()
+        assert s.metadata == {"goal_state": {"a": 1}}
