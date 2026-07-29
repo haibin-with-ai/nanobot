@@ -2152,15 +2152,14 @@ async def test_webui_automations_route_lists_all_jobs_and_allows_user_actions(
             f"{base_url}/api/webui/automations/run?id={incomplete_job.id}",
             headers=auth,
         )
-        assert unbound_run.status_code == 409
-        assert "no linked chat" in unbound_run.text
+        # This fork gives unbound jobs a fresh session per run.
+        assert unbound_run.status_code == 200
 
         unbound_enable = await _http_get(
             f"{base_url}/api/webui/automations/enable?id={incomplete_job.id}",
             headers=auth,
         )
-        assert unbound_enable.status_code == 409
-        assert "no linked chat" in unbound_enable.text
+        assert unbound_enable.status_code == 200
 
         protected_delete = await _http_get(
             f"{base_url}/api/webui/automations/delete?id=heartbeat",
