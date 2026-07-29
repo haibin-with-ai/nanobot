@@ -17,7 +17,7 @@ from loguru import logger
 
 from nanobot.runtime_context import public_history_messages
 from nanobot.session.manager import Session, SessionManager
-from nanobot.utils.gitstore import GitStore
+from nanobot.utils.gitstore import GitStore, GitStoreError
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -61,6 +61,10 @@ class DreamRunProgress:
             for event in tool_events or ()
         ):
             self.had_tool_errors = True
+
+
+# Below this age a line is still in play; annotating it would only add noise.
+_STALE_THRESHOLD_DAYS = 14
 
 
 class MemoryStore:
@@ -554,6 +558,7 @@ class MemoryStore:
             "agent/dream.md",
             strip=True,
             skill_creator_path=str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"),
+            stale_threshold_days=_STALE_THRESHOLD_DAYS,
         )
 
     def _dream_template(self) -> str:
@@ -600,6 +605,41 @@ class MemoryStore:
         )
         return (prompt, batch[-1]["cursor"])
 
+    def _annotate_memory_line_ages(self, content: str) -> str:
+        """Mark MEMORY.md lines that have gone untouched past the threshold.
+
+        MEMORY.md only ever grows, so a consolidation run needs some signal of
+        what has stopped moving. Failures here degrade to unannotated content:
+        a stale-line hint is not worth killing the run over.
+        """
+        file_path = "memory/MEMORY.md"
+        try:
+            ages = self._git.line_ages(file_path)
+        except GitStoreError as exc:
+            logger.warning("line_ages failed for {}: {}", file_path, exc)
+            return content
+        if not ages:
+            return content
+
+        lines = content.splitlines()
+        if len(lines) != len(ages):
+            # Blame reflects the last commit; an unstaged edit would shift every
+            # age onto the wrong line, which is worse than no annotation.
+            logger.debug(
+                "line_ages length mismatch for {} (lines={}, ages={}); skipping",
+                file_path, len(lines), len(ages),
+            )
+            return content
+
+        annotated = [
+            f"{line}  \u2190 {age.age_days}d"
+            if line.strip() and age.age_days > _STALE_THRESHOLD_DAYS
+            else line
+            for line, age in zip(lines, ages)
+        ]
+        result = "\n".join(annotated)
+        return result + "\n" if content.endswith("\n") else result
+
     def _render_current_memory_files(self) -> str:
         """Render the durable memory files' current contents for the Dream prompt.
 
@@ -617,6 +657,10 @@ class MemoryStore:
                 content = path.read_text(encoding="utf-8") if path.exists() else ""
             except OSError:
                 content = ""
+            if label == "memory/MEMORY.md" and content:
+                # Annotate before capping: truncated text no longer lines up
+                # with blame output.
+                content = self._annotate_memory_line_ages(content)
             if len(content) > self._DREAM_FILE_EMBED_CAP:
                 content = truncate_text(content, self._DREAM_FILE_EMBED_CAP) + "\n...[truncated]"
             blocks.append(f"### {label}\n{content}" if content.strip() else f"### {label}\n(empty)")

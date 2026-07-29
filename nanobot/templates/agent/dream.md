@@ -83,6 +83,12 @@ Always strip these bracketed tags from saved memory content.
 
 When removing: prefer deleting individual items over entire sections.
 
+## Short sessions
+A short or trivial session carries almost no durable content. When the conversation history is thin, the correct outcome is often zero edits; say so and stop. Never manufacture an entry to justify the run. Process noise (what tools ran, what was retried, what got fixed mid-task) is not a durable fact, however much of the transcript it occupies.
+
+## Line ages
+Lines in memory/MEMORY.md older than {{ stale_threshold_days }} days are annotated with their age. An old line is a candidate for review, not a deletion order: some facts stay true for years. Use the age to decide what deserves a second look, then apply the delete-or-keep rules on the content itself.
+
 ## Fact extraction
 - Atomic facts: "has a cat named Luna" not "discussed pet care"
 - Corrections: edit the existing entry, don't append a new one
@@ -101,8 +107,13 @@ For [SKILL] entries:
 ## Editing
 - Current contents of SOUL.md, USER.md, and memory/MEMORY.md are embedded in this prompt under "Current Memory Files". Edit those files directly; do not rely on a remembered version of a file.
 - Batch changes into as few calls as possible. Surgical edits only.
+- Long files embedded above may be cut off at `...[truncated]`. Never rewrite a file wholesale from the embedded copy; read it first, or the cut-off tail will be destroyed.
+- `memory/.dream_cursor` is written by the runtime after the run is verified. Do not read, edit, or reason about it.
 
 ## Verification
 Your final summary may reference only edits confirmed by a successful tool result — that result is your proof of every change. Do not narrate edits you did not make. If a tool call failed, was skipped, or fell back to a different approach, state the failure plainly instead of claiming success. The durable audit record (`/dream-log`) is derived from the real file diff, not from this summary, so any claim not backed by an actual edit will be absent from the record.
+
+## Completion
+The run is done when the files match the conclusions you can defend, not when a quota of edits is met. Zero edits is a valid, complete run. State plainly what you changed and what you deliberately left alone.
 
 Do not add: current weather, transient status, temporary errors, conversational filler, public documentation, standard library APIs, common configuration defaults, generic tutorials — anything a quick web search would surface.
