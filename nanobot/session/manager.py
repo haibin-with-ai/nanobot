@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import re
+import time
 from collections import OrderedDict
 from contextlib import suppress
 from copy import deepcopy
@@ -17,11 +18,11 @@ from weakref import WeakValueDictionary
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
-from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
     public_history_message,
 )
+from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -414,6 +415,28 @@ class Session:
             len(archive_chunk),
             len(self.messages),
         )
+
+
+# An unbound cron run writes ``cron:{job_id}:{run_id}`` where the run id itself
+# starts with the job id, so the doubled segment is what makes this key shape
+# self-identifying. Nothing else in the system produces it.
+_CRON_RUN_SESSION_KEY_RE = re.compile(
+    r"^cron:(?P<job>[0-9A-Za-z_-]+):(?P=job):(?P<started_ms>\d+):[0-9a-f]{8}$"
+)
+_CRON_RUN_RETAIN_DAYS = 30
+_CRON_RUN_KEEP_PER_JOB = 3
+
+
+def parse_cron_run_session_key(key: str) -> tuple[str, int] | None:
+    """Return ``(job_id, started_ms)`` for a cron run session key, else None.
+
+    Deliberately strict: a key that does not decode exactly is treated as
+    someone else's session and left alone.
+    """
+    match = _CRON_RUN_SESSION_KEY_RE.match(key)
+    if not match:
+        return None
+    return match.group("job"), int(match.group("started_ms"))
 
 
 class SessionManager:
@@ -879,6 +902,63 @@ class SessionManager:
                     "metadata": repaired.metadata,
                 }
             return None
+
+    def prune_cron_run_sessions(
+        self,
+        *,
+        retain_days: int = _CRON_RUN_RETAIN_DAYS,
+        keep_per_job: int = _CRON_RUN_KEEP_PER_JOB,
+        dry_run: bool = False,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Delete cron run sessions past the retention window.
+
+        Each job keeps its most recent runs regardless of age, so a monthly job
+        does not lose its whole history to a 30-day cutoff.
+        """
+        now = now_ms if now_ms is not None else int(time.time() * 1000)
+        cutoff = now - retain_days * 86_400_000
+
+        by_job: dict[str, list[tuple[int, str, Path]]] = {}
+        for path in self.sessions_dir.glob("*.jsonl"):
+            key = self._session_key_from_path(path)
+            if key is None:
+                continue
+            parsed = parse_cron_run_session_key(key)
+            if parsed is None:
+                continue
+            job_id, started_ms = parsed
+            by_job.setdefault(job_id, []).append((started_ms, key, path))
+
+        expired: list[tuple[str, Path]] = []
+        for runs in by_job.values():
+            runs.sort(key=lambda item: item[0], reverse=True)
+            for started_ms, key, path in runs[keep_per_job:]:
+                if started_ms < cutoff:
+                    expired.append((key, path))
+
+        total_bytes = 0
+        for _, path in expired:
+            with suppress(OSError):
+                total_bytes += path.stat().st_size
+
+        if dry_run:
+            keys = [key for key, _ in expired]
+            return {"keys": keys, "count": len(keys), "bytes": total_bytes}
+
+        deleted: list[str] = []
+        for key, _ in expired:
+            try:
+                self.delete_session(key)
+            except OSError as exc:
+                # A stuck file must not stop the sweep, nor the cron run that
+                # triggered it.
+                logger.warning("Session prune failed for {}: {}", key, exc)
+                continue
+            deleted.append(key)
+        if deleted:
+            logger.info("Session prune: removed {} cron run sessions", len(deleted))
+        return {"keys": deleted, "count": len(deleted), "bytes": total_bytes}
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

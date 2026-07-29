@@ -53,6 +53,8 @@ class CronPayload:
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
+    # Model preset for this job's run. None means the runtime default.
+    model: str | None = None
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
@@ -71,6 +73,7 @@ class CronPayload:
             origin_metadata=dict(
                 get_camel_snake(data, "originMetadata", "origin_metadata", {}) or {}
             ),
+            model=data.get("model"),
         )
 
 

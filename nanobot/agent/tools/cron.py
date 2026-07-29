@@ -39,6 +39,11 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "Naive values use the tool's default timezone."
     ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
+    model=StringSchema(
+        "Optional model preset name for this job's run (e.g. 'fast', 'deep', 'codex'). "
+        "When omitted, cron jobs run on the default 'deep' preset. "
+        "Use 'fast' for lightweight jobs to save cost."
+    ),
     required=["action"],
     description=(
         "Action-specific parameters: add requires a non-empty message plus one schedule "
@@ -138,11 +143,12 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        model: str | None = None,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at)
+            return self._add_job(name, message, every_seconds, cron_expr, tz, at, model)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -157,6 +163,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        model: str | None = None,
     ) -> str:
         if not message:
             return ToolResult.error(
@@ -210,6 +217,7 @@ class CronTool(Tool):
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
             origin_metadata=origin_metadata,
+            model=model,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
