@@ -121,7 +121,8 @@ class ContextBuilder:
 
         # The persona sits at the very top of a long prompt, where it is easiest
         # to lose. Repeat only its non-negotiable core at the tail.
-        anchor = self._build_soul_anchor(root)
+        # SOUL.md 只从 agent 工作区读，项目模式下 root 指向项目根，用它会锚空。
+        anchor = self._build_soul_anchor(self.workspace)
         if anchor:
             parts.append(anchor)
 

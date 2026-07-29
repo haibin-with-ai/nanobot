@@ -473,6 +473,20 @@ class TestSoulFirstAndAnchor:
         assert builder._build_soul_anchor() == ""
         assert "scarcest resource" in builder._build_soul_anchor(other)
 
+    def test_project_mode_still_anchors_on_the_agent_soul(self, tmp_path):
+        """项目工作区没有 SOUL.md，锚点必须仍取 agent 工作区那一份。"""
+        agent_home = self._workspace(tmp_path / "agent")
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("# Agents\n\nproject rules\n", encoding="utf-8")
+
+        prompt = ContextBuilder(agent_home).build_system_prompt(
+            workspace=project, include_memory_recent_history=False
+        )
+
+        assert "# Remember" in prompt
+        assert "haibin's time is the scarcest resource." in prompt
+
     def test_soul_without_prime_directive_yields_no_anchor(self, tmp_path):
         (tmp_path / "SOUL.md").write_text("# Soul\n\njust a voice section\n", encoding="utf-8")
         builder = ContextBuilder(tmp_path)
