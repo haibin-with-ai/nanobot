@@ -181,3 +181,53 @@ async def test_subagent_forwards_fail_on_tool_error_to_runner(tmp_path):
 
     spec = sm.runner.run.call_args.args[0]
     assert spec.fail_on_tool_error is False
+
+
+def _manager_with_profile(tmp_path, *, soul=None, tools=None):
+    agent_workspace = tmp_path / "agent"
+    agent_workspace.mkdir(parents=True, exist_ok=True)
+    if soul is not None:
+        (agent_workspace / "SOUL.md").write_text(soul, encoding="utf-8")
+    if tools is not None:
+        (agent_workspace / "TOOLS.md").write_text(tools, encoding="utf-8")
+    return SubagentManager(
+        workspace=agent_workspace,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+
+
+def test_subagent_prompt_carries_soul_and_tools(tmp_path):
+    """Subagents inherit voice and tool constraints, not just the task."""
+    manager = _manager_with_profile(
+        tmp_path,
+        soul="# Soul\n\nBlunt, conclusion-first Chinese.\n",
+        tools="# Tool Usage Notes\n\nTemp files only under tmp/.\n",
+    )
+
+    prompt = manager._build_subagent_prompt()
+
+    assert "Blunt, conclusion-first Chinese." in prompt
+    assert "Temp files only under tmp/." in prompt
+    # Upstream structure must survive.
+    assert "You are a subagent spawned by the main agent" in prompt
+    assert prompt.index("You are a subagent") < prompt.index("Blunt, conclusion-first")
+
+
+def test_subagent_prompt_omits_missing_profile_files(tmp_path):
+    manager = _manager_with_profile(tmp_path)
+    prompt = manager._build_subagent_prompt()
+    assert "SOUL.md" not in prompt
+    assert "TOOLS.md" not in prompt
+    assert "You are a subagent spawned by the main agent" in prompt
+
+
+def test_subagent_prompt_skips_unmodified_template_profile(tmp_path):
+    """A pristine default SOUL.md is noise, not personality."""
+    from nanobot.utils.helpers import load_bundled_template
+
+    pristine = load_bundled_template("SOUL.md")
+    assert pristine, "expected a bundled SOUL.md template"
+    manager = _manager_with_profile(tmp_path, soul=pristine)
+    prompt = manager._build_subagent_prompt()
+    assert "## SOUL.md" not in prompt

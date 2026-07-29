@@ -820,6 +820,11 @@ def build_status_content(
     return "\n".join(lines)
 
 
+# Bootstrapped into the prompt from the bundled copy; never seeded into a
+# user workspace, where a stale copy would silently override the real contract.
+_INTERNAL_ONLY_TEMPLATES = frozenset({"TOOLS.md"})
+
+
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Creates missing files without overwriting user files."""
     from importlib.resources import files as pkg_files
@@ -842,6 +847,8 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         added.append(str(dest.relative_to(workspace)))
 
     for item in tpl.iterdir():
+        if item.name in _INTERNAL_ONLY_TEMPLATES:
+            continue
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")

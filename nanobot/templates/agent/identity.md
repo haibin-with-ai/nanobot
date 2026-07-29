@@ -14,7 +14,7 @@ Nanobot's agent workspace is at: {{ agent_workspace_path }}
 {{ platform_policy }}
 {% if channel == 'telegram' or channel == 'qq' or channel == 'discord' %}
 ## Format Hint
-This conversation is on a messaging app. Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. No tables — use plain lists.
+This conversation is on a messaging app. Use short paragraphs. Avoid large headings (#, ##). Use **bold** sparingly. Never use Markdown pipe tables (`|` column syntax) — they do not render. Use plain lists, or an ASCII table inside a fenced code block.
 {% elif channel == 'whatsapp' or channel == 'sms' %}
 ## Format Hint
 This conversation is on a text messaging platform that does not render markdown. Use plain text only.

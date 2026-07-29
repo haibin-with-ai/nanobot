@@ -54,7 +54,8 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
+    # SOUL first, then the mechanism it operates through, then who it serves.
+    BOOTSTRAP_FILES = ["SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md"]
     _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
     _RUNTIME_CONTEXT_TAG = RUNTIME_CONTEXT_TAG
     _MAX_RECENT_HISTORY = 50
@@ -118,7 +119,31 @@ class ContextBuilder:
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
+        # The persona sits at the very top of a long prompt, where it is easiest
+        # to lose. Repeat only its non-negotiable core at the tail.
+        anchor = self._build_soul_anchor(root)
+        if anchor:
+            parts.append(anchor)
+
         return "\n\n---\n\n".join(parts)
+
+    def _build_soul_anchor(self, workspace: Path | None = None) -> str:
+        """Return SOUL.md's Prime Directive section, or "" when there isn't one."""
+        soul_path = (workspace or self.workspace) / "SOUL.md"
+        if not soul_path.exists():
+            return ""
+        try:
+            content = soul_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+        heading = "## Prime Directive"
+        start = content.find(heading)
+        if start == -1:
+            return ""
+        end = content.find("\n## ", start + len(heading))
+        section = content[start:] if end == -1 else content[start:end]
+        return f"# Remember\n\n{section.strip()}" if section.strip() else ""
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
@@ -159,13 +184,15 @@ class ContextBuilder:
         """Load project instructions plus the agent's global profile files."""
         parts = []
         project_root = workspace or self.workspace
-        sources = [
-            ("AGENTS.md", project_root),
-            ("SOUL.md", self.workspace),
-            ("USER.md", self.workspace),
-        ]
+        roots = {
+            "SOUL.md": self.workspace,
+            "USER.md": self.workspace,
+            "AGENTS.md": project_root,
+            "TOOLS.md": self.workspace,
+        }
 
-        for filename, root in sources:
+        for filename in self.BOOTSTRAP_FILES:
+            root = roots[filename]
             file_path = root / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
