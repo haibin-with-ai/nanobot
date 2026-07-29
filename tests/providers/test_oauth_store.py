@@ -391,6 +391,33 @@ def test_refresh_expires_five_minutes_early(monkeypatch) -> None:
     assert creds.account_id == "u-1"
 
 
+def test_refresh_keeps_the_old_token_when_the_response_omits_one(monkeypatch) -> None:
+    """不轮换 refresh token 的响应不能把本地凭据写空，否则永远刷不回来。"""
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {"access_token": "a", "expires_in": 3600}
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, *args, **kwargs):
+            return _Response()
+
+    monkeypatch.setattr("nanobot.providers.oauth_store.httpx.Client", lambda **kw: _Client())
+
+    creds = refresh_anthropic_token("old-refresh-token")
+
+    assert creds.refresh_token == "old-refresh-token"
+
+
 def test_refresh_raises_on_non_200(monkeypatch) -> None:
     class _Response:
         status_code = 401

@@ -207,10 +207,10 @@ def refresh_anthropic_token(refresh_token: str) -> OAuthCredentials:
         response = client.post(_ANTHROPIC_TOKEN_URL, json=payload)
     if response.status_code != 200:
         raise RuntimeError(f"Token refresh failed: {response.status_code} {response.text}")
-    return _parse_refresh_response(response.json())
+    return _parse_refresh_response(response.json(), refresh_token)
 
 
-def _parse_refresh_response(data: dict) -> OAuthCredentials:
+def _parse_refresh_response(data: dict, previous_refresh_token: str = "") -> OAuthCredentials:
     access = data.get("access_token")
     expires_in = data.get("expires_in")
     if not access or not expires_in:
@@ -219,7 +219,7 @@ def _parse_refresh_response(data: dict) -> OAuthCredentials:
     account = data.get("account") or {}
     return OAuthCredentials(
         access_token=access,
-        refresh_token=data.get("refresh_token", ""),
+        refresh_token=data.get("refresh_token") or previous_refresh_token,
         expires_at=expires_at,
         account_id=account.get("uuid") if isinstance(account, dict) else None,
     )
