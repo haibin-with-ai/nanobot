@@ -461,3 +461,52 @@ def test_refresh_raises_on_missing_fields(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="missing required fields"):
         refresh_anthropic_token("refresh-token")
+
+
+class TestRefreshKeepsWhatTheServerOmits:
+    def _store(self, tmp_path, monkeypatch, saved):
+        from nanobot.providers.oauth_store import OAuthCredentialStore
+
+        store = OAuthCredentialStore()
+        monkeypatch.setattr(store, "load", lambda: saved)
+        monkeypatch.setattr(store, "save", lambda creds: None)
+        monkeypatch.setattr(store, "_lock", lambda: _NullLock())
+        monkeypatch.setattr(store, "_on_lock_acquired", lambda path: None)
+        return store
+
+    def test_account_id_survives_a_response_without_account(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from nanobot.providers.oauth_store import OAuthCredentials
+
+        saved = OAuthCredentials("old", "refresh-1", 0, "acct-1")
+        store = self._store(tmp_path, monkeypatch, saved)
+        monkeypatch.setattr(
+            "nanobot.providers.oauth_store.refresh_anthropic_token",
+            lambda token: OAuthCredentials("new", token, 9_999_999_999_000, None),
+        )
+
+        creds = store.get_token(force_refresh=True)
+
+        assert creds.access_token == "new"
+        assert creds.account_id == "acct-1"
+
+    def test_server_account_wins_when_present(self, tmp_path, monkeypatch) -> None:
+        from nanobot.providers.oauth_store import OAuthCredentials
+
+        saved = OAuthCredentials("old", "refresh-1", 0, "acct-1")
+        store = self._store(tmp_path, monkeypatch, saved)
+        monkeypatch.setattr(
+            "nanobot.providers.oauth_store.refresh_anthropic_token",
+            lambda token: OAuthCredentials("new", token, 9_999_999_999_000, "acct-2"),
+        )
+
+        assert store.get_token(force_refresh=True).account_id == "acct-2"
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False

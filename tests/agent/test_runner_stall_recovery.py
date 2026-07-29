@@ -11,7 +11,7 @@ import pytest
 
 from agent.runner_helpers import make_run_spec
 from nanobot.config.schema import AgentDefaults
-from nanobot.providers.base import LLMProvider, LLMResponse
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 def _stall() -> LLMResponse:
@@ -28,6 +28,15 @@ def _server_error() -> LLMResponse:
 
 def _ok(content: str = "done") -> LLMResponse:
     return LLMResponse(content=content, finish_reason="stop", tool_calls=[])
+
+
+def _tool_call() -> LLMResponse:
+    """一次成功的工具调用，让同一次 run 能继续往下跑。"""
+    return LLMResponse(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+    )
 
 
 class _Provider:
@@ -88,27 +97,47 @@ class TestPhaseTwoRetries:
         assert _stall_notices(provider.seen[-1]), "模型必须看见上一轮超时"
 
     @pytest.mark.asyncio
-    async def test_a_good_answer_clears_the_counters(self) -> None:
+    async def test_a_good_turn_clears_the_counters_inside_one_run(self) -> None:
+        """同一次 run 内：成功一轮后计数必须归零，否则第 4 次超时会提前放弃。"""
         from nanobot.agent.runner import AgentRunner
 
         provider = _Provider(
-            _stall(), _ok("first"),
-            _stall(), _stall(), _stall(), _ok("second"),
+            _stall(),
+            _tool_call(),
+            _stall(), _stall(), _stall(),
+            _ok("second"),
         )
-        spec = _spec(provider)
-        assert (await AgentRunner().run(spec)).final_content == "first"
-        assert (await AgentRunner().run(spec)).final_content == "second"
+
+        result = await AgentRunner().run(_spec(provider))
+
+        assert result.final_content == "second"
+        assert result.stop_reason != "error"
+        assert len(provider.seen) == 6
 
 
 class TestPhaseThreeGivesUp:
     @pytest.mark.asyncio
-    async def test_too_many_stalls_raise(self) -> None:
-        from nanobot.agent.runner import AgentRunner, ModelStallError
+    async def test_too_many_stalls_end_the_run_as_an_error(self) -> None:
+        """放弃要走正常错误出口：不抛异常，上下文照常保留。"""
+        from nanobot.agent.runner import _MAX_TOTAL_STALLS, AgentRunner
 
         provider = _Provider(*[_stall() for _ in range(6)])
 
-        with pytest.raises(ModelStallError):
-            await AgentRunner().run(_spec(provider))
+        result = await AgentRunner().run(_spec(provider))
+
+        assert result.stop_reason == "error"
+        assert "放弃" in result.final_content
+        assert len(provider.seen) == _MAX_TOTAL_STALLS
+        assert result.messages and result.messages[0]["role"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_giving_up_does_not_blame_the_wrong_thing(self) -> None:
+        from nanobot.agent.runner import AgentRunner
+
+        result = await AgentRunner().run(_spec(_Provider(*[_stall() for _ in range(6)])))
+
+        assert "超时" not in result.final_content or "放弃" in result.final_content
+        assert result.error == result.final_content
 
     @pytest.mark.asyncio
     async def test_plain_errors_never_reach_the_stall_machinery(self) -> None:
@@ -149,3 +178,61 @@ class TestOuterTimeoutCoversTheWholeModelChain:
         result = await AgentRunner().run(spec)
 
         assert result.final_content == "primary late"
+
+    @pytest.mark.asyncio
+    async def test_a_long_chain_does_not_multiply_the_wall(self) -> None:
+        """预算只放大一倍：链再长也不能让用户干等 N 倍时间。"""
+        import asyncio
+
+        from nanobot.agent.runner import AgentRunner
+
+        class _LongChain:
+            model_attempt_budget = 6
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat_with_retry(self, *, messages, **_kwargs) -> LLMResponse:
+                self.calls += 1
+                await asyncio.sleep(5)
+                return _ok("never")
+
+        provider = _LongChain()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        result = await AgentRunner().run(
+            _spec(provider, llm_timeout_s=0.2, max_iterations=1)
+        )
+
+        # 6 个候选若各给一份预算就是 1.2 秒起步；封顶后单次调用只等 0.4 秒。
+        assert loop.time() - started < 1.0
+        assert result.stop_reason == "error"
+
+
+class TestRefusalKeepsItsWords:
+    """拒答是模型说的话，要原样进历史，别写成占位符。"""
+
+    @pytest.mark.asyncio
+    async def test_refusal_text_lands_in_history(self) -> None:
+        from nanobot.agent.runner import AgentRunner
+
+        refusal = LLMResponse(
+            content="我不能帮你做这个。",
+            finish_reason="error",
+            error_kind="refusal",
+        )
+        result = await AgentRunner().run(_spec(_Provider(refusal)))
+
+        assert result.final_content == "我不能帮你做这个。"
+        assert result.messages[-1]["role"] == "assistant"
+        assert "我不能帮你做这个。" in result.messages[-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_other_errors_still_use_the_placeholder(self) -> None:
+        from nanobot.agent.runner import AgentRunner
+
+        boom = LLMResponse(content="500 boom", finish_reason="error", error_kind="server_error")
+        result = await AgentRunner().run(_spec(_Provider(boom)))
+
+        assert result.messages[-1]["content"] != "500 boom"

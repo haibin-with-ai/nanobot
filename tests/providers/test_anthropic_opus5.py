@@ -12,16 +12,59 @@ def provider() -> AnthropicProvider:
     return AnthropicProvider(api_key="k")
 
 
-def _kwargs(provider: AnthropicProvider, model: str, effort: str | None = None) -> dict:
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "list_dir", "description": "ls", "parameters": {"type": "object"}},
+    }
+]
+
+
+def _kwargs(
+    provider: AnthropicProvider,
+    model: str,
+    effort: str | None = None,
+    *,
+    tools=None,
+    tool_choice=None,
+) -> dict:
     return provider._build_kwargs(
         messages=[{"role": "user", "content": "hi"}],
-        tools=None,
+        tools=tools,
         model=model,
         max_tokens=1024,
         temperature=0.7,
         reasoning_effort=effort,
-        tool_choice=None,
+        tool_choice=tool_choice,
     )
+
+
+class TestToolChoiceKnowsThinkingIsOn:
+    """thinking 开着时不能发 tool_choice: any，Anthropic 直接 400。"""
+
+    def test_default_thinking_model_forces_auto(self) -> None:
+        provider = AnthropicProvider(api_key="k")
+
+        kwargs = _kwargs(
+            provider, "claude-opus-5-20260901", tools=_TOOLS, tool_choice="required"
+        )
+
+        assert kwargs["thinking"]["type"] == "adaptive"
+        assert kwargs["tool_choice"] == {"type": "auto"}
+
+    def test_thinking_off_still_honours_required(self) -> None:
+        provider = AnthropicProvider(api_key="k")
+
+        kwargs = _kwargs(
+            provider,
+            "claude-opus-5-20260901",
+            "none",
+            tools=_TOOLS,
+            tool_choice="required",
+        )
+
+        assert kwargs["thinking"] == {"type": "disabled"}
+        assert kwargs["tool_choice"] == {"type": "any"}
 
 
 class TestOpus5Defaults:

@@ -220,3 +220,112 @@ class TestAnthropicRefusalSignal:
 
         assert result.finish_reason == "stop"
         assert result.error_kind is None
+
+
+class TestPrimaryErrorSurvivesSkippedFallbacks:
+    """备用模型全被跳过时，用户要看到主模型的真实错误，不是「熔断」这种空话。"""
+
+    @pytest.mark.asyncio
+    async def test_error_is_returned_when_the_only_fallback_is_cooling(self) -> None:
+        clock = _Clock()
+        primary = _FakeProvider("primary", _server_error(), _server_error())
+        fallback = _FakeProvider("fallback", _rate_limited(), _ok("late"))
+        provider, _ = _build(primary, fallback, clock=clock)
+
+        await _ask(provider)
+        result = await _ask(provider)
+
+        assert result.content == "boom"
+        assert len(fallback.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_provider_factory_failure_still_reports_the_primary_error(self) -> None:
+        primary = _FakeProvider("primary", _server_error())
+        provider, factory = _build(primary, _FakeProvider("fallback"))
+        factory.side_effect = RuntimeError("no such provider")
+
+        result = await _ask(provider)
+
+        assert result.content == "boom"
+        assert result.finish_reason == "error"
+
+
+class TestCooldownIsForRateLimitsOnly:
+    @pytest.mark.asyncio
+    async def test_retry_after_on_a_server_error_does_not_cool_down(self) -> None:
+        clock = _Clock()
+        overloaded = LLMResponse(
+            content="overloaded",
+            finish_reason="error",
+            error_kind="server_error",
+            error_status_code=503,
+            error_retry_after_s=30.0,
+        )
+        primary = _FakeProvider("primary", overloaded, _ok("primary back"))
+        fallback = _FakeProvider("fallback", _ok("fallback ok"))
+        provider, _ = _build(primary, fallback, clock=clock)
+
+        await _ask(provider)
+        result = await _ask(provider)
+
+        assert result.content == "primary back"
+        assert len(primary.calls) == 2
+
+
+class TestRefusalDoesNotTripTheBreaker:
+    @pytest.mark.asyncio
+    async def test_repeated_refusals_keep_probing_the_primary(self) -> None:
+        primary = _FakeProvider("primary", _refusal(), _refusal(), _refusal(), _ok("back"))
+        fallback = _FakeProvider("fallback", _ok("fallback ok"))
+        provider, _ = _build(primary, fallback)
+
+        for _ in range(3):
+            await _ask(provider)
+        result = await _ask(provider)
+
+        assert result.content == "back"
+        assert len(primary.calls) == 4
+
+
+class TestStreamedRefusalStaysPut:
+    """口径：已经吐给用户的拒答不再换模型，换了会看到两段自相矛盾的回答。"""
+
+    @pytest.mark.asyncio
+    async def test_refusal_after_output_does_not_switch(self) -> None:
+        class _StreamingPrimary(_FakeProvider):
+            async def chat_stream(self, **kwargs: Any) -> LLMResponse:
+                delta = kwargs.get("on_content_delta")
+                if delta:
+                    await delta("我不能帮你做这个。")
+                return await self.chat(**kwargs)
+
+        primary = _StreamingPrimary("primary", _refusal())
+        fallback = _FakeProvider("fallback", _ok("fallback ok"))
+        provider, _ = _build(primary, fallback)
+
+        seen: list[str] = []
+
+        async def _sink(text: str) -> None:
+            seen.append(text)
+
+        result = await provider.chat_stream(
+            messages=[{"role": "user", "content": "hi"}],
+            model="primary-model",
+            on_content_delta=_sink,
+        )
+
+        assert seen == ["我不能帮你做这个。"]
+        assert result.error_kind == "refusal"
+        assert fallback.calls == []
+
+    @pytest.mark.asyncio
+    async def test_refusal_without_output_still_switches(self) -> None:
+        primary = _FakeProvider("primary", _refusal())
+        fallback = _FakeProvider("fallback", _ok("fallback ok"))
+        provider, _ = _build(primary, fallback)
+
+        result = await provider.chat_stream(
+            messages=[{"role": "user", "content": "hi"}], model="primary-model"
+        )
+
+        assert result.content == "fallback ok"

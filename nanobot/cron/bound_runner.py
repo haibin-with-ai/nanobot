@@ -8,6 +8,8 @@ import time
 import uuid
 from typing import Any, Protocol
 
+from loguru import logger
+
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
@@ -27,6 +29,7 @@ DEFAULT_CRON_MODEL_PRESET = "deep"
 
 class BoundCronAgent(Protocol):
     tools: Any
+    sessions: Any
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         ...
@@ -84,6 +87,13 @@ async def run_cron_job(
     # channel and chat too, and refuses jobs that only push a message out.
     if is_bound_cron_job(job):
         return await run_bound_cron_job(job, agent=agent, cron=cron)
+    if job.payload.session_key and job.payload.kind == "agent_turn":
+        # 静默降级会让「回复原会话」的任务一直答到别处去，必须留声。
+        logger.warning(
+            "Cron job '{}' names a session but lacks origin channel/chat; "
+            "running it in a per-run session instead",
+            job.id,
+        )
     return await run_unbound_cron_job(job, agent=agent, cron=cron)
 
 
@@ -104,6 +114,8 @@ async def run_unbound_cron_job(
         message=job.payload.message,
     )
     run_id = _new_run_id(job)
+    # 每次触发都新开一个会话文件，所以清理也放在造文件的地方，每天最多一次。
+    agent.sessions.maybe_prune_cron_run_sessions()
     session_key = f"cron:{job.id}:{run_id}"
     model = job.payload.model or DEFAULT_CRON_MODEL_PRESET
     record_base: dict[str, Any] = {

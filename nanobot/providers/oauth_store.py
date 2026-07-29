@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -192,6 +192,10 @@ class OAuthCredentialStore:
             if not force_refresh and latest.fresh_for(min_ttl_ms):
                 return latest
             refreshed = refresh_anthropic_token(latest.refresh_token or creds.refresh_token)
+            known_account = latest.account_id or creds.account_id
+            if not refreshed.account_id and known_account:
+                # 刷新响应经常不带 account，别让它把已知的账号信息抹掉。
+                refreshed = replace(refreshed, account_id=known_account)
             self.save(refreshed)
             return refreshed
 

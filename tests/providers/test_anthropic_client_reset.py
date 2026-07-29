@@ -77,7 +77,8 @@ class TestClientResetOnStall:
 
         assert result.error_kind == "timeout"
         assert provider._client is fresh
-        assert stale.closed == 1
+        # 旧 client 可能还挂着别人的在途流，不能替别人关。
+        assert stale.closed == 0
 
     @pytest.mark.asyncio
     async def test_reset_failure_does_not_mask_the_stall(self, provider, monkeypatch) -> None:
@@ -148,6 +149,21 @@ class TestToolIdLengthCap:
         from nanobot.providers.anthropic_provider import _sanitize_tool_id
 
         assert _sanitize_tool_id("toolu_01ABC") == "toolu_01ABC"
+
+
+class TestResetDoesNotBreakConcurrentStreams:
+    @pytest.mark.asyncio
+    async def test_an_inflight_stream_survives_someone_elses_reset(self, provider, monkeypatch) -> None:
+        """一条流 idle 超时触发重建时，另一条正在用旧 client 的流不能被打断。"""
+        stale = _FakeClient(_StallingMessages())
+        provider._client = stale
+        monkeypatch.setattr(provider, "_new_client", lambda: _FakeClient(_OkMessages()))
+        inflight = stale
+
+        await _ask(provider)
+
+        assert provider._client is not inflight
+        assert inflight.closed == 0
 
 
 class TestRefreshDoesNotBlockTheLoop:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -59,6 +60,8 @@ MAX_MESSAGE_LEN = 2000  # Discord message character limit
 
 # 这三条在下面手写注册（自动补全、参数校验各有特殊处理），派生时跳过。
 _HANDWRITTEN_SLASH_COMMANDS = frozenset({"/model", "/trigger", "/help"})
+# Discord 只收小写字母、数字、连字符和下划线，1-32 字符。
+_SLASH_NAME_RE = re.compile(r"[a-z0-9_-]{1,32}")
 
 TYPING_INTERVAL_S = 8
 
@@ -219,7 +222,19 @@ if DISCORD_AVAILABLE:
             for spec in BUILTIN_COMMAND_SPECS:
                 if spec.command in _HANDWRITTEN_SLASH_COMMANDS:
                     continue
-                self.tree.add_command(self._builtin_command(spec))
+                name = spec.command.lstrip("/")
+                if not _SLASH_NAME_RE.fullmatch(name):
+                    # 名字不合 Discord 规矩就跳过这一条，别让整棵命令树注册失败。
+                    self._channel.logger.warning(
+                        "Skipping slash command '{}': illegal name", spec.command
+                    )
+                    continue
+                try:
+                    self.tree.add_command(self._builtin_command(spec))
+                except Exception as exc:
+                    self._channel.logger.warning(
+                        "Skipping slash command '{}': {}", spec.command, exc
+                    )
 
             @self.tree.command(name="model", description="Show or switch runtime model preset")
             @app_commands.describe(preset="Optional model preset name, such as default")

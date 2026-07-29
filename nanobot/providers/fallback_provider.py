@@ -182,10 +182,24 @@ class FallbackProvider(LLMProvider):
         freest = min(remaining, key=lambda key: remaining[key])
         return set(remaining) - {freest}
 
+    _RATE_LIMIT_KINDS = frozenset({"rate_limit", "rate_limit_error", "quota", "quota_exceeded"})
+
+    def _is_rate_limited(self, response: LLMResponse) -> bool:
+        if response.error_status_code == 429:
+            return True
+        values = (response.error_kind or "", response.error_type or "", response.error_code or "")
+        return any(
+            value.lower() in self._RATE_LIMIT_KINDS
+            or "rate_limit" in value.lower()
+            or "quota" in value.lower()
+            for value in values
+        )
+
     def _note_quota_cooldown(self, key: tuple[str, str], response: LLMResponse) -> None:
-        retry_after = LLMProvider._extract_retry_after_from_response(response)
-        if retry_after is None and response.error_status_code != 429:
+        # 只认限流：503 之类也会带 Retry-After，但那是重试提示，不是配额耗尽。
+        if not self._is_rate_limited(response):
             return
+        retry_after = LLMProvider._extract_retry_after_from_response(response)
         wait = min(max(retry_after or QUOTA_COOLDOWN_DEFAULT_S, QUOTA_COOLDOWN_MIN_S), QUOTA_COOLDOWN_MAX_S)
         self._quota_cooldowns[key] = self._clock() + wait
         logger.warning(
@@ -196,7 +210,7 @@ class FallbackProvider(LLMProvider):
         """Return True if the primary provider is not currently tripped."""
         if self._primary_tripped_at is None:
             return True
-        if time.monotonic() - self._primary_tripped_at >= _PRIMARY_COOLDOWN_S:
+        if self._clock() - self._primary_tripped_at >= _PRIMARY_COOLDOWN_S:
             # Half-open: allow one probe attempt.
             return True
         return False
@@ -239,6 +253,7 @@ class FallbackProvider(LLMProvider):
     ) -> LLMResponse:
         primary_model = kwargs.get("model") or self._primary.get_default_model()
         primary_was_attempted = False
+        primary_response: LLMResponse | None = None
         primary_error = "unknown error"
         cooling = self._cooling_down(primary_model)
         primary_key = self._primary_key(primary_model)
@@ -251,6 +266,7 @@ class FallbackProvider(LLMProvider):
                 self._primary_tripped_at = None
                 return response
             primary_error = (response.content or primary_error)[:120]
+            primary_response = response
             self._note_quota_cooldown(primary_key, response)
 
             if has_streamed is not None and has_streamed[0]:
@@ -280,9 +296,13 @@ class FallbackProvider(LLMProvider):
                 )
                 return response
 
-            self._primary_failures += 1
+            if (response.error_kind or "").lower() == "refusal":
+                # 拒答是内容判断，不是可用性故障：换模型可以，但别推熔断器。
+                logger.info("Primary model '{}' refused; trying another model", primary_model)
+            else:
+                self._primary_failures += 1
             if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
-                self._primary_tripped_at = time.monotonic()
+                self._primary_tripped_at = self._clock()
                 logger.warning(
                     "Primary model '{}' circuit open after {} consecutive failures",
                     primary_model, self._primary_failures,
@@ -290,7 +310,8 @@ class FallbackProvider(LLMProvider):
         else:
             logger.debug("Primary model '{}' circuit open; skipping", primary_model)
 
-        last_response: LLMResponse | None = None
+        # 备用模型全被冷却跳过时，仍要把主模型的真实错误还给调用方。
+        last_response: LLMResponse | None = primary_response
         primary_skipped = not primary_was_attempted
         for idx, fallback in enumerate(self._fallback_presets):
             fallback_model = fallback.model

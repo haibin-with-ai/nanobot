@@ -118,21 +118,16 @@ class AnthropicProvider(LLMProvider):
 
         return anthropic.AsyncAnthropic(**self._client_kwargs(credential))
 
-    async def _reset_client(self) -> None:
-        """Stall 之后旧连接可能半死，换一个；重建失败保留原 client。"""
-        stale = self._client
+    def _reset_client(self) -> None:
+        """Stall 之后旧连接可能半死，换一个新的给后续请求用。
+
+        provider 实例在多个会话间共享，旧 client 上可能还挂着别人的在途流，
+        所以这里只换引用不主动 close，剩下的交给 GC 和 httpx 自己的超时。
+        """
         try:
             self._client = self._new_client()
         except Exception as exc:
             logger.warning("Anthropic client reset failed: {}", exc)
-            return
-        close = getattr(stale, "close", None)
-        if close is None:
-            return
-        try:
-            await close()
-        except Exception as exc:
-            logger.debug("Closing the stale Anthropic client failed: {}", exc)
 
     @staticmethod
     def _normalize_base_url(api_base: str) -> str:
@@ -656,7 +651,9 @@ class AnthropicProvider(LLMProvider):
 
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
-            tc = self._convert_tool_choice(tool_choice, thinking_enabled)
+            tc = self._convert_tool_choice(
+                tool_choice, kwargs.get("thinking", {}).get("type") not in (None, "disabled")
+            )
             if tc:
                 kwargs["tool_choice"] = tc
 
@@ -768,7 +765,7 @@ class AnthropicProvider(LLMProvider):
                 lambda: OAuthCredentialStore().get_token(force_refresh=True)
             )
         except Exception as exc:
-            logger.warning("Claude Code token refresh failed: %s", exc)
+            logger.warning("Claude Code token refresh failed: {}", exc)
             return False
         if not creds or not creds.access_token:
             return False
@@ -839,6 +836,7 @@ class AnthropicProvider(LLMProvider):
             reasoning_effort, tool_choice,
         )
         idle_timeout_s = resolve_stream_idle_timeout_s()
+        emitted = [False]
         try:
             return await self._stream_once(
                 kwargs,
@@ -846,9 +844,10 @@ class AnthropicProvider(LLMProvider):
                 on_content_delta,
                 on_thinking_delta,
                 on_tool_call_delta,
+                emitted,
             )
         except asyncio.TimeoutError:
-            await self._reset_client()
+            self._reset_client()
             return LLMResponse(
                 content=(
                     f"Error calling LLM: stream stalled for more than "
@@ -858,8 +857,8 @@ class AnthropicProvider(LLMProvider):
                 error_kind="timeout",
             )
         except Exception as e:
-            # 401 在建连阶段抛出，此时还没有 delta 发出去，重试不会重复输出。
-            if self._is_auth_error(e) and await self._refresh_credentials():
+            # 已经吐过字就不能重跑：代理层在流中途返 401/403 时用户会看到重复输出。
+            if not emitted[0] and self._is_auth_error(e) and await self._refresh_credentials():
                 try:
                     return await self._stream_once(
                         kwargs,
@@ -867,6 +866,17 @@ class AnthropicProvider(LLMProvider):
                         on_content_delta,
                         on_thinking_delta,
                         on_tool_call_delta,
+                        emitted,
+                    )
+                except asyncio.TimeoutError:
+                    self._reset_client()
+                    return LLMResponse(
+                        content=(
+                            f"Error calling LLM: stream stalled for more than "
+                            f"{idle_timeout_s:g} seconds"
+                        ),
+                        finish_reason="error",
+                        error_kind="timeout",
                     )
                 except Exception as retry_error:
                     return self._handle_error(retry_error)
@@ -879,7 +889,9 @@ class AnthropicProvider(LLMProvider):
         on_content_delta: Callable[[str], Awaitable[None]] | None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        emitted: list[bool] | None = None,
     ) -> LLMResponse:
+        emitted = emitted if emitted is not None else [False]
         async with self._client.messages.stream(**kwargs) as stream:
             if on_content_delta or on_thinking_delta or on_tool_call_delta:
                 # Idle timeout must track *any* SSE chunk (thinking_delta,
@@ -916,6 +928,7 @@ class AnthropicProvider(LLMProvider):
                     ):
                         piece = getattr(chunk.delta, "thinking", None) or ""
                         if piece and on_thinking_delta:
+                            emitted[0] = True
                             await on_thinking_delta(piece)
                     elif (
                         chunk.type == "content_block_delta"
@@ -923,6 +936,7 @@ class AnthropicProvider(LLMProvider):
                     ):
                         text = getattr(chunk.delta, "text", None) or ""
                         if text and on_content_delta:
+                            emitted[0] = True
                             await on_content_delta(text)
                     elif (
                         chunk.type == "content_block_delta"

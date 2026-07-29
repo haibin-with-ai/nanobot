@@ -63,8 +63,7 @@ _MAX_STALL_RETRIES = 2
 _MAX_TOTAL_STALLS = 4
 
 
-class ModelStallError(RuntimeError):
-    """The model stalled too many times in one run; the caller decides what next."""
+_STALL_GIVE_UP_MESSAGE = "模型连续多次无响应，本轮放弃。已保留上下文，可以直接重试。"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
@@ -460,6 +459,10 @@ class AgentRunner:
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
             context.tool_calls = list(response.tool_calls)
+            if not self._is_stall(response):
+                # 任何一次有响应的回合都清账，包括只调了工具的回合。
+                consecutive_stalls = 0
+                total_stalls = 0
 
             original_content = response.content
             reasoning_text, cleaned_content = extract_reasoning(
@@ -685,34 +688,39 @@ class AgentRunner:
                 continue
 
             # 预算用尽时不再重试，交给下面的通用错误分支收尾。
+            stall_gave_up = False
             if self._is_stall(response) and iteration + 1 < spec.max_iterations:
                 total_stalls += 1
                 if total_stalls >= _MAX_TOTAL_STALLS:
-                    raise ModelStallError(
-                        f"model stalled {total_stalls} times in one run; giving up"
+                    # 放弃也走通用错误分支：上下文照常落盘，用户拿到明确文案。
+                    logger.warning("Model stalled {} times in one run; giving up", total_stalls)
+                    stall_gave_up = True
+                else:
+                    consecutive_stalls += 1
+                    if consecutive_stalls > _MAX_STALL_RETRIES:
+                        consecutive_stalls = 0
+                        self._append_stall_notice(messages)
+                    logger.warning(
+                        "Model stalled (consecutive={}, total={}); retrying",
+                        consecutive_stalls,
+                        total_stalls,
                     )
-                consecutive_stalls += 1
-                if consecutive_stalls > _MAX_STALL_RETRIES:
-                    consecutive_stalls = 0
-                    self._append_stall_notice(messages)
-                logger.warning(
-                    "Model stalled (consecutive={}, total={}); retrying",
-                    consecutive_stalls,
-                    total_stalls,
-                )
-                await hook.after_iteration(context)
-                continue
-            consecutive_stalls = 0
-            total_stalls = 0
-
+                    await hook.after_iteration(context)
+                    continue
             if response.finish_reason == "error":
-                if LLMProvider.is_arrearage_response(response):
+                if stall_gave_up:
+                    final_content = _STALL_GIVE_UP_MESSAGE
+                elif LLMProvider.is_arrearage_response(response):
                     final_content = _ARREARAGE_ERROR_MESSAGE
                 else:
                     final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
-                self._append_model_error_placeholder(messages)
+                if (response.error_kind or "") == "refusal" and clean:
+                    # 拒答的原话就是模型说的话，写占位符会让下一轮不知道自己拒过。
+                    messages.append(build_assistant_message(clean))
+                else:
+                    self._append_model_error_placeholder(messages)
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason
@@ -972,9 +980,10 @@ class AgentRunner:
         # timeout for streaming while preserving NANOBOT_LLM_TIMEOUT_S=0 as an
         # opt-out for all LLM wall-clock timeouts.
         is_streaming_request = wants_streaming or wants_progress_streaming
-        # 一次调用可能依次试多个模型，墙钟预算要覆盖整条链，
+        # 一次调用可能依次试多个模型，墙钟预算要给备用模型留出空间，
         # 否则慢的主模型会把后面的备用模型一起取消掉。
-        attempts = max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1)))
+        # 但也只留一个模型的余量：这道墙是保命的，不是给整条链做 SLA 的。
+        attempts = min(2, max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1))))
         outer_timeout_s = (
             max(300.0, timeout_s * 2) * attempts
             if is_streaming_request and timeout_s is not None

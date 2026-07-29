@@ -147,7 +147,7 @@ class TestDryRun:
 
 class TestFailureIsolation:
     def test_one_bad_file_does_not_stop_the_rest(self, manager, monkeypatch):
-        """Cron delivery must not break because a single unlink failed."""
+        """delete_session 自己吞 OSError 后返回 False，扫描要认这个真实契约。"""
         keys = [_key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}") for i in range(4)]
         for key in keys:
             _write(manager, key)
@@ -158,13 +158,62 @@ class TestFailureIsolation:
         def flaky(self, key):
             calls.append(key)
             if len(calls) == 1:
-                raise OSError("device busy")
+                self.invalidate(key)
+                return False
             return real(self, key)
 
         monkeypatch.setattr(SessionManager, "delete_session", flaky)
         report = manager.prune_cron_run_sessions(keep_per_job=1, now_ms=NOW_MS)
         assert len(calls) == 3
         assert report["count"] == 2
+        assert len(_existing(manager)) == 2
+
+    def test_failed_deletes_do_not_count_as_reclaimed_bytes(self, manager, monkeypatch):
+        keys = [_key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}") for i in range(2)]
+        for key in keys:
+            _write(manager, key, size=500)
+
+        monkeypatch.setattr(SessionManager, "delete_session", lambda self, key: False)
+        report = manager.prune_cron_run_sessions(keep_per_job=1, now_ms=NOW_MS)
+
+        assert report["count"] == 0
+        assert report["bytes"] == 0
+
+
+class TestThrottledSweep:
+    def test_second_call_within_the_window_is_skipped(self, manager, monkeypatch):
+        calls: list[int] = []
+        monkeypatch.setattr(
+            SessionManager,
+            "prune_cron_run_sessions",
+            lambda self, **kwargs: calls.append(1),
+        )
+
+        manager.maybe_prune_cron_run_sessions()
+        manager.maybe_prune_cron_run_sessions()
+
+        assert len(calls) == 1
+
+    def test_the_window_can_expire(self, manager, monkeypatch):
+        calls: list[int] = []
+        monkeypatch.setattr(
+            SessionManager,
+            "prune_cron_run_sessions",
+            lambda self, **kwargs: calls.append(1),
+        )
+
+        manager.maybe_prune_cron_run_sessions()
+        manager.maybe_prune_cron_run_sessions(min_interval_s=0.0)
+
+        assert len(calls) == 2
+
+    def test_a_broken_sweep_never_escapes(self, manager, monkeypatch):
+        def _boom(self, **kwargs):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(SessionManager, "prune_cron_run_sessions", _boom)
+
+        manager.maybe_prune_cron_run_sessions()
 
     def test_cache_is_cleared_along_with_the_file(self, manager):
         key = _key("job1", NOW_MS - 400 * DAY_MS, "aaaaaaa9")

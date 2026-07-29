@@ -1847,10 +1847,13 @@ def _patch_gateway_ports_free(monkeypatch) -> None:
 
 
 class _StubSessionManager:
-    """gateway 启动会清理 cron 会话，替身必须提供这个方法。"""
+    """gateway 启动会清理 cron 会话，替身必须提供这些方法。"""
 
     def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
         return {"keys": [], "count": 0, "bytes": 0}
+
+    def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+        return None
 
 
 def _stub_session_manager(_workspace) -> _StubSessionManager:
@@ -1930,6 +1933,9 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
     class _FakeSessionManager:
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
+
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
 
         def __init__(self, _workspace: Path) -> None:
             self.session = _FakeSession()
@@ -2599,6 +2605,9 @@ def test_gateway_unbound_agent_cron_uses_isolated_session(
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
 
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
+
         def __init__(self, _workspace: Path) -> None:
             self.session = _FakeSession()
             seen["session_manager"] = self
@@ -2629,6 +2638,7 @@ def test_gateway_unbound_agent_cron_uses_isolated_session(
             self.model = "test-model"
             self.provider = kwargs.get("provider", object())
             self.tools = {}
+            self.sessions = seen.get("session_manager") or _StubSessionManager()
             seen["agent"] = self
 
         def set_session_model_preset(self, session_key, name):
@@ -2736,6 +2746,9 @@ def test_gateway_bound_cron_runs_as_session_turn(
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
 
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
+
         def __init__(self, _workspace: Path) -> None:
             pass
 
@@ -2758,6 +2771,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
             self.model = "test-model"
             self.provider = kwargs.get("provider", object())
             self.tools = {}
+            self.sessions = seen.get("session_manager") or _StubSessionManager()
             seen["agent"] = self
 
         async def submit_cron_turn(self, msg: InboundMessage):
@@ -2945,6 +2959,9 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     class _FakeSessionManager:
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
+
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
 
         def flush_all(self) -> int:
             return 0
@@ -3219,6 +3236,9 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
 
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
+
         def flush_all(self) -> int:
             return 0
 
@@ -3415,6 +3435,9 @@ def test_gateway_shutdown_lets_agent_task_own_mcp_cleanup(
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
 
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
+
         def flush_all(self) -> int:
             return 0
 
@@ -3516,6 +3539,9 @@ def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     class _FakeSessionManager:
         def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
             return {"keys": [], "count": 0, "bytes": 0}
+
+        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
+            return None
 
         def flush_all(self) -> int:
             return 0

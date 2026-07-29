@@ -83,9 +83,13 @@ class _Sessions:
     def __init__(self):
         self.presets: dict[str, str] = {}
         self.deleted: list[str] = []
+        self.prune_calls = 0
 
     def delete(self, key):
         self.deleted.append(key)
+
+    def maybe_prune_cron_run_sessions(self):
+        self.prune_calls += 1
 
 
 class _Tools:
@@ -235,3 +239,50 @@ class TestIncompleteBindingFallsBackToItsOwnSession:
         await run_cron_job(job, agent=agent, cron=cron)
         assert agent.bound_calls == []
         assert agent.direct_calls[0]["session_key"].startswith("cron:job-1:")
+
+
+class TestHalfBoundJobsAreLoud:
+    """只有 session_key、缺 origin 的任务会降级到独立会话，降级必须留下日志。"""
+
+    async def _warnings(self, job) -> list[str]:
+        from loguru import logger
+
+        captured: list[str] = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="WARNING")
+        # 别的用例可能跑过 logger.disable("nanobot")，这里显式打开。
+        logger.enable("nanobot")
+        try:
+            await run_cron_job(job, agent=_Agent(), cron=_Recorder())
+        finally:
+            logger.remove(sink_id)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_missing_origin_logs_a_warning(self) -> None:
+        captured = await self._warnings(_job(session_key="discord:123"))
+
+        assert any("origin channel/chat" in line for line in captured)
+
+    @pytest.mark.asyncio
+    async def test_fully_bound_jobs_stay_quiet(self) -> None:
+        captured = await self._warnings(_job(**_BOUND))
+
+        assert not [line for line in captured if "origin channel/chat" in line]
+
+
+class TestUnboundRunsSweepTheirOwnLitter:
+    @pytest.mark.asyncio
+    async def test_each_unbound_run_asks_for_a_sweep(self) -> None:
+        agent = _Agent()
+
+        await run_cron_job(_job(), agent=agent, cron=_Recorder())
+
+        assert agent.sessions.prune_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_bound_runs_do_not_create_run_sessions(self) -> None:
+        agent = _Agent()
+
+        await run_cron_job(_job(**_BOUND), agent=agent, cron=_Recorder())
+
+        assert agent.sessions.prune_calls == 0

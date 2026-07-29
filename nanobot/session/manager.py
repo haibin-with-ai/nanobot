@@ -947,18 +947,30 @@ class SessionManager:
             return {"keys": keys, "count": len(keys), "bytes": total_bytes}
 
         deleted: list[str] = []
-        for key, _ in expired:
-            try:
-                self.delete_session(key)
-            except OSError as exc:
-                # A stuck file must not stop the sweep, nor the cron run that
-                # triggered it.
-                logger.warning("Session prune failed for {}: {}", key, exc)
+        freed_bytes = 0
+        for key, path in expired:
+            size = 0
+            with suppress(OSError):
+                size = path.stat().st_size
+            # delete_session 自己吞掉 OSError 并返回 False，别再套一层假的 except。
+            if not self.delete_session(key):
+                logger.warning("Session prune failed for {}", key)
                 continue
             deleted.append(key)
+            freed_bytes += size
         if deleted:
             logger.info("Session prune: removed {} cron run sessions", len(deleted))
-        return {"keys": deleted, "count": len(deleted), "bytes": total_bytes}
+        return {"keys": deleted, "count": len(deleted), "bytes": freed_bytes}
+
+    def maybe_prune_cron_run_sessions(self, *, min_interval_s: float = 86_400.0) -> None:
+        """长期不重启的实例也要清理，但一天最多扫一次。"""
+        now = time.monotonic()
+        last = getattr(self, "_last_cron_prune_at", None)
+        if last is not None and now - last < min_interval_s:
+            return
+        self._last_cron_prune_at = now
+        with suppress(Exception):
+            self.prune_cron_run_sessions()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

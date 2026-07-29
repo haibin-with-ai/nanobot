@@ -337,3 +337,121 @@ async def test_stream_non_auth_error_does_not_refresh(
 
     assert len(fake.calls) == 1
     assert result.finish_reason == "error"
+
+
+# ---------------------------------------------------------------------------
+# 流式 401 自愈：只在还没吐字时重试，否则用户会看到重复输出
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedStream:
+    """先吐若干 text_delta，再按脚本抛错或正常收尾。"""
+
+    def __init__(self, deltas: list[str], error: Exception | None) -> None:
+        self._deltas = deltas
+        self._error = error
+
+    async def __aenter__(self) -> "_ScriptedStream":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    def __aiter__(self) -> "_ScriptedStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        from types import SimpleNamespace
+
+        if self._deltas:
+            text = self._deltas.pop(0)
+            return SimpleNamespace(
+                type="content_block_delta",
+                index=0,
+                delta=SimpleNamespace(type="text_delta", text=text),
+            )
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise error
+        raise StopAsyncIteration
+
+    async def get_final_message(self) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            model="claude-opus-4-6",
+        )
+
+
+class _StreamingMessages:
+    def __init__(self, scripts: list[tuple[list[str], Exception | None]]) -> None:
+        self._scripts = scripts
+        self.calls: list[dict[str, Any]] = []
+
+    def stream(self, **kwargs: Any) -> _ScriptedStream:
+        self.calls.append(kwargs)
+        deltas, error = self._scripts.pop(0)
+        if error is not None and not deltas:
+            raise error
+        return _ScriptedStream(list(deltas), error)
+
+
+def _refresh_always(monkeypatch) -> list[bool]:
+    seen: list[bool] = []
+
+    def _get_token(self, force_refresh: bool = False, min_ttl_ms: int = 0):
+        seen.append(force_refresh)
+        return OAuthCredentials("new-token", "r", 0, "acct")
+
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.OAuthCredentialStore.get_token", _get_token
+    )
+    return seen
+
+
+async def test_stream_401_before_any_output_is_retried(
+    oauth_provider, monkeypatch, spy_client
+) -> None:
+    refreshed = _refresh_always(monkeypatch)
+    fake = _StreamingMessages([([], _AuthError("401")), ([], None)])
+    oauth_provider._client.messages = fake
+    spy_client["spy"].messages_slot = fake
+
+    chunks: list[str] = []
+
+    async def _sink(text: str) -> None:
+        chunks.append(text)
+
+    result = await oauth_provider.chat_stream(
+        messages=[{"role": "user", "content": "hi"}], on_content_delta=_sink
+    )
+
+    assert refreshed == [True]
+    assert len(fake.calls) == 2
+    assert result.finish_reason == "stop"
+
+
+async def test_stream_401_after_output_is_not_retried(
+    oauth_provider, monkeypatch, spy_client
+) -> None:
+    refreshed = _refresh_always(monkeypatch)
+    fake = _StreamingMessages([(["前半段"], _AuthError("401")), ([], None)])
+    oauth_provider._client.messages = fake
+    spy_client["spy"].messages_slot = fake
+
+    chunks: list[str] = []
+
+    async def _sink(text: str) -> None:
+        chunks.append(text)
+
+    result = await oauth_provider.chat_stream(
+        messages=[{"role": "user", "content": "hi"}], on_content_delta=_sink
+    )
+
+    assert chunks == ["前半段"]
+    assert len(fake.calls) == 1
+    assert refreshed == []
+    assert result.finish_reason == "error"
