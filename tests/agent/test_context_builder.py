@@ -101,7 +101,7 @@ class TestLoadBootstrapFiles:
         assert "Soul." in result
 
     def test_all_bootstrap_files_enter_context_in_required_order(self, tmp_path):
-        expected_files = ["SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md"]
+        expected_files = ["SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md"]
         for name in expected_files:
             (tmp_path / name).write_text(f"unique content from {name}", encoding="utf-8")
 
@@ -419,3 +419,74 @@ class TestBuildMessages:
         user_msg = messages[-1]["content"]
         assert isinstance(user_msg, list)
         assert any(b.get("type") == "image_url" for b in user_msg)
+
+
+class TestSoulFirstAndAnchor:
+    """SOUL must outrank AGENTS/USER, and its core must survive to the prompt tail."""
+
+    def _workspace(self, tmp_path):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "SOUL.md").write_text(
+            "# Soul\n\n" + ("persona detail line\n" * 60) + "\n## Prime Directive\n\n"
+            "haibin's time is the scarcest resource.\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "USER.md").write_text("# User\n\nlives in GMT+8\n", encoding="utf-8")
+        (tmp_path / "AGENTS.md").write_text("# Agents\n\nreminder rules\n", encoding="utf-8")
+        (tmp_path / "TOOLS.md").write_text("# Tools\n\ntmp file rules\n", encoding="utf-8")
+        return tmp_path
+
+    def test_bootstrap_order_is_soul_agents_user_tools(self, tmp_path):
+        builder = ContextBuilder(self._workspace(tmp_path))
+        text = builder._load_bootstrap_files(tmp_path)
+        positions = [text.index(f"## {name}") for name in ("SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md")]
+        assert positions == sorted(positions)
+
+    def test_soul_anchor_is_appended_once_and_stays_small(self, tmp_path):
+        workspace = self._workspace(tmp_path)
+        builder = ContextBuilder(workspace)
+        prompt = builder.build_system_prompt(include_memory_recent_history=False)
+        soul = (workspace / "SOUL.md").read_text(encoding="utf-8")
+
+        anchor = builder._build_soul_anchor(workspace)
+        assert anchor, "expected a soul anchor"
+        assert "Prime Directive" in anchor
+        assert "haibin's time is the scarcest resource." in anchor
+        assert len(anchor) <= len(soul) * 0.30
+        assert prompt.rstrip().endswith(anchor.rstrip())
+        # The anchor repeats the directive on purpose; it must not repeat itself.
+        assert prompt.count("# Remember") == 1
+        assert prompt.count("## Prime Directive") == 2
+        assert "persona detail line" not in anchor
+
+    def test_missing_soul_degrades_without_anchor(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("# Agents\n\nrules\n", encoding="utf-8")
+        builder = ContextBuilder(tmp_path)
+        assert builder._build_soul_anchor(tmp_path) == ""
+        prompt = builder.build_system_prompt(include_memory_recent_history=False)
+        assert "Prime Directive" not in prompt
+
+    def test_anchor_reads_the_workspace_it_is_given(self, tmp_path):
+        """The override argument must not be silently ignored."""
+        other = self._workspace(tmp_path / "other")
+        builder = ContextBuilder(tmp_path / "empty")
+        assert builder._build_soul_anchor() == ""
+        assert "scarcest resource" in builder._build_soul_anchor(other)
+
+    def test_soul_without_prime_directive_yields_no_anchor(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("# Soul\n\njust a voice section\n", encoding="utf-8")
+        builder = ContextBuilder(tmp_path)
+        assert builder._build_soul_anchor(tmp_path) == ""
+
+
+class TestDiscordFormatHint:
+    def test_discord_hint_forbids_pipe_tables(self, tmp_path):
+        builder = ContextBuilder(tmp_path)
+        identity = builder._get_identity(channel="discord", workspace=tmp_path)
+        assert "Format Hint" in identity
+        assert "|" in identity and "table" in identity.lower()
+
+    def test_non_messaging_channel_keeps_upstream_hints(self, tmp_path):
+        builder = ContextBuilder(tmp_path)
+        assert "Format Hint" in builder._get_identity(channel="email", workspace=tmp_path)
+        assert "## External Content" in builder._get_identity(channel="cli", workspace=tmp_path)

@@ -516,6 +516,29 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
+    _PROFILE_FILES = ("SOUL.md", "TOOLS.md")
+
+    def _load_profile_files(self) -> str:
+        """Voice and tool constraints the main agent runs under, for subagents too."""
+        from nanobot.utils.helpers import load_bundled_template
+
+        parts: list[str] = []
+        for filename in self._PROFILE_FILES:
+            path = self.workspace / filename
+            if not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if not content:
+                continue
+            # An untouched default carries no information worth the tokens.
+            if content == (load_bundled_template(filename) or "").strip():
+                continue
+            parts.append(f"## {filename}\n\n{content}")
+        return "\n\n".join(parts)
+
     def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.skills import SkillsLoader
@@ -526,13 +549,15 @@ class SubagentManager:
             self.workspace,
             disabled_skills=self.disabled_skills,
         ).build_skills_summary()
-        return render_template(
+        prompt = render_template(
             "agent/subagent_system.md",
             workspace=str(project_workspace),
             agent_workspace=str(agent_workspace),
             history_log=str(agent_workspace / "memory" / "history.jsonl"),
             skills_summary=skills_summary or "",
         )
+        profile = self._load_profile_files()
+        return f"{prompt}\n\n---\n\n{profile}" if profile else prompt
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
