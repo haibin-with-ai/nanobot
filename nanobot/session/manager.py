@@ -17,6 +17,7 @@ from weakref import WeakValueDictionary
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_HISTORY_META,
     public_history_message,
@@ -292,6 +293,8 @@ class Session:
         self.last_consolidated = 0
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
+        # A model override belongs to the conversation that asked for it.
+        self.metadata.pop(SESSION_MODEL_PRESET_METADATA_KEY, None)
 
     def retain_recent_legal_suffix(
         self,
