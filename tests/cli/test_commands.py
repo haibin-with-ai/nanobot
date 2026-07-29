@@ -1935,11 +1935,7 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
     class _FakeCron:
         def __init__(self, _store_path: Path) -> None:
             self.on_job = None
-            self.records = []
             seen["cron"] = self
-
-        def write_run_record(self, run_id, record) -> None:
-            self.records.append((run_id, dict(record)))
 
         def status(self) -> dict[str, int]:
             return {"jobs": 0}
@@ -2603,7 +2599,11 @@ def test_gateway_unbound_agent_cron_uses_isolated_session(
     class _FakeCron:
         def __init__(self, _store_path: Path) -> None:
             self.on_job = None
+            self.records = []
             seen["cron"] = self
+
+        def write_run_record(self, run_id, record) -> None:
+            self.records.append((run_id, dict(record)))
 
     class _FakeAgentLoop:
         @classmethod
