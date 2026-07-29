@@ -243,3 +243,97 @@ async def test_refresh_failure_returns_original_error(
 
     assert result.finish_reason == "error"
     assert "401" in (result.content or "")
+
+
+# ---------------------------------------------------------------------------
+# 流式路径同样要自愈：runner 主链路走的是 chat_stream，不是 chat
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamCtx:
+    def __init__(self, outcome: Any) -> None:
+        self._outcome = outcome
+
+    async def __aenter__(self) -> Any:
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def get_final_message(self) -> Any:
+        return self._outcome
+
+
+class _FakeStreamMessages:
+    def __init__(self, outcomes: list[Any]) -> None:
+        self._outcomes = outcomes
+        self.calls: list[dict[str, Any]] = []
+
+    def stream(self, **kwargs: Any) -> _FakeStreamCtx:
+        self.calls.append(kwargs)
+        return _FakeStreamCtx(self._outcomes.pop(0))
+
+
+def _attach_stream(provider: Any, spy: dict[str, Any], outcomes: list[Any]) -> _FakeStreamMessages:
+    fake = _FakeStreamMessages(outcomes)
+    spy["spy"].messages_slot = fake
+    provider._client.messages = fake
+    return fake
+
+
+async def test_stream_auth_error_triggers_refresh_and_retry(
+    oauth_provider, monkeypatch, spy_client
+) -> None:
+    refreshed: list[bool] = []
+
+    def _get_token(self, force_refresh: bool = False, min_ttl_ms: int = 0):
+        refreshed.append(force_refresh)
+        return OAuthCredentials("new-token", "r", 0, "acct")
+
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.OAuthCredentialStore.get_token", _get_token
+    )
+    fake = _attach_stream(
+        oauth_provider, spy_client, [_AuthError("401 unauthorized"), _stub_response()]
+    )
+
+    result = await oauth_provider.chat_stream(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.content == "ok"
+    assert refreshed == [True]
+    assert len(fake.calls) == 2
+    assert spy_client["auth_token"] == "new-token"
+
+
+async def test_stream_refresh_happens_only_once(
+    oauth_provider, monkeypatch, spy_client
+) -> None:
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.OAuthCredentialStore.get_token",
+        lambda self, force_refresh=False, min_ttl_ms=0: OAuthCredentials("new", "r", 0, "a"),
+    )
+    fake = _attach_stream(oauth_provider, spy_client, [_AuthError("401"), _AuthError("401 again")])
+
+    result = await oauth_provider.chat_stream(messages=[{"role": "user", "content": "hi"}])
+
+    assert len(fake.calls) == 2
+    assert result.finish_reason == "error"
+
+
+async def test_stream_non_auth_error_does_not_refresh(
+    oauth_provider, monkeypatch, spy_client
+) -> None:
+    def _boom(self, force_refresh: bool = False, min_ttl_ms: int = 0):
+        raise AssertionError("500 不该触发刷新")
+
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.OAuthCredentialStore.get_token", _boom
+    )
+    fake = _attach_stream(oauth_provider, spy_client, [_ServerError("500 boom")])
+
+    result = await oauth_provider.chat_stream(messages=[{"role": "user", "content": "hi"}])
+
+    assert len(fake.calls) == 1
+    assert result.finish_reason == "error"
