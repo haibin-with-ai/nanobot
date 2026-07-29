@@ -2680,7 +2680,7 @@ def test_gateway_unbound_agent_cron_uses_isolated_session(
     asyncio.run(cron.on_job(job))
 
     session_key, preset = seen["cron_preset"]
-    assert str(session_key).startswith("cron:job-unbound:")
+    assert str(session_key).startswith("cron:cron-1:")
     assert preset == "deep"
     assert seen["cron_direct"]["session_key"] == session_key
     assert cron.records[-1][1]["status"] == "ok"
