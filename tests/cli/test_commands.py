@@ -1935,7 +1935,11 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
     class _FakeCron:
         def __init__(self, _store_path: Path) -> None:
             self.on_job = None
+            self.records = []
             seen["cron"] = self
+
+        def write_run_record(self, run_id, record) -> None:
+            self.records.append((run_id, dict(record)))
 
         def status(self) -> dict[str, int]:
             return {"jobs": 0}
@@ -2546,7 +2550,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
 
 
-def test_gateway_unbound_agent_cron_is_skipped(
+def test_gateway_unbound_agent_cron_uses_isolated_session(
     monkeypatch, tmp_path: Path
 ) -> None:
     config_file = tmp_path / "instance" / "config.json"
@@ -2611,8 +2615,13 @@ def test_gateway_unbound_agent_cron_is_skipped(
             self.tools = {}
             seen["agent"] = self
 
-        async def process_direct(self, *_args, **_kwargs):
-            raise AssertionError("unbound cron job must not use process_direct")
+        def set_session_model_preset(self, session_key, name):
+            seen["cron_preset"] = (session_key, name)
+            return object()
+
+        async def process_direct(self, *_args, **kwargs):
+            seen["cron_direct"] = kwargs
+            return OutboundMessage(channel="cron", chat_id="job-unbound", content="done")
 
         async def submit_cron_turn(self, _msg: InboundMessage):
             raise AssertionError("unbound cron job must not run as a bound cron turn")
@@ -2667,10 +2676,14 @@ def test_gateway_unbound_agent_cron_is_skipped(
         ),
     )
 
-    # Diverges from upstream: an unbound job runs in a session of its own
-    # rather than being skipped.
+    # Diverges from upstream: an unbound job runs in a session of its own.
     asyncio.run(cron.on_job(job))
 
+    session_key, preset = seen["cron_preset"]
+    assert str(session_key).startswith("cron:job-unbound:")
+    assert preset == "deep"
+    assert seen["cron_direct"]["session_key"] == session_key
+    assert cron.records[-1][1]["status"] == "ok"
     bus.publish_outbound.assert_not_awaited()
 
 
