@@ -42,12 +42,13 @@ class _Provider:
         return self._responses.pop(0)
 
 
-def _spec(provider: _Provider, **kwargs):
+def _spec(provider, **kwargs):
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="")
     real = MagicMock(spec=LLMProvider)
     real.chat_with_retry = provider.chat_with_retry
+    real.model_attempt_budget = getattr(provider, "model_attempt_budget", 1)
     return make_run_spec(
         real,
         initial_messages=[{"role": "user", "content": "hi"}],
@@ -118,3 +119,33 @@ class TestPhaseThreeGivesUp:
 
         assert result.stop_reason == "error"
         assert len(provider.seen) == 1
+
+
+class TestOuterTimeoutCoversTheWholeModelChain:
+    """外层墙钟预算要按候选模型数放大，否则慢的主模型会把备用模型一起掐掉。"""
+
+    @pytest.mark.asyncio
+    async def test_slow_primary_does_not_cancel_the_fallback(self) -> None:
+        import asyncio
+
+        from nanobot.agent.runner import AgentRunner
+
+        class _Chain:
+            model_attempt_budget = 2
+
+            def __init__(self) -> None:
+                self.seen: list[list[dict]] = []
+
+            async def chat_with_retry(self, *, messages, **_kwargs) -> LLMResponse:
+                self.seen.append([dict(m) for m in messages])
+                if len(self.seen) == 1:
+                    await asyncio.sleep(0.25)
+                    return _ok("primary late")
+                return _ok("fallback ok")
+
+        provider = _Chain()
+        spec = _spec(provider, llm_timeout_s=0.2)
+
+        result = await AgentRunner().run(spec)
+
+        assert result.final_content == "primary late"

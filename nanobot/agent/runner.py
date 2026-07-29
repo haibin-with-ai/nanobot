@@ -972,10 +972,15 @@ class AgentRunner:
         # timeout for streaming while preserving NANOBOT_LLM_TIMEOUT_S=0 as an
         # opt-out for all LLM wall-clock timeouts.
         is_streaming_request = wants_streaming or wants_progress_streaming
+        # 一次调用可能依次试多个模型，墙钟预算要覆盖整条链，
+        # 否则慢的主模型会把后面的备用模型一起取消掉。
+        attempts = max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1)))
         outer_timeout_s = (
-            max(300.0, timeout_s * 2)
+            max(300.0, timeout_s * 2) * attempts
             if is_streaming_request and timeout_s is not None
-            else timeout_s
+            else timeout_s * attempts
+            if timeout_s is not None
+            else None
         )
         try:
             response = (

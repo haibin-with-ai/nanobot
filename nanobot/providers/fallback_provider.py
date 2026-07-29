@@ -148,6 +148,11 @@ class FallbackProvider(LLMProvider):
     def supports_progress_deltas(self) -> bool:
         return bool(getattr(self._primary, "supports_progress_deltas", False))
 
+    @property
+    def model_attempt_budget(self) -> int:
+        """一次请求最多会试几个模型，供调用方计算墙钟预算。"""
+        return 1 + len(self._fallback_presets)
+
     def _primary_key(self, model: str) -> tuple[str, str]:
         label = getattr(self._primary, "name", None) or type(self._primary).__name__
         return (str(label), model)
