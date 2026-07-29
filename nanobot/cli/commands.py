@@ -1621,9 +1621,8 @@ def _run_gateway(
     from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.watcher import watch_config_file
-    from nanobot.cron.bound_runner import run_bound_cron_job
-    from nanobot.cron.service import CronJobSkippedError, CronService
-    from nanobot.cron.session_turns import is_bound_cron_job
+    from nanobot.cron.bound_runner import run_cron_job
+    from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.providers.factory import (
         build_provider_snapshot,
@@ -1944,17 +1943,7 @@ def _run_gateway(
                 logger.info("Heartbeat: silenced by post-run evaluation")
             return response
 
-        if is_bound_cron_job(job):
-            return await run_bound_cron_job(job, agent=agent, cron=cron)
-
-        reason = "unbound agent cron job must be recreated from a chat session"
-        logger.warning(
-            "Cron: skipped unbound agent job '{}' ({}): {}",
-            job.name,
-            job.id,
-            reason,
-        )
-        raise CronJobSkippedError(reason)
+        return await run_cron_job(job, agent=agent, cron=cron)
 
     cron.on_job = on_cron_job
 
