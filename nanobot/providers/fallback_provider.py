@@ -20,7 +20,13 @@ _FALLBACK_ERROR_KINDS = frozenset({
     "server_error",
     "rate_limit",
     "overloaded",
+    # 与上游相反：模型拒答换一个模型再问，不当作终态。
+    "refusal",
 })
+# 限流冷却：命中后这一档模型暂时不再排进候选。
+QUOTA_COOLDOWN_DEFAULT_S = 600.0
+QUOTA_COOLDOWN_MIN_S = 60.0
+QUOTA_COOLDOWN_MAX_S = 1800.0
 _AUTHENTICATION_ERROR_KINDS = frozenset({
     "authentication",
     "auth",
@@ -52,7 +58,6 @@ _AUTHENTICATION_ERROR_TOKENS = (
 )
 _NON_FALLBACK_ERROR_KINDS = frozenset({
     "content_filter",
-    "refusal",
     "context_length",
     "invalid_request",
 })
@@ -112,6 +117,7 @@ class FallbackProvider(LLMProvider):
         fallback_presets: list[Any],
         provider_factory: Callable[[Any], LLMProvider],
         fallback_model_observer: FallbackModelObserver | None = None,
+        clock: Callable[[], float] | None = None,
     ):
         self._primary = primary
         self._fallback_presets = list(fallback_presets)
@@ -120,6 +126,8 @@ class FallbackProvider(LLMProvider):
         self._has_fallbacks = bool(fallback_presets)
         self._primary_failures = 0
         self._primary_tripped_at: float | None = None
+        self._clock = clock or time.monotonic
+        self._quota_cooldowns: dict[tuple[str, str], float] = {}
 
     @property
     def generation(self):
@@ -139,6 +147,45 @@ class FallbackProvider(LLMProvider):
     @property
     def supports_progress_deltas(self) -> bool:
         return bool(getattr(self._primary, "supports_progress_deltas", False))
+
+    def _primary_key(self, model: str) -> tuple[str, str]:
+        label = getattr(self._primary, "name", None) or type(self._primary).__name__
+        return (str(label), model)
+
+    @staticmethod
+    def _preset_key(preset: Any) -> tuple[str, str]:
+        return (str(getattr(preset, "provider", "") or ""), preset.model)
+
+    def _cooldown_remaining(self, key: tuple[str, str]) -> float:
+        until = self._quota_cooldowns.get(key)
+        if until is None:
+            return 0.0
+        remaining = until - self._clock()
+        if remaining <= 0:
+            self._quota_cooldowns.pop(key, None)
+            return 0.0
+        return remaining
+
+    def _cooling_down(self, primary_model: str) -> set[tuple[str, str]]:
+        """Keys to skip this turn; if everything is cooling, keep the freest one."""
+        keys = [self._primary_key(primary_model)]
+        keys += [self._preset_key(preset) for preset in self._fallback_presets]
+        remaining = {key: self._cooldown_remaining(key) for key in keys}
+        cooling = {key for key, value in remaining.items() if value > 0}
+        if len(cooling) < len(remaining):
+            return cooling
+        freest = min(remaining, key=lambda key: remaining[key])
+        return set(remaining) - {freest}
+
+    def _note_quota_cooldown(self, key: tuple[str, str], response: LLMResponse) -> None:
+        retry_after = LLMProvider._extract_retry_after_from_response(response)
+        if retry_after is None and response.error_status_code != 429:
+            return
+        wait = min(max(retry_after or QUOTA_COOLDOWN_DEFAULT_S, QUOTA_COOLDOWN_MIN_S), QUOTA_COOLDOWN_MAX_S)
+        self._quota_cooldowns[key] = self._clock() + wait
+        logger.warning(
+            "Model '{}' rate limited; cooling it down for {}s", key[1], int(wait)
+        )
 
     def _primary_available(self) -> bool:
         """Return True if the primary provider is not currently tripped."""
@@ -188,8 +235,10 @@ class FallbackProvider(LLMProvider):
         primary_model = kwargs.get("model") or self._primary.get_default_model()
         primary_was_attempted = False
         primary_error = "unknown error"
+        cooling = self._cooling_down(primary_model)
+        primary_key = self._primary_key(primary_model)
 
-        if self._primary_available():
+        if self._primary_available() and primary_key not in cooling:
             primary_was_attempted = True
             response = await call(self._primary, kwargs)
             if response.finish_reason != "error":
@@ -197,6 +246,7 @@ class FallbackProvider(LLMProvider):
                 self._primary_tripped_at = None
                 return response
             primary_error = (response.content or primary_error)[:120]
+            self._note_quota_cooldown(primary_key, response)
 
             if has_streamed is not None and has_streamed[0]:
                 is_timeout = (response.error_kind or "").lower() == "timeout"
@@ -239,6 +289,10 @@ class FallbackProvider(LLMProvider):
         primary_skipped = not primary_was_attempted
         for idx, fallback in enumerate(self._fallback_presets):
             fallback_model = fallback.model
+            fallback_key = self._preset_key(fallback)
+            if fallback_key in cooling:
+                logger.debug("Fallback '{}' still cooling down; skipping", fallback_model)
+                continue
             if has_streamed is not None and has_streamed[0]:
                 is_timeout = (
                     last_response is not None
@@ -307,6 +361,7 @@ class FallbackProvider(LLMProvider):
                 return fallback_response
 
             last_response = fallback_response
+            self._note_quota_cooldown(fallback_key, fallback_response)
             logger.warning(
                 "Fallback '{}' also failed: {}",
                 fallback_model,

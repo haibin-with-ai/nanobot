@@ -675,12 +675,15 @@ class AnthropicProvider(LLMProvider):
             if cache_read:
                 usage["cached_tokens"] = cache_read
 
+        # 拒答按可切换错误上报，fallback 才能换个模型再问。
+        error_kind = "refusal" if finish_reason == "refusal" else None
         return LLMResponse(
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
-            finish_reason=finish_reason,
+            finish_reason="error" if error_kind else finish_reason,
             usage=usage,
             thinking_blocks=thinking_blocks or None,
+            error_kind=error_kind,
         )
 
     # ------------------------------------------------------------------
