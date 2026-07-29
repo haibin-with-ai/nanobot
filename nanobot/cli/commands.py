@@ -1695,6 +1695,10 @@ def _run_gateway(
             console.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1) from exc
     session_manager = SessionManager(config.workspace_path)
+    # Unbound cron runs each leave a session file behind; sweep once at startup
+    # so they cannot accumulate unbounded.
+    with suppress(OSError):
+        session_manager.prune_cron_run_sessions()
 
     # Self-heal the gateway state file with the current PID after any restart.
     from nanobot.config.loader import get_config_path
