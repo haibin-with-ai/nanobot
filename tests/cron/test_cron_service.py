@@ -143,7 +143,9 @@ def test_write_run_record_uses_cron_runs_dir(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unbound_agent_jobs_are_disabled_on_add(tmp_path) -> None:
+async def test_unbound_agent_jobs_run_in_their_own_session(tmp_path) -> None:
+    """Diverges from upstream: this fork runs unbound jobs in a per-run session,
+    so a missing binding is a legal state rather than a defect."""
     called: list[str] = []
 
     async def on_job(job):
@@ -159,15 +161,14 @@ async def test_unbound_agent_jobs_are_disabled_on_add(tmp_path) -> None:
         message="hello",
     )
 
-    assert job.enabled is False
-    assert job.state.next_run_at_ms is None
-    assert job.state.last_status == "error"
-    assert "missing bound session delivery context" in (job.state.last_error or "")
-    assert await service.run_job(job.id, force=True) is False
-    assert called == []
+    assert job.enabled is True
+    assert job.state.next_run_at_ms is not None
+    assert job.state.last_status != "error"
+    assert await service.run_job(job.id, force=True) is True
+    assert called == [job.id]
 
 
-def test_unbound_agent_jobs_are_disabled_on_load(tmp_path) -> None:
+def test_unbound_agent_jobs_stay_enabled_on_load(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     store_path.parent.mkdir(parents=True)
     store_path.write_text(
@@ -197,10 +198,9 @@ def test_unbound_agent_jobs_are_disabled_on_load(tmp_path) -> None:
     job = CronService(store_path).get_job("unbound-1")
 
     assert job is not None
-    assert job.enabled is False
-    assert job.state.next_run_at_ms is None
-    assert job.state.last_status == "error"
-    assert "missing bound session delivery context" in (job.state.last_error or "")
+    assert job.enabled is True
+    assert job.state.next_run_at_ms == 1
+    assert job.state.last_status != "error"
 
 
 def test_add_job_migrates_legacy_delivery_context(tmp_path) -> None:
