@@ -65,6 +65,31 @@ class TestModelReachesTheStoredJob:
         assert reloaded is not None and reloaded.payload.model == "fast"
 
 
+class TestModelSurvivesAStoreRewrite:
+    """Any full store rewrite must carry the model, or a restart silently
+    downgrades every per-job preset back to the cron default."""
+
+    def _seed(self, path) -> str:
+        return CronService(path).add_job(
+            name="nightly",
+            message="ping",
+            schedule=CronSchedule(kind="every", every_ms=60_000),
+            model="fast",
+        ).id
+
+    def _rewrite(self, path, job_id: str) -> None:
+        service = CronService(path)
+        assert service.get_job(job_id) is not None  # forces the lazy load
+        service._save_store()
+
+    def test_rewritten_file_still_carries_the_model(self, tmp_path):
+        path = _store(tmp_path)
+        job_id = self._seed(path)
+        self._rewrite(path, job_id)
+        payloads = {j["id"]: j["payload"] for j in json.loads(path.read_text())["jobs"]}
+        assert payloads[job_id].get("model") == "fast"
+
+
 class TestUnboundJobsStayEnabled:
     def test_adding_an_unbound_agent_job_keeps_it_enabled(self, tmp_path):
         service = CronService(_store(tmp_path))
