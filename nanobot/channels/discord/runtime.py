@@ -885,11 +885,20 @@ class DiscordChannel(BaseChannel):
             if message.reference and message.reference.message_id
             else None
         )
-        return {
+        metadata = {
             "message_id": str(message.id),
             "guild_id": str(message.guild.id) if message.guild else None,
             "reply_to": reply_to,
         }
+        # Human-readable identity for the runtime context block. DM channels
+        # have no name, so the key is dropped rather than filled with a stand-in.
+        sender_name = getattr(message.author, "display_name", None)
+        if sender_name:
+            metadata["sender_name"] = sender_name
+        channel_name = getattr(message.channel, "name", None)
+        if channel_name:
+            metadata["channel_name"] = channel_name
+        return metadata
 
     def _should_respond_in_group(self, message: discord.Message, content: str) -> bool:
         """Check if the bot should respond in a guild channel based on policy."""

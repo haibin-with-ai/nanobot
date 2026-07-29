@@ -24,6 +24,7 @@ from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
+from nanobot.agent.identity_context import build_identity_context_provider
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
@@ -457,7 +458,7 @@ class AgentLoop:
             config,
             provider_snapshot_loader,
         )
-        return cls(
+        loop = cls(
             bus=bus,
             provider=provider,
             workspace=config.workspace_path,
@@ -488,6 +489,12 @@ class AgentLoop:
             preset_snapshot_loader=preset_snapshot_loader,
             **extra,
         )
+        # Identity is channel-agnostic, so it is wired once here at assembly
+        # rather than imposed on every embedder that constructs a loop directly.
+        loop.register_runtime_context_provider(
+            build_identity_context_provider(defaults.timezone)
+        )
+        return loop
 
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
