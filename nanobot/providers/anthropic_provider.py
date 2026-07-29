@@ -73,20 +73,43 @@ class AnthropicProvider(LLMProvider):
         self.extra_headers = extra_headers or {}
         self.product_mode = product_mode
 
+        self._client = self._new_client()
+
+    def _client_kwargs(self, credential: str | None = None) -> dict[str, Any]:
+        """所有 client 都从这里出生：刷新令牌和 stall 重建不能各写一份。"""
+        key = self.api_key if credential is None else credential
+        # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
+        client_kw: dict[str, Any] = {"max_retries": 0}
+        if key:
+            # OAuth 凭据是 bearer token，走 api_key 会被当成 x-api-key 发出去。
+            key_field = "auth_token" if self.product_mode == "claude_code" else "api_key"
+            client_kw[key_field] = key
+        if self.api_base:
+            client_kw["base_url"] = self._normalize_base_url(self.api_base)
+        if self.extra_headers:
+            client_kw["default_headers"] = self.extra_headers
+        return client_kw
+
+    def _new_client(self, credential: str | None = None) -> Any:
         import anthropic
 
-        client_kw: dict[str, Any] = {}
-        if api_key:
-            # OAuth 凭据是 bearer token，走 api_key 会被当成 x-api-key 发出去。
-            key_field = "auth_token" if product_mode == "claude_code" else "api_key"
-            client_kw[key_field] = api_key
-        if api_base:
-            client_kw["base_url"] = self._normalize_base_url(api_base)
-        if extra_headers:
-            client_kw["default_headers"] = extra_headers
-        # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
-        client_kw["max_retries"] = 0
-        self._client = anthropic.AsyncAnthropic(**client_kw)
+        return anthropic.AsyncAnthropic(**self._client_kwargs(credential))
+
+    async def _reset_client(self) -> None:
+        """Stall 之后旧连接可能半死，换一个；重建失败保留原 client。"""
+        stale = self._client
+        try:
+            self._client = self._new_client()
+        except Exception as exc:
+            logger.warning("Anthropic client reset failed: {}", exc)
+            return
+        close = getattr(stale, "close", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception as exc:
+            logger.debug("Closing the stale Anthropic client failed: {}", exc)
 
     @staticmethod
     def _normalize_base_url(api_base: str) -> str:
@@ -722,14 +745,7 @@ class AnthropicProvider(LLMProvider):
         return True
 
     def _rebuild_client(self, token: str) -> None:
-        import anthropic
-
-        client_kw: dict[str, Any] = {"auth_token": token, "max_retries": 0}
-        if self.api_base:
-            client_kw["base_url"] = self.api_base
-        if self.extra_headers:
-            client_kw["default_headers"] = self.extra_headers
-        self._client = anthropic.AsyncAnthropic(**client_kw)
+        self._client = self._new_client(token)
 
     async def chat(
         self,
@@ -800,6 +816,7 @@ class AnthropicProvider(LLMProvider):
                 on_tool_call_delta,
             )
         except asyncio.TimeoutError:
+            await self._reset_client()
             return LLMResponse(
                 content=(
                     f"Error calling LLM: stream stalled for more than "

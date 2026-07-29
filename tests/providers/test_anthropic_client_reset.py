@@ -1,0 +1,150 @@
+"""Stall 之后换一个 Anthropic client：旧连接可能已经半死。"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from nanobot.providers.anthropic_provider import AnthropicProvider
+
+
+class _StallingMessages:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(self, **_kwargs: Any):
+        self.calls += 1
+        raise asyncio.TimeoutError
+
+
+class _OkMessages:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(self, **_kwargs: Any):
+        self.calls += 1
+        return _OkStream()
+
+
+class _OkStream:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def get_final_message(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id="msg_1",
+            type="message",
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="ok")],
+            usage=None,
+        )
+
+
+class _FakeClient:
+    def __init__(self, messages: Any) -> None:
+        self.messages = messages
+        self.closed = 0
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+@pytest.fixture
+def provider() -> AnthropicProvider:
+    return AnthropicProvider(api_key="k", api_base="https://example.test/v1")
+
+
+async def _ask(provider: AnthropicProvider):
+    return await provider.chat_stream(messages=[{"role": "user", "content": "hi"}])
+
+
+class TestClientResetOnStall:
+    @pytest.mark.asyncio
+    async def test_stall_swaps_in_a_fresh_client(self, provider, monkeypatch) -> None:
+        stale = _FakeClient(_StallingMessages())
+        fresh = _FakeClient(_OkMessages())
+        provider._client = stale
+        monkeypatch.setattr(provider, "_new_client", lambda: fresh)
+
+        result = await _ask(provider)
+
+        assert result.error_kind == "timeout"
+        assert provider._client is fresh
+        assert stale.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_reset_failure_does_not_mask_the_stall(self, provider, monkeypatch) -> None:
+        stale = _FakeClient(_StallingMessages())
+        provider._client = stale
+
+        def _explode() -> None:
+            raise RuntimeError("cannot rebuild")
+
+        monkeypatch.setattr(provider, "_new_client", _explode)
+
+        result = await _ask(provider)
+
+        assert result.finish_reason == "error"
+        assert result.error_kind == "timeout"
+        assert provider._client is stale
+
+    @pytest.mark.asyncio
+    async def test_healthy_stream_keeps_its_client(self, provider, monkeypatch) -> None:
+        healthy = _FakeClient(_OkMessages())
+        provider._client = healthy
+        monkeypatch.setattr(
+            provider, "_new_client", lambda: pytest.fail("不该重建 client")
+        )
+
+        result = await _ask(provider)
+
+        assert result.content == "ok"
+        assert provider._client is healthy
+        assert healthy.closed == 0
+
+
+class TestClientKwargsAreBuiltOnce:
+    def test_refresh_path_reuses_the_normalized_base_url(self, provider) -> None:
+        kwargs = provider._client_kwargs("new-token")
+
+        assert kwargs["base_url"] == "https://example.test"
+        assert kwargs["max_retries"] == 0
+
+    def test_claude_code_credentials_go_to_auth_token(self) -> None:
+        claude_code = AnthropicProvider(api_key="tok", product_mode="claude_code")
+
+        kwargs = claude_code._client_kwargs()
+
+        assert kwargs["auth_token"] == "tok"
+        assert "api_key" not in kwargs
+
+
+class TestToolIdLengthCap:
+    """Anthropic 的 tool id 有 64 字符硬上限，超长要摘要成合法 id。"""
+
+    def test_long_but_legal_ids_are_shortened(self) -> None:
+        from nanobot.providers.anthropic_provider import _MAX_TOOL_ID_LEN, _sanitize_tool_id
+
+        long_id = "toolu_" + "a" * 200
+        result = _sanitize_tool_id(long_id)
+
+        assert len(result) <= _MAX_TOOL_ID_LEN
+        assert result != long_id
+
+    def test_the_same_id_always_maps_to_the_same_short_id(self) -> None:
+        from nanobot.providers.anthropic_provider import _sanitize_tool_id
+
+        long_id = "toolu_" + "b" * 200
+        assert _sanitize_tool_id(long_id) == _sanitize_tool_id(long_id)
+
+    def test_short_ids_are_untouched(self) -> None:
+        from nanobot.providers.anthropic_provider import _sanitize_tool_id
+
+        assert _sanitize_tool_id("toolu_01ABC") == "toolu_01ABC"
