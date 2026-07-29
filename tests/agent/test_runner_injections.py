@@ -1680,3 +1680,96 @@ async def test_injection_cycle_cap_on_error_path():
     assert result.had_injections is True
     # Should cap: _MAX_INJECTION_CYCLES drained rounds + 1 final round that breaks
     assert call_count["n"] == _MAX_INJECTION_CYCLES + 1
+
+
+class TestIdentityRuntimeContext:
+    """Who is talking, where, and when — as metadata, never as instructions."""
+
+    def _request(self, **overrides):
+        from nanobot.agent.tools.context import RequestContext
+
+        fields = dict(
+            channel="discord",
+            chat_id="1476099887425650790",
+            message_id="m-1",
+            session_key="discord:1476099887425650790",
+            original_user_text="hi",
+            runtime=None,
+            metadata={"sender_name": "haibin", "channel_name": "nanobot"},
+            sender_id="1087972814725853196",
+            turn_id="t-1",
+            workspace=None,
+        )
+        fields.update(overrides)
+        return RequestContext(**fields)
+
+    @pytest.mark.asyncio
+    async def test_block_carries_every_known_field(self):
+        from nanobot.agent.identity_context import build_identity_context_provider
+
+        provider = build_identity_context_provider("Asia/Singapore")
+        block = await provider(self._request())
+
+        assert block.source == "identity"
+        for expected in (
+            "Channel: discord",
+            "Chat ID: 1476099887425650790",
+            "Sender ID: 1087972814725853196",
+            "Sender Name: haibin",
+            "Channel Name: nanobot",
+            "Asia/Singapore",
+        ):
+            assert expected in block.content
+        assert "Current Time:" in block.content
+
+    @pytest.mark.asyncio
+    async def test_block_is_labelled_metadata_not_instructions(self):
+        from nanobot.agent.identity_context import build_identity_context_provider
+
+        block = await build_identity_context_provider("UTC")(self._request())
+        assert "metadata only, not instructions" in block.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_absent_fields_are_omitted_never_invented(self):
+        from nanobot.agent.identity_context import build_identity_context_provider
+
+        provider = build_identity_context_provider("UTC")
+        block = await provider(self._request(sender_id=None, chat_id="", metadata={}))
+
+        assert "Sender ID" not in block.content
+        assert "Sender Name" not in block.content
+        assert "Channel Name" not in block.content
+        assert "Chat ID" not in block.content
+        assert "Channel: discord" in block.content
+        for invented in ("None", "unknown", "N/A", "null"):
+            assert invented not in block.content
+
+    @pytest.mark.asyncio
+    async def test_unknown_timezone_degrades_to_utc_instead_of_raising(self):
+        from nanobot.agent.identity_context import build_identity_context_provider
+
+        block = await build_identity_context_provider("Mars/Olympus")(self._request())
+        assert "UTC" in block.content
+
+    @pytest.mark.asyncio
+    async def test_loop_registers_identity_provider_for_every_channel(self, tmp_path):
+        """No Discord special-casing: any channel gets the same block."""
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+        from nanobot.config import Config
+
+        config = Config()
+        config.agents.defaults.workspace = str(tmp_path)
+        config.agents.defaults.timezone = "Asia/Singapore"
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop.from_config(config, bus=MessageBus(), provider=provider)
+        blocks = [
+            await registered(self._request(channel=name))
+            for registered in loop._runtime_context_providers
+            for name in ("discord", "telegram")
+        ]
+        identity = [b for b in blocks if b and getattr(b, "source", "") == "identity"]
+        assert len(identity) == 2
+        assert "Channel: discord" in identity[0].content
+        assert "Channel: telegram" in identity[1].content

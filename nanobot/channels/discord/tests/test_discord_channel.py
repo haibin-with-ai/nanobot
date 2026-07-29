@@ -1986,3 +1986,40 @@ def test_skipped_skills_are_counted_not_silently_swallowed(tmp_path) -> None:
     names = _skill_names_from(client)
     assert list(names).count("help") == 1
     assert sorted(name for name in names if name.startswith("alpha")) == ["alpha-skill"]
+
+
+class TestInboundIdentityMetadata:
+    """Discord must name the human and the room, not just their numeric ids."""
+
+    def _channel(self):
+        return DiscordChannel(DiscordConfig(token="test"), MessageBus())
+
+    def _message(self, *, display_name="haibin", channel_name="nanobot", guild=True):
+        author = SimpleNamespace(id=42, display_name=display_name, bot=False)
+        channel = SimpleNamespace(id=7)
+        if channel_name is not None:
+            channel.name = channel_name
+        return SimpleNamespace(
+            id=99, author=author, channel=channel,
+            guild=SimpleNamespace(id=5) if guild else None,
+            reference=None,
+        )
+
+    def test_sender_and_channel_names_reach_metadata(self):
+        metadata = self._channel()._build_inbound_metadata(self._message())
+        assert metadata["sender_name"] == "haibin"
+        assert metadata["channel_name"] == "nanobot"
+
+    def test_direct_message_has_no_channel_name_key(self):
+        """A DM channel has no name; omit the key instead of inventing one."""
+        metadata = self._channel()._build_inbound_metadata(
+            self._message(channel_name=None, guild=False)
+        )
+        assert "channel_name" not in metadata
+        assert metadata["sender_name"] == "haibin"
+
+    def test_existing_metadata_keys_are_preserved(self):
+        metadata = self._channel()._build_inbound_metadata(self._message())
+        assert metadata["message_id"] == "99"
+        assert metadata["guild_id"] == "5"
+        assert metadata["reply_to"] is None
