@@ -32,6 +32,29 @@ def _gen_tool_id() -> str:
 _VALID_TOOL_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 _MAX_TOOL_ID_LEN = 64
 
+# 这些模型直接拒收 temperature 一类旧采样参数，带上就 400。
+_MODELS_WITHOUT_SAMPLING_PARAMS = (
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable",
+    "fable",
+)
+# Opus 5 默认就开自适应思考，并把思考过程折成摘要。
+_EFFORT_MODELS = ("claude-opus-5",)
+_DEFAULT_THINKING_ON_MODELS = ("claude-opus-5",)
+_THINKING_SUMMARIZATION_MODELS = ("claude-opus-5",)
+_ADAPTIVE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _matches_model(model: str, candidates: tuple[str, ...]) -> bool:
+    """按边界匹配模型族，别让 sonnet-55 撞上 sonnet-5。"""
+    model_id = model.rsplit("/", 1)[-1].lower()
+    return any(
+        model_id == name or model_id.startswith(f"{name}-") for name in candidates
+    )
+
 # Anthropic 按精确字符串识别 Claude Code 客户端，一个字都不能改。
 _CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
@@ -591,14 +614,12 @@ class AnthropicProvider(LLMProvider):
             )
 
         max_tokens = max(1, max_tokens)
-        thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"
+        effort = reasoning_effort.lower() if reasoning_effort else None
+        thinking_disabled = effort in {"none", "disabled"}
+        thinking_enabled = bool(effort) and not thinking_disabled
+        thinking_on_by_default = _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS)
 
-        # Several Anthropic models (opus-4-7, opus-4-8, sonnet-5, fable) deprecated the
-        # `temperature` parameter — the API returns 400 if it is present.
-        _model_lower = model_name.lower()
-        omit_temperature = any(
-            m in _model_lower for m in ("opus-4-7", "opus-4-8", "sonnet-5", "fable")
-        )
+        omit_temperature = _matches_model(model_name, _MODELS_WITHOUT_SAMPLING_PARAMS)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -610,16 +631,22 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
-        if reasoning_effort == "adaptive":
+        if thinking_disabled and thinking_on_by_default:
+            kwargs["thinking"] = {"type": "disabled"}
+        elif effort == "adaptive" or thinking_on_by_default:
             # Adaptive thinking: model decides when and how much to think
             # Supported on claude-sonnet-4-6 and claude-opus-4-6.
             # Also auto-enables interleaved thinking between tool calls.
             kwargs["thinking"] = {"type": "adaptive"}
+            if _matches_model(model_name, _THINKING_SUMMARIZATION_MODELS):
+                kwargs["thinking"]["display"] = "summarized"
+            if effort in _ADAPTIVE_EFFORT_LEVELS and _matches_model(model_name, _EFFORT_MODELS):
+                kwargs["output_config"] = {"effort": effort}
             if not omit_temperature:
                 kwargs["temperature"] = 1.0
         elif thinking_enabled:
             budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
-            budget = budget_map.get(reasoning_effort.lower(), 4096)
+            budget = budget_map.get(effort, 4096)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
             if not omit_temperature:
