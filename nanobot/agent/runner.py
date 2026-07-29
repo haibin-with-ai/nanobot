@@ -57,6 +57,14 @@ _ARREARAGE_ERROR_MESSAGE = (
     "account is in arrears. Please top up / check the billing status of your API key and try again."
 )
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
+_STALL_NOTICE = "[上一轮回复超时中断，未产生内容，请重新作答。]"
+# Phase 2：同模型静默重试的连续上限。Phase 3：一次运行内允许的超时总数。
+_MAX_STALL_RETRIES = 2
+_MAX_TOTAL_STALLS = 4
+
+
+class ModelStallError(RuntimeError):
+    """The model stalled too many times in one run; the caller decides what next."""
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
@@ -410,6 +418,8 @@ class AgentRunner:
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
+        consecutive_stalls = 0
+        total_stalls = 0
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -673,6 +683,27 @@ class AgentRunner:
                 length_recovery_parts.clear()
                 await hook.after_iteration(context)
                 continue
+
+            # 预算用尽时不再重试，交给下面的通用错误分支收尾。
+            if self._is_stall(response) and iteration + 1 < spec.max_iterations:
+                total_stalls += 1
+                if total_stalls >= _MAX_TOTAL_STALLS:
+                    raise ModelStallError(
+                        f"model stalled {total_stalls} times in one run; giving up"
+                    )
+                consecutive_stalls += 1
+                if consecutive_stalls > _MAX_STALL_RETRIES:
+                    consecutive_stalls = 0
+                    self._append_stall_notice(messages)
+                logger.warning(
+                    "Model stalled (consecutive={}, total={}); retrying",
+                    consecutive_stalls,
+                    total_stalls,
+                )
+                await hook.after_iteration(context)
+                continue
+            consecutive_stalls = 0
+            total_stalls = 0
 
             if response.finish_reason == "error":
                 if LLMProvider.is_arrearage_response(response):
@@ -1503,6 +1534,19 @@ class AgentRunner:
             messages[-1] = build_assistant_message(content)
             return
         messages.append(build_assistant_message(content))
+
+    @staticmethod
+    def _is_stall(response: LLMResponse) -> bool:
+        """Stall 只认 provider 给的 timeout 标记，不做文案匹配。"""
+        return response.finish_reason == "error" and response.error_kind == "timeout"
+
+    @staticmethod
+    def _append_stall_notice(messages: list[dict[str, Any]]) -> None:
+        """让模型自己看见上一轮超时，而不是静默重来。"""
+        last = messages[-1] if messages else {}
+        if last.get("role") == "assistant" and not last.get("tool_calls"):
+            return
+        messages.append(build_assistant_message(_STALL_NOTICE))
 
     @staticmethod
     def _append_model_error_placeholder(messages: list[dict[str, Any]]) -> None:
