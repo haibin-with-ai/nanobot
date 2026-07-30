@@ -710,6 +710,16 @@ class DiscordChannel(BaseChannel):
         if not self._should_accept_inbound(message, sender_id, content):
             return
 
+        if not self.is_allowed(sender_id):
+            # 陌生人只会拿到一个配对码，别先替他下附件、拉引用、点表情。
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=channel_id,
+                content=content,
+                is_dm=message.guild is None,
+            )
+            return
+
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
         quoted = self._build_quoted_context(message)
         full_content = self._compose_inbound_content(content, attachment_markers, quoted)

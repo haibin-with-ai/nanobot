@@ -926,6 +926,21 @@ async def test_slash_new_is_blocked_for_disallowed_user() -> None:
     assert handled == []
 
 
+@pytest.mark.asyncio
+async def test_slash_rejection_never_sends_acceptance_reply() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["999"]), MessageBus())
+    client = DiscordBotClient(channel, intents=discord.Intents.none())
+    interaction = _make_interaction(user_id=123)
+
+    command = client.tree.get_command("new")
+    assert command is not None
+    await command.callback(interaction)
+
+    contents = [message["content"] for message in interaction.response.messages]
+    assert contents == ["You are not allowed to use this bot."]
+    assert "Command accepted." not in contents
+
+
 @pytest.mark.parametrize("slash_name", ["stop", "restart", "status", "history", "model"])
 @pytest.mark.asyncio
 async def test_slash_commands_forward_via_handle_message(slash_name: str) -> None:
