@@ -391,6 +391,42 @@ class TestLineAgesPerCommit:
         assert ages[0].age_days >= 19
         assert ages[1].age_days == 0
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "a" * 32 + " tail of a normal commit summary",
+            "这是一个包含非 ASCII 字符的提交摘要",
+            "subject\n\nbody line one\nbody line two",
+        ],
+        ids=["long-summary", "non-ascii-summary", "multiline-message"],
+    )
+    def test_commit_metadata_cannot_be_mistaken_for_blame_header(
+        self, git, tmp_path, message
+    ):
+        (tmp_path / "MEMORY.md").write_text("remember this\n", encoding="utf-8")
+        self._commit_at(tmp_path, 0, message)
+
+        ages = git.line_ages("MEMORY.md")
+
+        assert len(ages) == 1
+        assert ages[0].age_days == 0
+
+    def test_blame_timeout_reports_path_and_limit(self, git, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("important\n", encoding="utf-8")
+        git.auto_commit("initial")
+        tracked = subprocess.CompletedProcess([], 0, stdout="MEMORY.md\n", stderr="")
+
+        with patch(
+            "nanobot.utils.gitstore.subprocess.run",
+            side_effect=[tracked, subprocess.TimeoutExpired("git blame", 30)],
+        ) as run:
+            with pytest.raises(
+                GitStoreError, match=r"MEMORY\.md.*30.*seconds"
+            ):
+                git.line_ages("MEMORY.md")
+
+        assert run.call_args_list[1].kwargs["timeout"] == 30
+
     def test_blame_failure_is_not_faked_as_success(self, git, tmp_path):
         """blame 挂了要抛错，不能返回空列表让调用方以为文件没内容。"""
         (tmp_path / "MEMORY.md").write_text("a\n", encoding="utf-8")

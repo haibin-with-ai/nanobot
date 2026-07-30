@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from loguru import logger
 # are tiny in practice, but a pathological rewrite must not blow up the audit
 # record. The structured per-file summary is always emitted in full regardless.
 _WORKING_TREE_DIFF_MAX_CHARS = 6000
+_BLAME_TIMEOUT_SECONDS = 30
+_BLAME_HEADER_RE = re.compile(r"^([0-9a-fA-F]{40}) ([0-9]+) ([0-9]+) ([0-9]+)$")
 
 
 class GitStoreError(RuntimeError):
@@ -48,23 +51,28 @@ class LineAge:
 
 
 def _parse_blame_porcelain(stdout: str) -> list[int]:
-    """Pull one committer-time per output line out of `git blame --porcelain`.
-
-    ┌─ porcelain 格式：hunk 头是 `<40位sha> <orig> <final> [<n>]`，
-    │  同一个 sha 的 header 只在首次出现时发送，后续 hunk 只有头行，
-    └─ 所以要缓存 sha -> committer-time；正文行以 TAB 开头。
-    """
+    """Pull one committer-time per output line out of `git blame --porcelain`."""
     times: dict[str, int] = {}
     ages: list[int] = []
-    current = ""
-    for line in stdout.split("\n"):
-        if line.startswith("\t"):
-            if current in times:
+    current: str | None = None
+    try:
+        for line_number, line in enumerate(stdout.splitlines(), start=1):
+            header = _BLAME_HEADER_RE.fullmatch(line)
+            if header:
+                current = header.group(1)
+            elif line.startswith("committer-time "):
+                if current is None:
+                    raise ValueError("committer-time appeared before a record header")
+                times[current] = int(line.removeprefix("committer-time "))
+            elif line.startswith("\t"):
+                if current is None or current not in times:
+                    raise ValueError("source line has no matching committer-time")
                 ages.append(times[current])
-        elif line.startswith("committer-time "):
-            times[current] = int(line.split(" ", 1)[1])
-        elif len(line) > 40 and line[40] == " ":
-            current = line[:40]
+    except (ValueError, OverflowError) as exc:
+        context = line[:160] if "line" in locals() else "<empty output>"
+        raise GitStoreError(
+            f"Invalid git blame porcelain at line {line_number}: {context!r}"
+        ) from exc
     return ages
 
 
@@ -331,7 +339,13 @@ class GitStore:
                 cwd=self._workspace,
                 capture_output=True,
                 text=True,
+                timeout=_BLAME_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise GitStoreError(
+                f"Git line annotation timed out for {file_path} after "
+                f"{_BLAME_TIMEOUT_SECONDS} seconds"
+            ) from exc
         except OSError as exc:
             raise GitStoreError(f"Git line annotation failed for {file_path}") from exc
 
