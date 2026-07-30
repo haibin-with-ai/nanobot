@@ -138,18 +138,24 @@ def _normalize_agent_turn_job(job: CronJob) -> bool:
         _disable_malformed_legacy_job(job)
         return True
 
-    payload.session_key = _legacy_session_key(payload)
-    payload.origin_channel = payload.origin_channel or payload.channel
-    payload.origin_chat_id = payload.origin_chat_id or payload.to
-    if not payload.origin_metadata:
-        payload.origin_metadata = dict(payload.channel_meta or {})
+    if payload.model:
+        payload.session_key = None
+        payload.origin_channel = None
+        payload.origin_chat_id = None
+        payload.origin_metadata = {}
+    else:
+        payload.session_key = _legacy_session_key(payload)
+        payload.origin_channel = payload.origin_channel or payload.channel
+        payload.origin_chat_id = payload.origin_chat_id or payload.to
+        if not payload.origin_metadata:
+            payload.origin_metadata = dict(payload.channel_meta or {})
 
     payload.deliver = False
     payload.channel = None
     payload.to = None
     payload.channel_meta = {}
     job.updated_at_ms = max(job.updated_at_ms, _now_ms())
-    logger.info("Cron: migrated legacy job '{}' ({}) to session-bound payload", job.name, job.id)
+    logger.info("Cron: normalized legacy job '{}' ({}) payload", job.name, job.id)
     return True
 
 

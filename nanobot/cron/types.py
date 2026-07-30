@@ -58,8 +58,20 @@ class CronPayload:
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
+        raw_kind = data.get("kind", "agent_turn")
+        kind_aliases = {
+            "agentTurn": "agent_turn",
+            "agent_turn": "agent_turn",
+            "systemEvent": "system_event",
+            "system_event": "system_event",
+        }
+        try:
+            kind = kind_aliases[raw_kind]
+        except (KeyError, TypeError):
+            raise ValueError(f"unknown cron payload kind: {raw_kind!r}") from None
+
         return cls(
-            kind=data.get("kind", "agent_turn"),
+            kind=kind,
             message=data.get("message", ""),
             deliver=data.get("deliver", False),
             channel=data.get("channel"),
