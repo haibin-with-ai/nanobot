@@ -882,6 +882,35 @@ class AnthropicProvider(LLMProvider):
                     return self._handle_error(retry_error)
             return self._handle_error(e)
 
+    async def _dispatch_stream_chunk(
+        self, chunk: Any, tool_blocks: dict[int, dict[str, str]], emitted: list[bool],
+        on_content_delta: Callable[[str], Awaitable[None]] | None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        block = getattr(chunk, "content_block", None)
+        if chunk.type == "content_block_start" and getattr(block, "type", None) == "tool_use":
+            index = int(getattr(chunk, "index", 0) or 0)
+            state = {"call_id": str(getattr(block, "id", "") or ""),
+                     "name": str(getattr(block, "name", "") or "")}
+            tool_blocks[index] = state
+            if on_tool_call_delta:
+                await on_tool_call_delta({"index": index, **state, "arguments_delta": ""})
+            return
+        delta = getattr(chunk, "delta", None)
+        delta_type = getattr(delta, "type", None)
+        callback = on_thinking_delta if delta_type == "thinking_delta" else on_content_delta
+        text = getattr(delta, "thinking" if delta_type == "thinking_delta" else "text", "")
+        if delta_type in {"thinking_delta", "text_delta"} and text and callback:
+            emitted[0] = True
+            await callback(text)
+        elif delta_type == "input_json_delta" and on_tool_call_delta:
+            index = int(getattr(chunk, "index", 0) or 0)
+            state = tool_blocks.get(index, {})
+            await on_tool_call_delta({"index": index, "call_id": state.get("call_id", ""),
+                                      "name": state.get("name", ""),
+                                      "arguments_delta": getattr(delta, "partial_json", "") or ""})
+
     async def _stream_once(
         self,
         kwargs: dict[str, Any],
@@ -893,65 +922,17 @@ class AnthropicProvider(LLMProvider):
     ) -> LLMResponse:
         emitted = emitted if emitted is not None else [False]
         async with self._client.messages.stream(**kwargs) as stream:
-            # Idle timeout must track *any* SSE chunk (thinking_delta,
-            # tool JSON deltas, etc.), not only text_stream tokens.
-            # Otherwise extended thinking can stall text_stream for minutes
-            # while the connection is healthy (e.g. MiniMax Anthropic).
             tool_blocks: dict[int, dict[str, str]] = {}
             next_chunk = getattr(stream, "__anext__", None)
             while next_chunk is not None:
                 try:
-                    chunk = await asyncio.wait_for(
-                        next_chunk(),
-                        timeout=idle_timeout_s,
-                    )
+                    chunk = await asyncio.wait_for(next_chunk(), timeout=idle_timeout_s)
                 except StopAsyncIteration:
                     break
-                if chunk.type == "content_block_start":
-                    block = getattr(chunk, "content_block", None)
-                    if getattr(block, "type", None) == "tool_use":
-                        index = int(getattr(chunk, "index", 0) or 0)
-                        state = {
-                            "call_id": str(getattr(block, "id", "") or ""),
-                            "name": str(getattr(block, "name", "") or ""),
-                        }
-                        tool_blocks[index] = state
-                        if on_tool_call_delta:
-                            await on_tool_call_delta({
-                                "index": index,
-                                **state,
-                                "arguments_delta": "",
-                            })
-                elif (
-                    chunk.type == "content_block_delta"
-                    and getattr(chunk.delta, "type", None) == "thinking_delta"
-                ):
-                    piece = getattr(chunk.delta, "thinking", None) or ""
-                    if piece and on_thinking_delta:
-                        emitted[0] = True
-                        await on_thinking_delta(piece)
-                elif (
-                    chunk.type == "content_block_delta"
-                    and getattr(chunk.delta, "type", None) == "text_delta"
-                ):
-                    text = getattr(chunk.delta, "text", None) or ""
-                    if text and on_content_delta:
-                        emitted[0] = True
-                        await on_content_delta(text)
-                elif (
-                    chunk.type == "content_block_delta"
-                    and getattr(chunk.delta, "type", None) == "input_json_delta"
-                ):
-                    partial = getattr(chunk.delta, "partial_json", None) or ""
-                    if partial and on_tool_call_delta:
-                        index = int(getattr(chunk, "index", 0) or 0)
-                        state = tool_blocks.get(index, {})
-                        await on_tool_call_delta({
-                            "index": index,
-                            "call_id": state.get("call_id", ""),
-                            "name": state.get("name", ""),
-                            "arguments_delta": partial,
-                        })
+                await self._dispatch_stream_chunk(
+                    chunk, tool_blocks, emitted, on_content_delta,
+                    on_thinking_delta, on_tool_call_delta,
+                )
             response = await stream.get_final_message()
         return self._parse_response(response)
 

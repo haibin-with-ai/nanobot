@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -13,7 +15,6 @@ from nanobot.providers.base import LLMProvider, LLMResponse
 # Circuit breaker tuned to match OpenAICompatProvider's Responses API breaker.
 _PRIMARY_FAILURE_THRESHOLD = 3
 _PRIMARY_COOLDOWN_S = 60
-_MISSING = object()
 _FALLBACK_ERROR_KINDS = frozenset({
     "timeout",
     "connection",
@@ -88,6 +89,16 @@ _FALLBACK_ERROR_TOKENS = (
 
 
 FallbackModelObserver = Callable[[str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    key: tuple[str, str]
+    model: str
+    provider: LLMProvider | None
+    preset: Any | None
+    kwargs: dict[str, Any]
+    primary: bool = False
 
 
 class FallbackProvider(LLMProvider):
@@ -244,6 +255,52 @@ class FallbackProvider(LLMProvider):
             on_stream_recover=on_stream_recover,
         )
 
+    def _candidates(self, kwargs: dict[str, Any]) -> list[_Candidate]:
+        model = kwargs.get("model") or self._primary.get_default_model()
+        candidates = [_Candidate(self._primary_key(model), model, self._primary, None, kwargs, True)]
+        for preset in self._fallback_presets:
+            attempt_kwargs = {**kwargs, "model": preset.model, "max_tokens": preset.max_tokens,
+                              "temperature": preset.temperature}
+            if preset.reasoning_effort is None:
+                attempt_kwargs.pop("reasoning_effort", None)
+            else:
+                attempt_kwargs["reasoning_effort"] = preset.reasoning_effort
+            candidates.append(_Candidate(self._preset_key(preset), preset.model, None, preset,
+                                         attempt_kwargs))
+        return candidates
+
+    async def _resolve_provider(self, candidate: _Candidate) -> LLMProvider | None:
+        if candidate.provider is not None:
+            return candidate.provider
+        try:
+            return await asyncio.to_thread(self._provider_factory, candidate.preset)
+        except Exception as exc:
+            logger.warning("Failed to create provider for fallback '{}': {}", candidate.model, exc)
+            return None
+
+    async def _recover_stream(
+        self, response: LLMResponse, has_streamed: list[bool] | None,
+        on_stream_recover: Callable[[], Awaitable[None]] | None,
+        kwargs: dict[str, Any],
+    ) -> bool:
+        if has_streamed is None or not has_streamed[0]:
+            return True
+        if (response.error_kind or "").lower() != "timeout":
+            return False
+        has_streamed[0] = False
+        if on_stream_recover:
+            await on_stream_recover()
+        else:
+            kwargs["on_content_delta"] = None
+        return True
+
+    def _note_primary_failure(self, response: LLMResponse) -> None:
+        if (response.error_kind or "").lower() == "refusal":
+            return
+        self._primary_failures += 1
+        if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
+            self._primary_tripped_at = self._clock()
+
     async def _try_with_fallback(
         self,
         call: Callable[[LLMProvider, dict[str, Any]], Awaitable[LLMResponse]],
@@ -251,157 +308,36 @@ class FallbackProvider(LLMProvider):
         has_streamed: list[bool] | None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        primary_model = kwargs.get("model") or self._primary.get_default_model()
-        primary_was_attempted = False
-        primary_response: LLMResponse | None = None
-        primary_error = "unknown error"
+        candidates = self._candidates(kwargs)
+        primary_model = candidates[0].model
         cooling = self._cooling_down(primary_model)
-        primary_key = self._primary_key(primary_model)
-
-        if self._primary_available() and primary_key not in cooling:
-            primary_was_attempted = True
-            response = await call(self._primary, kwargs)
+        last_response: LLMResponse | None = None
+        for candidate in candidates:
+            if candidate.key in cooling or (candidate.primary and not self._primary_available()):
+                continue
+            provider = await self._resolve_provider(candidate)
+            if provider is None:
+                continue
+            if not candidate.primary:
+                await self._notify_fallback_model(candidate.model)
+            response = await call(provider, candidate.kwargs)
             if response.finish_reason != "error":
-                self._primary_failures = 0
-                self._primary_tripped_at = None
+                if candidate.primary:
+                    self._primary_failures = 0
+                    self._primary_tripped_at = None
                 return response
-            primary_error = (response.content or primary_error)[:120]
-            primary_response = response
-            self._note_quota_cooldown(primary_key, response)
-
-            if has_streamed is not None and has_streamed[0]:
-                is_timeout = (response.error_kind or "").lower() == "timeout"
-                if is_timeout:
-                    logger.warning(
-                        "Primary model '{}' stream stalled after content was emitted; "
-                        "attempting failover anyway",
-                        primary_model,
-                    )
-                    has_streamed[0] = False
-                    if on_stream_recover:
-                        await on_stream_recover()
-                    else:
-                        kwargs["on_content_delta"] = None
-                else:
-                    logger.warning(
-                        "Primary model error but content already streamed; skipping failover"
-                    )
+            if not await self._recover_stream(response, has_streamed, on_stream_recover, kwargs):
+                return response
+            self._note_quota_cooldown(candidate.key, response)
+            if candidate.primary:
+                last_response = response
+                if not self._should_fallback(response):
                     return response
-
-            if not self._should_fallback(response):
-                logger.warning(
-                    "Primary model '{}' returned non-fallbackable error: {}",
-                    primary_model,
-                    (response.content or "")[:120],
-                )
-                return response
-
-            if (response.error_kind or "").lower() == "refusal":
-                # 拒答是内容判断，不是可用性故障：换模型可以，但别推熔断器。
-                logger.info("Primary model '{}' refused; trying another model", primary_model)
+                self._note_primary_failure(response)
             else:
-                self._primary_failures += 1
-            if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
-                self._primary_tripped_at = self._clock()
-                logger.warning(
-                    "Primary model '{}' circuit open after {} consecutive failures",
-                    primary_model, self._primary_failures,
-                )
-        else:
-            logger.debug("Primary model '{}' circuit open; skipping", primary_model)
-
-        # 备用模型全被冷却跳过时，仍要把主模型的真实错误还给调用方。
-        last_response: LLMResponse | None = primary_response
-        primary_skipped = not primary_was_attempted
-        for idx, fallback in enumerate(self._fallback_presets):
-            fallback_model = fallback.model
-            fallback_key = self._preset_key(fallback)
-            if fallback_key in cooling:
-                logger.debug("Fallback '{}' still cooling down; skipping", fallback_model)
-                continue
-            if has_streamed is not None and has_streamed[0]:
-                is_timeout = (
-                    last_response is not None
-                    and (last_response.error_kind or "").lower() == "timeout"
-                )
-                if is_timeout and on_stream_recover:
-                    logger.warning(
-                        "Fallback model '{}' stream stalled after content was emitted; "
-                        "starting a new stream segment and trying next fallback",
-                        self._fallback_presets[idx - 1].model if idx > 0 else primary_model,
-                    )
-                    has_streamed[0] = False
-                    await on_stream_recover()
-                else:
-                    break
-            if idx == 0 and primary_skipped:
-                logger.info(
-                    "Primary model '{}' circuit open, trying fallback '{}'",
-                    primary_model, fallback_model,
-                )
-            elif idx == 0:
-                logger.info(
-                    "Primary model '{}' failed: {}; trying fallback '{}'",
-                    primary_model, primary_error, fallback_model,
-                )
-            else:
-                logger.info(
-                    "Fallback '{}' also failed, trying next fallback '{}'",
-                    self._fallback_presets[idx - 1].model, fallback_model,
-                )
-            try:
-                fallback_provider = self._provider_factory(fallback)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to create provider for fallback '{}': {}", fallback_model, exc
-                )
-                continue
-
-            await self._notify_fallback_model(fallback_model)
-
-            original_values = {
-                name: kwargs.get(name, _MISSING)
-                for name in ("model", "max_tokens", "temperature", "reasoning_effort")
-            }
-            kwargs["model"] = fallback_model
-            kwargs["max_tokens"] = fallback.max_tokens
-            kwargs["temperature"] = fallback.temperature
-            if fallback.reasoning_effort is None:
-                kwargs.pop("reasoning_effort", None)
-            else:
-                kwargs["reasoning_effort"] = fallback.reasoning_effort
-            try:
-                fallback_response = await call(fallback_provider, kwargs)
-            finally:
-                for name, value in original_values.items():
-                    if value is _MISSING:
-                        kwargs.pop(name, None)
-                    else:
-                        kwargs[name] = value
-
-            if fallback_response.finish_reason != "error":
-                logger.info(
-                    "Fallback '{}' succeeded after primary '{}' failed",
-                    fallback_model, primary_model,
-                )
-                return fallback_response
-
-            last_response = fallback_response
-            self._note_quota_cooldown(fallback_key, fallback_response)
-            logger.warning(
-                "Fallback '{}' also failed: {}",
-                fallback_model,
-                (fallback_response.content or "")[:120],
-            )
-
-        logger.warning(
-            "All {} fallback model(s) failed",
-            len(self._fallback_presets),
-        )
-        # Return the last error response we saw (primary or last fallback).
+                last_response = response
         if last_response is not None:
             return last_response
-        # Primary was tripped and we have no fallbacks — synthesize an error.
         return LLMResponse(
             content=f"Primary model '{primary_model}' circuit open and no fallbacks available",
             finish_reason="error",
