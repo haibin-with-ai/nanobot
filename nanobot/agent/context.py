@@ -3,6 +3,7 @@
 import base64
 import mimetypes
 import platform
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -51,11 +52,27 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
     return False
 
 
+@dataclass(frozen=True)
+class BootstrapFile:
+    """A bootstrap file and the source that owns its content."""
+
+    name: str
+    root: str
+
+    def __fspath__(self) -> str:
+        return self.name
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     # SOUL first, then the mechanism it operates through, then who it serves.
-    BOOTSTRAP_FILES = ["SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = (
+        BootstrapFile("SOUL.md", "agent"),
+        BootstrapFile("AGENTS.md", "project"),
+        BootstrapFile("USER.md", "agent"),
+        BootstrapFile("TOOLS.md", "bundled"),
+    )
     _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
     _RUNTIME_CONTEXT_TAG = RUNTIME_CONTEXT_TAG
     _MAX_RECENT_HISTORY = 50
@@ -185,30 +202,28 @@ class ContextBuilder:
         """Load project instructions plus the agent's global profile files."""
         parts = []
         project_root = workspace or self.workspace
-        roots = {
-            "SOUL.md": self.workspace,
-            "USER.md": self.workspace,
-            "AGENTS.md": project_root,
-            "TOOLS.md": self.workspace,
-        }
+        roots = {"agent": self.workspace, "project": project_root}
 
-        for filename in self.BOOTSTRAP_FILES:
-            root = roots[filename]
-            file_path = root / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                if filename == "SOUL.md" and self._is_template_content(
-                    content,
-                    "legacy/SOUL.md",
-                ):
-                    content = load_bundled_template("SOUL.md") or content
-                if not content.strip():
-                    continue
-                if filename in self._SKIPPABLE_DEFAULTS and self._is_template_content(
-                    content, filename
-                ):
-                    continue
-                parts.append(f"## {filename}\n\n{content}")
+        for spec in self.BOOTSTRAP_FILES:
+            if spec.root == "bundled":
+                content = load_bundled_template(spec.name)
+            else:
+                file_path = roots[spec.root] / spec.name
+                content = file_path.read_text(encoding="utf-8") if file_path.exists() else None
+            if content is None:
+                continue
+            if spec.name == "SOUL.md" and self._is_template_content(
+                content,
+                "legacy/SOUL.md",
+            ):
+                content = load_bundled_template("SOUL.md") or content
+            if not content.strip():
+                continue
+            if spec.name in self._SKIPPABLE_DEFAULTS and self._is_template_content(
+                content, spec.name
+            ):
+                continue
+            parts.append(f"## {spec.name}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 
