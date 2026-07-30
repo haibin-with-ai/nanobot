@@ -18,6 +18,7 @@ from nanobot.cron.session_turns import (
 )
 from nanobot.cron.types import CronJob
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
+from nanobot.session.manager import make_cron_run_session_key
 from nanobot.utils.prompt_templates import render_template
 
 # A job that names no model runs on the slower, more careful preset: nobody is
@@ -111,10 +112,11 @@ async def run_unbound_cron_job(
         strip=True,
         message=job.payload.message,
     )
-    run_id = _new_run_id(job)
-    # 每次触发都新开一个会话文件，所以清理也放在造文件的地方，每天最多一次。
-    agent.sessions.maybe_prune_cron_run_sessions()
-    session_key = f"cron:{job.id}:{run_id}"
+    run_id = _new_run_id()
+    # Every unbound trigger creates a file, so this real call point runs the
+    # manager's instance-level daily retention gate before creating another.
+    agent.sessions.prune_cron_run_sessions()
+    session_key = make_cron_run_session_key(job.id, run_id)
     model = job.payload.model or DEFAULT_CRON_MODEL_PRESET
     record_base: dict[str, Any] = {
         "job_id": job.id,
@@ -161,8 +163,8 @@ async def run_unbound_cron_job(
     return response
 
 
-def _new_run_id(job: CronJob) -> str:
-    return f"{job.id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+def _new_run_id() -> str:
+    return f"{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
 
 
 async def run_bound_cron_job(
@@ -182,7 +184,9 @@ async def run_bound_cron_job(
         message=job.payload.message,
     )
     prompt_ref = _cron_prompt_ref(prompt)
-    run_id = _new_run_id(job)
+    # A bound run writes into an existing session, so it needs no run session
+    # key: its run id is just job-scoped for the run-record files.
+    run_id = f"{job.id}:{_new_run_id()}"
     channel, chat_id, metadata = _bound_session_delivery_context(
         job,
         turn_seed=f"cron:{job.id}",

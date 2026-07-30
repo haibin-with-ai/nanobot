@@ -1,17 +1,14 @@
-"""Recycling the throwaway sessions that unbound cron runs leave behind.
-
-Every unbound run creates a session file and nothing ever removed them; the
-production workspace had accumulated 177 of them. Pruning is deliberately
-narrow: only keys that decode exactly as a cron run key are eligible, so a
-bug here cannot eat a human conversation.
-"""
+"""Retention for the throwaway sessions created by unbound cron runs."""
 
 from __future__ import annotations
 
-import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from nanobot.cron.bound_runner import run_cron_job
+from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
 from nanobot.session.manager import SessionManager
 
 DAY_MS = 86_400_000
@@ -19,7 +16,7 @@ NOW_MS = 1_800_000_000_000
 
 
 def _key(job: str, ms: int, uid: str = "abcd1234") -> str:
-    return f"cron:{job}:{job}:{ms}:{uid}"
+    return f"cron:{job}:{ms}:{uid}"
 
 
 @pytest.fixture
@@ -35,12 +32,11 @@ def _write(manager: SessionManager, key: str, size: int = 0) -> None:
 
 def _existing(manager: SessionManager) -> set[str]:
     keys = (manager._session_key_from_path(p) for p in manager.sessions_dir.glob("*.jsonl"))
-    return {k for k in keys if k}
+    return {key for key in keys if key}
 
 
 class TestOnlyCronRunSessionsAreEligible:
     def test_a_stale_cron_run_session_is_removed(self, manager):
-        """Stale and beyond the per-job floor, so it goes."""
         for i in range(4):
             _write(manager, _key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}"))
         report = manager.prune_cron_run_sessions(now_ms=NOW_MS)
@@ -48,34 +44,61 @@ class TestOnlyCronRunSessionsAreEligible:
         assert len(_existing(manager)) == 3
 
     def test_the_only_run_of_a_job_is_kept_however_stale(self, manager):
-        """The floor wins over the window: some history beats none."""
         _write(manager, _key("job1", NOW_MS - 400 * DAY_MS))
         assert manager.prune_cron_run_sessions(now_ms=NOW_MS)["count"] == 0
         assert _existing(manager)
 
-    @pytest.mark.parametrize("key", [
-        "discord:123456",
-        "cli:direct",
-        "cron:job1",
-        "cron:job1:job2:1700000000000:abcd1234",
-        "cron:job1:job1:notanumber:abcd1234",
-        "cron:job1:job1:1700000000000:XYZ",
-        "cron:job1:job1:1700000000000:abcd1234:extra",
-    ])
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "discord:123456",
+            "cli:direct",
+            "cron:job1",
+            "cron:job1:job2:1700000000000:abcd1234",
+            "cron:job1:notanumber:abcd1234",
+            "cron:job1:1700000000000:XYZ",
+            "cron:job1:1700000000000:abcd1234:extra",
+        ],
+    )
     def test_non_cron_run_keys_are_never_touched(self, manager, key):
-        """Anything that does not decode exactly is left alone."""
         _write(manager, key)
         report = manager.prune_cron_run_sessions(now_ms=NOW_MS)
         assert report["count"] == 0
         assert _existing(manager)
 
-    def test_a_foreign_key_shaped_like_cron_is_rejected(self, manager):
-        """Only the doubled job id proves this key came from a cron run."""
+    def test_key_codec_has_one_copy_of_the_job_id(self):
+        from nanobot.session.manager import make_cron_run_session_key
+        key = make_cron_run_session_key("job1", "1700000000000:abcd1234")
+        assert key == "cron:job1:1700000000000:abcd1234"
+
+    def test_key_codec_round_trips(self):
         from nanobot.session.manager import parse_cron_run_session_key
-        assert parse_cron_run_session_key("cron:job1:something:1700000000000:abcd1234") is None
-        assert parse_cron_run_session_key("cron:job1:job1:1700000000000:abcd1234") == (
-            "job1", 1700000000000,
+        assert parse_cron_run_session_key(_key("job1", 1700000000000)) == (
+            "job1",
+            1700000000000,
         )
+
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            ("cron:073339b1:1785371400012", ("073339b1", 1785371400012)),
+            (
+                "cron:74737c87-a618-4017-9290-41672bdb5fc4:1784075400005",
+                ("74737c87-a618-4017-9290-41672bdb5fc4", 1784075400005),
+            ),
+        ],
+    )
+    def test_run_keys_written_before_the_random_suffix_still_decode(self, key, expected):
+        """线上已有的 per-run 会话是 cron:{job}:{ms}，没有随机后缀，也得认。"""
+        from nanobot.session.manager import parse_cron_run_session_key
+        assert parse_cron_run_session_key(key) == expected
+
+    def test_run_sessions_written_before_the_random_suffix_are_pruned(self, manager):
+        for i in range(4):
+            _write(manager, f"cron:073339b1:{NOW_MS - (40 + i) * DAY_MS}")
+        report = manager.prune_cron_run_sessions(now_ms=NOW_MS)
+        assert report["count"] == 1
+        assert len(_existing(manager)) == 3
 
     def test_a_bound_cron_session_is_not_a_run_session(self, manager):
         _write(manager, "discord:chat-9")
@@ -86,20 +109,20 @@ class TestOnlyCronRunSessionsAreEligible:
 class TestRetentionWindow:
     def test_recent_runs_survive(self, manager):
         _write(manager, _key("job1", NOW_MS - 5 * DAY_MS, "aaaaaaaa"))
-        report = manager.prune_cron_run_sessions(now_ms=NOW_MS)
-        assert report["count"] == 0
+        assert manager.prune_cron_run_sessions(now_ms=NOW_MS)["count"] == 0
 
     def test_the_boundary_day_survives(self, manager):
-        """Exactly at the cutoff is still inside the window."""
         for i in range(3):
             _write(manager, _key("job1", NOW_MS - 400 * DAY_MS, f"bbbbbbb{i}"))
-        _write(manager, _key("job1", NOW_MS - 30 * DAY_MS, "aaaaaaaa"))
-        report = manager.prune_cron_run_sessions(retain_days=30, keep_per_job=0, now_ms=NOW_MS)
+        survivor = _key("job1", NOW_MS - 30 * DAY_MS, "aaaaaaaa")
+        _write(manager, survivor)
+        report = manager.prune_cron_run_sessions(
+            retain_days=30, keep_per_job=0, now_ms=NOW_MS
+        )
         assert report["count"] == 3
-        assert _existing(manager) == {_key("job1", NOW_MS - 30 * DAY_MS, "aaaaaaaa")}
+        assert _existing(manager) == {survivor}
 
     def test_the_newest_runs_survive_however_old_they_are(self, manager):
-        """A job that runs monthly must not lose its entire history."""
         for i in range(5):
             _write(manager, _key("job1", NOW_MS - (100 + i) * DAY_MS, f"aaaaaaa{i}"))
         report = manager.prune_cron_run_sessions(keep_per_job=3, now_ms=NOW_MS)
@@ -137,21 +160,21 @@ class TestDryRun:
         for i in range(3):
             _write(manager, _key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}"))
         _write(manager, _key("job1", NOW_MS - 400 * DAY_MS, "aaaaaaa9"), size=500)
-        report = manager.prune_cron_run_sessions(dry_run=True, now_ms=NOW_MS)
-        assert report["bytes"] >= 500
+        assert manager.prune_cron_run_sessions(dry_run=True, now_ms=NOW_MS)["bytes"] >= 500
 
     def test_nothing_to_do_reports_zero(self, manager):
-        report = manager.prune_cron_run_sessions(dry_run=True, now_ms=NOW_MS)
-        assert report == {"keys": [], "count": 0, "bytes": 0}
+        assert manager.prune_cron_run_sessions(dry_run=True, now_ms=NOW_MS) == {
+            "keys": [],
+            "count": 0,
+            "bytes": 0,
+        }
 
 
 class TestFailureIsolation:
     def test_one_bad_file_does_not_stop_the_rest(self, manager, monkeypatch):
-        """delete_session 自己吞 OSError 后返回 False，扫描要认这个真实契约。"""
         keys = [_key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}") for i in range(4)]
         for key in keys:
             _write(manager, key)
-
         real = SessionManager.delete_session
         calls: list[str] = []
 
@@ -169,51 +192,33 @@ class TestFailureIsolation:
         assert len(_existing(manager)) == 2
 
     def test_failed_deletes_do_not_count_as_reclaimed_bytes(self, manager, monkeypatch):
-        keys = [_key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}") for i in range(2)]
-        for key in keys:
-            _write(manager, key, size=500)
-
+        for i in range(2):
+            _write(manager, _key("job1", NOW_MS - (40 + i) * DAY_MS, f"aaaaaaa{i}"), size=500)
         monkeypatch.setattr(SessionManager, "delete_session", lambda self, key: False)
         report = manager.prune_cron_run_sessions(keep_per_job=1, now_ms=NOW_MS)
-
         assert report["count"] == 0
         assert report["bytes"] == 0
 
 
 class TestThrottledSweep:
-    def test_second_call_within_the_window_is_skipped(self, manager, monkeypatch):
-        calls: list[int] = []
-        monkeypatch.setattr(
-            SessionManager,
-            "prune_cron_run_sessions",
-            lambda self, **kwargs: calls.append(1),
-        )
+    def test_instance_sweeps_at_most_once_per_day(self, tmp_path):
+        clock = Mock(return_value=10.0)
+        manager = SessionManager(tmp_path, retention_clock=clock)
+        first = manager.prune_cron_run_sessions()
+        second = manager.prune_cron_run_sessions()
+        assert first == {"keys": [], "count": 0, "bytes": 0}
+        assert second is None
 
-        manager.maybe_prune_cron_run_sessions()
-        manager.maybe_prune_cron_run_sessions()
+    def test_the_daily_window_uses_the_injected_monotonic_clock(self, tmp_path):
+        clock = Mock(side_effect=[10.0, 10.0 + 86_399, 10.0 + 86_400])
+        manager = SessionManager(tmp_path, retention_clock=clock)
+        assert manager.prune_cron_run_sessions() is not None
+        assert manager.prune_cron_run_sessions() is None
+        assert manager.prune_cron_run_sessions() is not None
 
-        assert len(calls) == 1
-
-    def test_the_window_can_expire(self, manager, monkeypatch):
-        calls: list[int] = []
-        monkeypatch.setattr(
-            SessionManager,
-            "prune_cron_run_sessions",
-            lambda self, **kwargs: calls.append(1),
-        )
-
-        manager.maybe_prune_cron_run_sessions()
-        manager.maybe_prune_cron_run_sessions(min_interval_s=0.0)
-
-        assert len(calls) == 2
-
-    def test_a_broken_sweep_never_escapes(self, manager, monkeypatch):
-        def _boom(self, **kwargs):
-            raise RuntimeError("disk on fire")
-
-        monkeypatch.setattr(SessionManager, "prune_cron_run_sessions", _boom)
-
-        manager.maybe_prune_cron_run_sessions()
+    def test_explicit_now_bypasses_the_runtime_throttle(self, manager):
+        assert manager.prune_cron_run_sessions(now_ms=NOW_MS) is not None
+        assert manager.prune_cron_run_sessions(now_ms=NOW_MS) is not None
 
     def test_cache_is_cleared_along_with_the_file(self, manager):
         key = _key("job1", NOW_MS - 400 * DAY_MS, "aaaaaaa9")
@@ -224,9 +229,29 @@ class TestThrottledSweep:
         assert manager.get_or_create(key).messages == []
 
 
-class TestGatewayWiresItOnce:
-    def test_startup_prune_is_invoked(self, monkeypatch):
-        """One entry point: gateway startup. Confirm it is actually reachable."""
-        import nanobot.cli.commands as commands
-        source = json.dumps(commands.__file__)
-        assert "prune_cron_run_sessions" in open(json.loads(source), encoding="utf-8").read()
+class TestRealCronCallPointWiresRetention:
+    @pytest.mark.asyncio
+    async def test_unbound_run_invokes_the_throttled_prune_once(self):
+        sessions = SimpleNamespace(prune_cron_run_sessions=Mock())
+        agent = SimpleNamespace(
+            sessions=sessions,
+            tools=SimpleNamespace(get=lambda _name: None),
+            set_session_model_preset=lambda *_args: None,
+        )
+
+        async def process_direct(*_args, **_kwargs):
+            return SimpleNamespace(content="done")
+
+        agent.process_direct = process_direct
+        cron = SimpleNamespace(write_run_record=Mock())
+        job = CronJob(
+            id="job-1",
+            name="nightly",
+            payload=CronPayload(message="ping"),
+            schedule=CronSchedule(kind="every", every_ms=60_000),
+            state=CronJobState(),
+        )
+
+        await run_cron_job(job, agent=agent, cron=cron)
+
+        sessions.prune_cron_run_sessions.assert_called_once_with()

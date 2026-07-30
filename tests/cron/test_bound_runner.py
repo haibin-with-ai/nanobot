@@ -88,7 +88,8 @@ class _Sessions:
     def delete(self, key):
         self.deleted.append(key)
 
-    def maybe_prune_cron_run_sessions(self):
+    def prune_cron_run_sessions(self):
+        """The manager itself decides whether this sweep actually scans."""
         self.prune_calls += 1
 
 
@@ -110,6 +111,18 @@ class TestUnboundRunsInItsOwnSession:
         key = agent.direct_calls[0]["session_key"]
         assert key.startswith("cron:job-1:")
         assert key != "cron:job-1:"
+
+    @pytest.mark.asyncio
+    async def test_session_key_encodes_the_job_id_once(self):
+        from nanobot.session.manager import parse_cron_run_session_key
+
+        agent, cron = _Agent(), _Recorder()
+        await run_cron_job(_job(), agent=agent, cron=cron)
+        key = agent.direct_calls[0]["session_key"]
+        parsed = parse_cron_run_session_key(key)
+        assert parsed is not None
+        assert parsed[0] == "job-1"
+        assert key.count("job-1") == 1
 
     @pytest.mark.asyncio
     async def test_two_runs_of_one_job_do_not_share_a_session(self):
@@ -200,6 +213,15 @@ class TestBoundStillUsesTheSessionTurnPath:
         metadata = agent.bound_calls[0].metadata
         assert CRON_TRIGGER_META in metadata
         assert metadata[CRON_DEFER_UNTIL_IDLE_META] is True
+
+    @pytest.mark.asyncio
+    async def test_bound_run_id_names_the_job(self):
+        """Run records are filed per job, so the id must still carry the job."""
+        agent, cron = _Agent(), _Recorder()
+        await run_cron_job(_job(**_BOUND), agent=agent, cron=cron)
+        run_id = cron.records[0][0]
+        assert run_id.startswith("job-1:")
+        assert not run_id.startswith("cron:")
 
     @pytest.mark.asyncio
     async def test_bound_job_with_model_is_rejected_instead_of_ignored(self):

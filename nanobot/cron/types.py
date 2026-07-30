@@ -38,6 +38,15 @@ class CronSchedule:
             tz=data.get("tz"),
         )
 
+    def to_store_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "atMs": self.at_ms,
+            "everyMs": self.every_ms,
+            "expr": self.expr,
+            "tz": self.tz,
+        }
+
 
 @dataclass
 class CronPayload:
@@ -88,6 +97,21 @@ class CronPayload:
             model=data.get("model"),
         )
 
+    def to_store_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "message": self.message,
+            "model": self.model,
+            "deliver": self.deliver,
+            "channel": self.channel,
+            "to": self.to,
+            "channelMeta": self.channel_meta,
+            "sessionKey": self.session_key,
+            "originChannel": self.origin_channel,
+            "originChatId": self.origin_chat_id,
+            "originMetadata": self.origin_metadata,
+        }
+
 
 @dataclass
 class CronRunRecord:
@@ -105,6 +129,14 @@ class CronRunRecord:
             duration_ms=_store_int(get_camel_snake(data, "durationMs", "duration_ms", 0)),
             error=data.get("error"),
         )
+
+    def to_store_dict(self) -> dict[str, Any]:
+        return {
+            "runAtMs": self.run_at_ms,
+            "status": self.status,
+            "durationMs": self.duration_ms,
+            "error": self.error,
+        }
 
 
 @dataclass
@@ -136,6 +168,15 @@ class CronJobState:
                 if isinstance(record, (dict, CronRunRecord))
             ],
         )
+
+    def to_store_dict(self) -> dict[str, Any]:
+        return {
+            "nextRunAtMs": self.next_run_at_ms,
+            "lastRunAtMs": self.last_run_at_ms,
+            "lastStatus": self.last_status,
+            "lastError": self.last_error,
+            "runHistory": [record.to_store_dict() for record in self.run_history],
+        }
 
 
 @dataclass
@@ -179,6 +220,20 @@ class CronJob:
                 get_camel_snake(data, "deleteAfterRun", "delete_after_run", False)
             ),
         )
+
+    def to_store_dict(self) -> dict[str, Any]:
+        """Render a job for jobs.json, mirroring ``from_store_dict`` field for field."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "enabled": self.enabled,
+            "schedule": self.schedule.to_store_dict(),
+            "payload": self.payload.to_store_dict(),
+            "state": self.state.to_store_dict(),
+            "createdAtMs": self.created_at_ms,
+            "updatedAtMs": self.updated_at_ms,
+            "deleteAfterRun": self.delete_after_run,
+        }
 
 
 @dataclass

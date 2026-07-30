@@ -316,54 +316,10 @@ class CronService:
 
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Field names live once, in the job codec, next to from_store_dict.
         data = {
             "version": self._store.version,
-            "jobs": [
-                {
-                    "id": j.id,
-                    "name": j.name,
-                    "enabled": j.enabled,
-                    "schedule": {
-                        "kind": j.schedule.kind,
-                        "atMs": j.schedule.at_ms,
-                        "everyMs": j.schedule.every_ms,
-                        "expr": j.schedule.expr,
-                        "tz": j.schedule.tz,
-                    },
-                    "payload": {
-                        "kind": j.payload.kind,
-                        "message": j.payload.message,
-                        "model": j.payload.model,
-                        "deliver": j.payload.deliver,
-                        "channel": j.payload.channel,
-                        "to": j.payload.to,
-                        "channelMeta": j.payload.channel_meta,
-                        "sessionKey": j.payload.session_key,
-                        "originChannel": j.payload.origin_channel,
-                        "originChatId": j.payload.origin_chat_id,
-                        "originMetadata": j.payload.origin_metadata,
-                    },
-                    "state": {
-                        "nextRunAtMs": j.state.next_run_at_ms,
-                        "lastRunAtMs": j.state.last_run_at_ms,
-                        "lastStatus": j.state.last_status,
-                        "lastError": j.state.last_error,
-                        "runHistory": [
-                            {
-                                "runAtMs": r.run_at_ms,
-                                "status": r.status,
-                                "durationMs": r.duration_ms,
-                                "error": r.error,
-                            }
-                            for r in j.state.run_history
-                        ],
-                    },
-                    "createdAtMs": j.created_at_ms,
-                    "updatedAtMs": j.updated_at_ms,
-                    "deleteAfterRun": j.delete_after_run,
-                }
-                for j in self._store.jobs
-            ]
+            "jobs": [j.to_store_dict() for j in self._store.jobs],
         }
 
         self._atomic_write(self.store_path, json.dumps(data, indent=2, ensure_ascii=False))

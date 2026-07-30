@@ -417,22 +417,25 @@ class Session:
         )
 
 
-# An unbound cron run writes ``cron:{job_id}:{run_id}`` where the run id itself
-# starts with the job id, so the doubled segment is what makes this key shape
-# self-identifying. Nothing else in the system produces it.
+# Unbound cron sessions use one canonical codec: ``cron:{job_id}:{run_id}``,
+# where ``run_id`` is ``{started_ms}:{random_hex}``. Job ids are encoded once.
+# The random suffix is newer than the feature, so run sessions already on disk
+# stop at the timestamp; they decode too, otherwise they would never be pruned.
 _CRON_RUN_SESSION_KEY_RE = re.compile(
-    r"^cron:(?P<job>[0-9A-Za-z_-]+):(?P=job):(?P<started_ms>\d+):[0-9a-f]{8}$"
+    r"^cron:(?P<job>[0-9A-Za-z_-]+):(?P<started_ms>\d+)(?::[0-9a-f]{8})?$"
 )
 _CRON_RUN_RETAIN_DAYS = 30
 _CRON_RUN_KEEP_PER_JOB = 3
+_CRON_RUN_PRUNE_INTERVAL_S = 86_400.0
+
+
+def make_cron_run_session_key(job_id: str, run_id: str) -> str:
+    """Build the canonical per-run session key for an unbound cron job."""
+    return f"cron:{job_id}:{run_id}"
 
 
 def parse_cron_run_session_key(key: str) -> tuple[str, int] | None:
-    """Return ``(job_id, started_ms)`` for a cron run session key, else None.
-
-    Deliberately strict: a key that does not decode exactly is treated as
-    someone else's session and left alone.
-    """
+    """Return ``(job_id, started_ms)`` only for a canonical cron run key."""
     match = _CRON_RUN_SESSION_KEY_RE.match(key)
     if not match:
         return None
@@ -446,7 +449,12 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
 
-    def __init__(self, workspace: Path):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        retention_clock: Callable[[], float] = time.monotonic,
+    ):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
@@ -455,6 +463,8 @@ class SessionManager:
         self._overflow_cache: WeakValueDictionary[str, Session] = WeakValueDictionary()
         self._max_cached_sessions = SESSION_CACHE_MAX_SIZE
         self._file_cap_archiver: Callable[..., None] | None = None
+        self._retention_clock = retention_clock
+        self._last_cron_prune_at: float | None = None
 
     def _remember(self, session: Session) -> None:
         """Keep recent sessions strongly cached without duplicating live objects."""
@@ -910,12 +920,20 @@ class SessionManager:
         keep_per_job: int = _CRON_RUN_KEEP_PER_JOB,
         dry_run: bool = False,
         now_ms: int | None = None,
-    ) -> dict[str, Any]:
-        """Delete cron run sessions past the retention window.
+    ) -> dict[str, Any] | None:
+        """Delete expired per-run cron sessions, throttled once per manager instance.
 
-        Each job keeps its most recent runs regardless of age, so a monthly job
-        does not lose its whole history to a 30-day cutoff.
+        Runtime calls omit ``now_ms`` and scan at most once per monotonic 24-hour
+        interval for this ``SessionManager`` instance. Explicit ``now_ms`` calls
+        are administrative/test scans and bypass the throttle. Each job keeps its
+        three newest runs regardless of age; the default age window is 30 days.
         """
+        if now_ms is None:
+            tick = self._retention_clock()
+            last = self._last_cron_prune_at
+            if last is not None and tick - last < _CRON_RUN_PRUNE_INTERVAL_S:
+                return None
+            self._last_cron_prune_at = tick
         now = now_ms if now_ms is not None else int(time.time() * 1000)
         cutoff = now - retain_days * 86_400_000
 
@@ -961,16 +979,6 @@ class SessionManager:
         if deleted:
             logger.info("Session prune: removed {} cron run sessions", len(deleted))
         return {"keys": deleted, "count": len(deleted), "bytes": freed_bytes}
-
-    def maybe_prune_cron_run_sessions(self, *, min_interval_s: float = 86_400.0) -> None:
-        """长期不重启的实例也要清理，但一天最多扫一次。"""
-        now = time.monotonic()
-        last = getattr(self, "_last_cron_prune_at", None)
-        if last is not None and now - last < min_interval_s:
-            return
-        self._last_cron_prune_at = now
-        with suppress(Exception):
-            self.prune_cron_run_sessions()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
