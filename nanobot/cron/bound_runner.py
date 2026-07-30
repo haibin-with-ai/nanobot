@@ -8,8 +8,6 @@ import time
 import uuid
 from typing import Any, Protocol
 
-from loguru import logger
-
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
@@ -83,17 +81,17 @@ async def run_cron_job(
     cron: CronRunRecorder,
 ) -> str | None:
     """Run a cron job in its bound session, or in one created just for this run."""
-    # A bare session_key is not a binding: the bound path needs the origin
-    # channel and chat too, and refuses jobs that only push a message out.
+    binding = (
+        job.payload.session_key,
+        job.payload.origin_channel,
+        job.payload.origin_chat_id,
+    )
+    if any(binding) and not all(binding):
+        raise ValueError("incomplete cron session binding")
     if is_bound_cron_job(job):
+        if job.payload.model:
+            raise ValueError("bound cron job cannot specify a model")
         return await run_bound_cron_job(job, agent=agent, cron=cron)
-    if job.payload.session_key and job.payload.kind == "agent_turn":
-        # 静默降级会让「回复原会话」的任务一直答到别处去，必须留声。
-        logger.warning(
-            "Cron job '{}' names a session but lacks origin channel/chat; "
-            "running it in a per-run session instead",
-            job.id,
-        )
     return await run_unbound_cron_job(job, agent=agent, cron=cron)
 
 

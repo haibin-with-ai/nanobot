@@ -101,11 +101,25 @@ def _disable_malformed_legacy_job(job: CronJob) -> None:
     job.payload.channel = None
     job.payload.to = None
     job.payload.channel_meta = {}
+    _disable_invalid_job(job, reason)
+
+
+def _disable_invalid_job(job: CronJob, reason: str) -> None:
     job.enabled = False
     job.state.next_run_at_ms = None
     job.state.last_status = "error"
     job.state.last_error = reason
-    logger.warning("Cron: disabled malformed legacy job '{}' ({}): {}", job.name, job.id, reason)
+    logger.warning("Cron: disabled invalid job '{}' ({}): {}", job.name, job.id, reason)
+
+
+def _validate_agent_turn_payload(payload: CronPayload) -> None:
+    if payload.kind != "agent_turn":
+        return
+    binding = (payload.session_key, payload.origin_channel, payload.origin_chat_id)
+    if any(binding) and not all(binding):
+        raise ValueError("incomplete cron session binding")
+    if all(binding) and payload.model:
+        raise ValueError("bound cron job cannot specify a model")
 
 
 def _normalize_agent_turn_job(job: CronJob) -> bool:
@@ -183,6 +197,10 @@ class CronService:
                 for j in data.get("jobs", []):
                     job = CronJob.from_store_dict(j)
                     _normalize_agent_turn_job(job)
+                    try:
+                        _validate_agent_turn_payload(job.payload)
+                    except ValueError as exc:
+                        _disable_invalid_job(job, str(exc))
                     jobs.append(job)
             except Exception:
                 # Preserve the corrupt file for forensic recovery instead of
@@ -210,6 +228,7 @@ class CronService:
         def _update(params: dict):
             j = CronJob.from_dict(params)
             _normalize_agent_turn_job(j)
+            _validate_agent_turn_payload(j.payload)
             jobs_map[j.id] = j
 
         def _del(params: dict):
@@ -605,6 +624,7 @@ class CronService:
             delete_after_run=delete_after_run,
         )
         _normalize_agent_turn_job(job)
+        _validate_agent_turn_payload(job.payload)
         if self._running:
             store = self._require_store()
             store.jobs.append(job)

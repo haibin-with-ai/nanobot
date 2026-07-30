@@ -202,33 +202,41 @@ class TestBoundStillUsesTheSessionTurnPath:
         assert metadata[CRON_DEFER_UNTIL_IDLE_META] is True
 
     @pytest.mark.asyncio
-    async def test_bound_job_ignores_the_model_field(self):
-        """A bound job belongs to a conversation that already has a preset."""
+    async def test_bound_job_with_model_is_rejected_instead_of_ignored(self):
         agent, cron = _Agent(), _Recorder()
-        await run_cron_job(
-            _job(**_BOUND, model="fast"), agent=agent, cron=cron
-        )
-        assert agent.sessions.presets == {}
 
+        with pytest.raises(ValueError, match="bound cron job cannot specify a model"):
+            await run_cron_job(
+                _job(**_BOUND, model="fast"), agent=agent, cron=cron
+            )
 
-class TestIncompleteBindingFallsBackToItsOwnSession:
-    """A session key alone is not a binding: without an origin channel and chat
-    the bound path can only raise, so such a job must run isolated instead."""
-
-    @pytest.mark.asyncio
-    async def test_session_key_without_origin_runs_unbound(self):
-        agent, cron = _Agent(), _Recorder()
-        await run_cron_job(_job(session_key="discord:123"), agent=agent, cron=cron)
         assert agent.bound_calls == []
-        assert agent.direct_calls[0]["session_key"].startswith("cron:job-1:")
+        assert agent.direct_calls == []
+
+
+class TestIncompleteBindingIsRejected:
+    """Binding fields are atomic and must never degrade to an unbound run."""
 
     @pytest.mark.asyncio
-    async def test_partial_origin_runs_unbound(self):
+    async def test_session_key_without_origin_is_rejected(self):
+        agent, cron = _Agent(), _Recorder()
+
+        with pytest.raises(ValueError, match="incomplete cron session binding"):
+            await run_cron_job(_job(session_key="discord:123"), agent=agent, cron=cron)
+
+        assert agent.bound_calls == []
+        assert agent.direct_calls == []
+
+    @pytest.mark.asyncio
+    async def test_partial_origin_is_rejected(self):
         agent, cron = _Agent(), _Recorder()
         job = _job(session_key="discord:123", origin_channel="discord")
-        await run_cron_job(job, agent=agent, cron=cron)
+
+        with pytest.raises(ValueError, match="incomplete cron session binding"):
+            await run_cron_job(job, agent=agent, cron=cron)
+
         assert agent.bound_calls == []
-        assert cron.last["status"] == "ok"
+        assert agent.direct_calls == []
 
     @pytest.mark.asyncio
     async def test_proactive_delivery_payload_runs_unbound(self):
@@ -239,35 +247,6 @@ class TestIncompleteBindingFallsBackToItsOwnSession:
         await run_cron_job(job, agent=agent, cron=cron)
         assert agent.bound_calls == []
         assert agent.direct_calls[0]["session_key"].startswith("cron:job-1:")
-
-
-class TestHalfBoundJobsAreLoud:
-    """只有 session_key、缺 origin 的任务会降级到独立会话，降级必须留下日志。"""
-
-    async def _warnings(self, job) -> list[str]:
-        from loguru import logger
-
-        captured: list[str] = []
-        sink_id = logger.add(lambda m: captured.append(str(m)), level="WARNING")
-        # 别的用例可能跑过 logger.disable("nanobot")，这里显式打开。
-        logger.enable("nanobot")
-        try:
-            await run_cron_job(job, agent=_Agent(), cron=_Recorder())
-        finally:
-            logger.remove(sink_id)
-        return captured
-
-    @pytest.mark.asyncio
-    async def test_missing_origin_logs_a_warning(self) -> None:
-        captured = await self._warnings(_job(session_key="discord:123"))
-
-        assert any("origin channel/chat" in line for line in captured)
-
-    @pytest.mark.asyncio
-    async def test_fully_bound_jobs_stay_quiet(self) -> None:
-        captured = await self._warnings(_job(**_BOUND))
-
-        assert not [line for line in captured if "origin channel/chat" in line]
 
 
 class TestUnboundRunsSweepTheirOwnLitter:

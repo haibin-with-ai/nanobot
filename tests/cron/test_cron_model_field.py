@@ -64,6 +64,61 @@ class TestModelReachesTheStoredJob:
         reloaded = CronService(path).get_job(job.id)
         assert reloaded is not None and reloaded.payload.model == "fast"
 
+    def test_add_rejects_model_on_bound_job(self, tmp_path):
+        import pytest
+
+        service = CronService(_store(tmp_path))
+        with pytest.raises(ValueError, match="bound cron job cannot specify a model"):
+            service.add_job(
+                name="bound",
+                message="ping",
+                schedule=CronSchedule(kind="every", every_ms=60_000),
+                session_key="discord:123",
+                origin_channel="discord",
+                origin_chat_id="chat-9",
+                model="fast",
+            )
+
+
+class TestBindingIsAtomicAtStorageBoundary:
+    def test_add_rejects_incomplete_binding(self, tmp_path):
+        import pytest
+
+        service = CronService(_store(tmp_path))
+        with pytest.raises(ValueError, match="incomplete cron session binding"):
+            service.add_job(
+                name="half-bound",
+                message="ping",
+                schedule=CronSchedule(kind="every", every_ms=60_000),
+                session_key="discord:123",
+            )
+
+    def test_load_disables_incomplete_binding(self, tmp_path):
+        path = _store(tmp_path)
+        path.write_text(json.dumps({
+            "version": 1,
+            "jobs": [{
+                "id": "half-bound-1",
+                "name": "half-bound",
+                "enabled": True,
+                "payload": {
+                    "kind": "agent_turn",
+                    "message": "ping",
+                    "sessionKey": "discord:123",
+                },
+                "schedule": {"kind": "every", "everyMs": 60000},
+                "state": {"nextRunAtMs": 1},
+            }],
+        }))
+
+        job = CronService(path).get_job("half-bound-1")
+
+        assert job is not None
+        assert job.enabled is False
+        assert job.state.next_run_at_ms is None
+        assert job.state.last_status == "error"
+        assert "incomplete cron session binding" in (job.state.last_error or "")
+
 
 class TestModelSurvivesAStoreRewrite:
     """Any full store rewrite must carry the model, or a restart silently

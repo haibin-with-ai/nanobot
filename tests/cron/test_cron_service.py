@@ -82,6 +82,8 @@ def test_load_jobs_coerces_string_schedule_and_state_ms(tmp_path) -> None:
                             "kind": "agent_turn",
                             "message": "hi",
                             "sessionKey": "websocket:chat-1",
+                            "originChannel": "websocket",
+                            "originChatId": "chat-1",
                         },
                         "state": {
                             "nextRunAtMs": "100",
