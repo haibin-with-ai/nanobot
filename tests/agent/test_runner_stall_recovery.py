@@ -149,6 +149,31 @@ class TestPhaseThreeGivesUp:
         assert result.stop_reason == "error"
         assert len(provider.seen) == 1
 
+    @pytest.mark.asyncio
+    async def test_last_iteration_stall_is_not_silently_demoted(self) -> None:
+        """Phase 2 must still give up explicitly when the iteration budget ends."""
+        from nanobot.agent.runner import AgentRunner
+
+        provider = _Provider(_stall(), _stall(), _stall())
+        result = await AgentRunner().run(_spec(provider, max_iterations=3))
+
+        assert result.stop_reason == "error"
+        assert result.final_content == result.error
+        assert "放弃" in result.final_content
+        assert len(provider.seen) == 3
+
+    @pytest.mark.asyncio
+    async def test_stall_threshold_depends_on_one_counter_only(self) -> None:
+        """A successful tool turn resets the sole stall state for the run."""
+        from nanobot.agent.runner import AgentRunner
+
+        provider = _Provider(_stall(), _stall(), _tool_call(), _stall(), _stall(), _ok())
+        result = await AgentRunner().run(_spec(provider))
+
+        assert result.final_content == "done"
+        assert result.stop_reason == "completed"
+        assert len(provider.seen) == 6
+
 
 class TestOuterTimeoutCoversTheWholeModelChain:
     """外层墙钟预算要按候选模型数放大，否则慢的主模型会把备用模型一起掐掉。"""
@@ -178,6 +203,34 @@ class TestOuterTimeoutCoversTheWholeModelChain:
         result = await AgentRunner().run(spec)
 
         assert result.final_content == "primary late"
+
+    @pytest.mark.asyncio
+    async def test_run_deadline_caps_repeated_stall_retries(self) -> None:
+        """A run gets one wall-clock budget, not timeout multiplied by stalls."""
+        from nanobot.agent.runner import AgentRunner
+
+        now = [0.0]
+
+        class _SlowStalls:
+            model_attempt_budget = 1
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat_with_retry(self, *, messages, **_kwargs) -> LLMResponse:
+                self.calls += 1
+                now[0] += 0.11
+                return _stall()
+
+        provider = _SlowStalls()
+        result = await AgentRunner(clock=lambda: now[0]).run(
+            _spec(provider, llm_timeout_s=0.1)
+        )
+
+        assert result.stop_reason == "error"
+        assert "放弃" in result.final_content
+        assert provider.calls == 1
+        assert result.messages[-1]["role"] == "assistant"
 
     @pytest.mark.asyncio
     async def test_a_long_chain_does_not_multiply_the_wall(self) -> None:

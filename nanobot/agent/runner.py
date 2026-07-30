@@ -137,8 +137,9 @@ _llm_timing: ContextVar[dict[str, float] | None] = ContextVar("_llm_timing", def
 class AgentRunner:
     """Run a tool-capable LLM loop without product-layer concerns."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = perf_counter) -> None:
         self.context_governor = ContextGovernor()
+        self._clock = clock
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -354,10 +355,12 @@ class AgentRunner:
         timing: dict[str, float] = {"llm_ms": 0.0, "depth": 0.0}
         timing_token = _llm_timing.set(timing)
         started_at = perf_counter()
+        wall_budget_s = self._model_wall_budget(spec, hook)
+        deadline = self._clock() + wall_budget_s if wall_budget_s is not None else None
 
         try:
             await hook.before_run(context)
-            result = await self._run_core(spec, hook, messages)
+            result = await self._run_core(spec, hook, messages, deadline)
         except asyncio.CancelledError as exc:
             context.messages = deepcopy(messages)
             context.stop_reason = "cancelled"
@@ -406,6 +409,7 @@ class AgentRunner:
         spec: AgentRunSpec,
         hook: AgentHook,
         messages: list[dict[str, Any]],
+        deadline: float | None,
     ) -> AgentRunResult:
         final_content: str | None = None
         tools_used: list[str] = []
@@ -456,7 +460,10 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            request_deadline = deadline if total_stalls else None
+            response = await self._request_model(
+                spec, messages_for_model, hook, context, deadline=request_deadline,
+            )
             context.response = response
             context.tool_calls = list(response.tool_calls)
             if not self._is_stall(response):
@@ -688,10 +695,16 @@ class AgentRunner:
                 continue
 
             # 预算用尽时不再重试，交给下面的通用错误分支收尾。
-            stall_gave_up = False
-            if self._is_stall(response) and iteration + 1 < spec.max_iterations:
+            is_stall = self._is_stall(response)
+            deadline_reached = deadline is not None and self._clock() >= deadline
+            stall_gave_up = (
+                is_stall
+                and iteration + 1 >= spec.max_iterations
+                and not self._is_wall_timeout(response)
+            )
+            if is_stall and iteration + 1 < spec.max_iterations:
                 total_stalls += 1
-                if total_stalls >= _MAX_TOTAL_STALLS:
+                if total_stalls >= _MAX_TOTAL_STALLS or deadline_reached:
                     # 放弃也走通用错误分支：上下文照常落盘，用户拿到明确文案。
                     logger.warning("Model stalled {} times in one run; giving up", total_stalls)
                     stall_gave_up = True
@@ -825,6 +838,30 @@ class AgentRunner:
             pending_stream_content=pending_stream_content,
         )
 
+    @staticmethod
+    def _llm_timeout(spec: AgentRunSpec) -> float | None:
+        timeout_s = spec.llm_timeout_s
+        if timeout_s is None:
+            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "300").strip()
+            try:
+                timeout_s = float(raw)
+            except (TypeError, ValueError):
+                timeout_s = 300.0
+        return timeout_s if timeout_s is not None and timeout_s > 0 else None
+
+    def _model_wall_budget(self, spec: AgentRunSpec, hook: AgentHook) -> float | None:
+        timeout_s = self._llm_timeout(spec)
+        if timeout_s is None:
+            return None
+        attempts = min(2, max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1))))
+        if hook.wants_streaming() or (
+            spec.stream_progress_deltas
+            and spec.progress_callback is not None
+            and getattr(spec.runtime.provider, "supports_progress_deltas", False) is True
+        ):
+            return max(300.0, timeout_s * 2) * attempts
+        return timeout_s * attempts
+
     def _build_request_kwargs(
         self,
         spec: AgentRunSpec,
@@ -868,19 +905,9 @@ class AgentRunner:
         context: AgentHookContext,
         *,
         malformed_retry: bool = False,
+        deadline: float | None = None,
     ):
-        timeout_s: float | None = spec.llm_timeout_s
-        if timeout_s is None:
-            # Default to a finite timeout to avoid per-session lock starvation when an LLM
-            # request hangs indefinitely (e.g. gateway/network stall).
-            # Set NANOBOT_LLM_TIMEOUT_S=0 to disable.
-            raw = os.environ.get("NANOBOT_LLM_TIMEOUT_S", "300").strip()
-            try:
-                timeout_s = float(raw)
-            except (TypeError, ValueError):
-                timeout_s = 300.0
-        if timeout_s is not None and timeout_s <= 0:
-            timeout_s = None
+        timeout_s = self._llm_timeout(spec)
 
         kwargs = self._build_request_kwargs(
             spec,
@@ -991,6 +1018,9 @@ class AgentRunner:
             if timeout_s is not None
             else None
         )
+        if deadline is not None:
+            remaining_s = max(0.0, deadline - self._clock())
+            outer_timeout_s = min(outer_timeout_s, remaining_s) if outer_timeout_s else remaining_s
         try:
             response = (
                 await coro if outer_timeout_s is None
@@ -1040,6 +1070,7 @@ class AgentRunner:
             return await self._request_model(
                 spec, retry_messages, hook, context,
                 malformed_retry=True,
+                deadline=deadline,
             )
         if (
             all_dropped
@@ -1553,6 +1584,10 @@ class AgentRunner:
     def _is_stall(response: LLMResponse) -> bool:
         """Stall 只认 provider 给的 timeout 标记，不做文案匹配。"""
         return response.finish_reason == "error" and response.error_kind == "timeout"
+
+    @staticmethod
+    def _is_wall_timeout(response: LLMResponse) -> bool:
+        return response.content.startswith("Error calling LLM: timed out after ")
 
     @staticmethod
     def _append_stall_notice(messages: list[dict[str, Any]]) -> None:
