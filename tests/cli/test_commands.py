@@ -30,6 +30,7 @@ from nanobot.webui.metadata import (
     WEBUI_MESSAGE_SOURCE_METADATA_KEY,
     WEBUI_TURN_METADATA_KEY,
 )
+from tests.cli.fakes import SessionManagerStub
 
 runner = CliRunner()
 
@@ -1846,18 +1847,8 @@ def _patch_gateway_ports_free(monkeypatch) -> None:
     monkeypatch.setattr("nanobot.cli.commands._webui_endpoint_reachable", lambda *_a, **_kw: False)
 
 
-class _StubSessionManager:
-    """gateway 启动会清理 cron 会话，替身必须提供这些方法。"""
-
-    def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-        return {"keys": [], "count": 0, "bytes": 0}
-
-    def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-        return None
-
-
-def _stub_session_manager(_workspace) -> _StubSessionManager:
-    return _StubSessionManager()
+def _stub_session_manager(_workspace) -> SessionManagerStub:
+    return SessionManagerStub()
 
 
 def _patch_cli_command_runtime(
@@ -1930,13 +1921,7 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
         def retain_recent_legal_suffix(self, limit: int) -> None:
             seen["retained_limit"] = limit
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
+    class _FakeSessionManager(SessionManagerStub):
         def __init__(self, _workspace: Path) -> None:
             self.session = _FakeSession()
             seen["heartbeat_session"] = self.session
@@ -2601,13 +2586,7 @@ def test_gateway_unbound_agent_cron_uses_isolated_session(
         def add_message(self, role: str, content: str, **kwargs) -> None:
             self.messages.append({"role": role, "content": content, **kwargs})
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
+    class _FakeSessionManager(SessionManagerStub):
         def __init__(self, _workspace: Path) -> None:
             self.session = _FakeSession()
             seen["session_manager"] = self
@@ -2638,7 +2617,7 @@ def test_gateway_unbound_agent_cron_uses_isolated_session(
             self.model = "test-model"
             self.provider = kwargs.get("provider", object())
             self.tools = {}
-            self.sessions = seen.get("session_manager") or _StubSessionManager()
+            self.sessions = seen.get("session_manager") or SessionManagerStub()
             seen["agent"] = self
 
         def set_session_model_preset(self, session_key, name):
@@ -2742,13 +2721,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
     )
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
+    class _FakeSessionManager(SessionManagerStub):
         def __init__(self, _workspace: Path) -> None:
             pass
 
@@ -2771,7 +2744,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
             self.model = "test-model"
             self.provider = kwargs.get("provider", object())
             self.tools = {}
-            self.sessions = seen.get("session_manager") or _StubSessionManager()
+            self.sessions = seen.get("session_manager") or SessionManagerStub()
             seen["agent"] = self
 
         async def submit_cron_turn(self, msg: InboundMessage):
@@ -2956,15 +2929,8 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     class _FakeContext:
         memory = _FakeMemory()
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
-        def flush_all(self) -> int:
-            return 0
+    class _FakeSessionManager(SessionManagerStub):
+        pass
 
         def list_sessions(self) -> list[dict[str, object]]:
             return []
@@ -3232,15 +3198,8 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
     config.gateway.port = 18791
     captured: dict[str, object] = {}
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
-        def flush_all(self) -> int:
-            return 0
+    class _FakeSessionManager(SessionManagerStub):
+        pass
 
     class _FakeAgentLoop:
         @classmethod
@@ -3431,15 +3390,8 @@ def test_gateway_shutdown_lets_agent_task_own_mcp_cleanup(
     config.gateway.port = 18791
     seen: dict[str, object] = {}
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
-        def flush_all(self) -> int:
-            return 0
+    class _FakeSessionManager(SessionManagerStub):
+        pass
 
     class _FakeAgentLoop:
         @classmethod
@@ -3536,15 +3488,8 @@ def test_gateway_shutdown_event_exits_forever_runtime_tasks(
     seen: dict[str, object] = {}
     shutdown_order: list[str] = []
 
-    class _FakeSessionManager:
-        def prune_cron_run_sessions(self, **_kw: object) -> dict[str, object]:
-            return {"keys": [], "count": 0, "bytes": 0}
-
-        def maybe_prune_cron_run_sessions(self, **_kw: object) -> None:
-            return None
-
-        def flush_all(self) -> int:
-            return 0
+    class _FakeSessionManager(SessionManagerStub):
+        pass
 
     class _FakeAgentLoop:
         @classmethod

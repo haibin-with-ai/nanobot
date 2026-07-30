@@ -94,3 +94,21 @@ def test_write_text_atomic_keeps_file_when_directory_fsync_is_unsupported(
 
     assert target.read_text(encoding="utf-8") == '{"pending": {}}'
     assert len(fsync_calls) == 1
+
+
+def test_write_text_atomic_propagates_replace_failure_without_replacing_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = tmp_path / "pairing.json"
+    target.write_text('{"original": true}', encoding="utf-8")
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("rename failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="rename failed"):
+        _write_text_atomic(target, '{"replacement": true}')
+
+    assert target.read_text(encoding="utf-8") == '{"original": true}'
+    assert list(tmp_path.iterdir()) == [target]
