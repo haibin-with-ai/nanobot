@@ -202,7 +202,8 @@ async def test_chat_stream_without_callback_still_finalizes() -> None:
     provider = AnthropicProvider(api_key="sk-test")
     provider._client = MagicMock()
 
-    fake = _FakeAsyncStream([])
+    chunks = [SimpleNamespace(type="message_start"), SimpleNamespace(type="message_stop")]
+    fake = _FakeAsyncStream(chunks)
     fake.get_final_message = AsyncMock(return_value=_final_message_stub("ok"))
     stream_cm = MagicMock()
     stream_cm.__aenter__ = AsyncMock(return_value=fake)
@@ -214,4 +215,5 @@ async def test_chat_stream_without_callback_still_finalizes() -> None:
         on_content_delta=None,
     )
     assert res.content == "ok"
+    assert fake._idx == len(chunks)
     fake.get_final_message.assert_awaited_once()
