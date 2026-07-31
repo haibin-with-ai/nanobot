@@ -12,10 +12,15 @@ Every entry writes out all fields so you can copy-paste as a template.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic.alias_generators import to_snake
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nanobot.config.schema import ProviderConfig
+    from nanobot.providers.base import LLMProvider
 
 
 @dataclass(frozen=True)
@@ -764,3 +769,133 @@ def create_dynamic_spec(
         strip_model_prefixes=strip_prefixes,
         thinking_style=thinking_style,
     )
+
+
+# ---------------------------------------------------------------------------
+# Backend builders — construction lives next to the metadata, so adding a
+# provider means touching this file only. factory.py just looks up the table.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProviderBuildRequest:
+    """Everything a backend builder needs, resolved by the factory."""
+
+    model: str
+    provider_name: str
+    spec: ProviderSpec | None
+    provider_config: ProviderConfig | None
+    api_base: str | None  # config-resolved base URL
+    extra_headers: dict[str, str] | None
+
+
+def _anthropic_credential(provider_config: ProviderConfig | None, *, oauth: bool) -> str | None:
+    """OAuth 订阅没有 api_key，凭据从本地 token store 取。"""
+    if not oauth:
+        return provider_config.api_key if provider_config else None
+    from nanobot.providers.oauth_store import OAuthCredentialStore
+
+    creds = OAuthCredentialStore().get_token()
+    return creds.access_token if creds else None
+
+
+def _build_openai_codex(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
+    p = req.provider_config
+    return OpenAICodexProvider(
+        default_model=req.model,
+        proxy=getattr(p, "proxy", None) if p else None,
+        extra_body=p.extra_body if p else None,
+    )
+
+
+def _build_xai_grok(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.xai_grok_provider import XAIGrokProvider
+
+    p = req.provider_config
+    return XAIGrokProvider(
+        default_model=req.model,
+        proxy=getattr(p, "proxy", None) if p else None,
+        extra_body=p.extra_body if p else None,
+    )
+
+
+def _build_azure_openai(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+
+    # factory 在分派前就校验过 api_key / api_base，这里的 provider_config 必然存在。
+    p = req.provider_config
+    return AzureOpenAIProvider(
+        api_key=(p.api_key or "") if p else "",
+        api_base=p.api_base if p else None,
+        default_model=req.model,
+    )
+
+
+def _build_github_copilot(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
+
+    return GitHubCopilotProvider(default_model=req.model)
+
+
+def _build_anthropic(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.anthropic_provider import AnthropicProvider
+
+    oauth = bool(req.spec and req.spec.is_oauth)
+    return AnthropicProvider(
+        api_key=_anthropic_credential(req.provider_config, oauth=oauth),
+        api_base=req.api_base,
+        default_model=req.model,
+        extra_headers=req.extra_headers,
+        product_mode="claude_code" if oauth else "",
+    )
+
+
+def _build_bedrock(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.bedrock_provider import BedrockProvider
+
+    p = req.provider_config
+    return BedrockProvider(
+        api_key=p.api_key if p else None,
+        api_base=p.api_base if p else None,
+        default_model=req.model,
+        region=getattr(p, "region", None) if p else None,
+        profile=getattr(p, "profile", None) if p else None,
+        extra_body=p.extra_body if p else None,
+    )
+
+
+def _build_openai_compat(req: ProviderBuildRequest) -> LLMProvider:
+    from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+    p = req.provider_config
+    return OpenAICompatProvider(
+        api_key=p.api_key if p else None,
+        api_base=req.api_base,
+        default_model=req.model,
+        extra_headers=req.extra_headers,
+        spec=req.spec,
+        extra_body=p.extra_body if p else None,
+        api_type=p.api_type if p and req.provider_name == "openai" else "auto",
+        extra_query=p.extra_query if p else None,
+        proxy=p.proxy if p else None,
+    )
+
+
+ProviderBuilder = Callable[["ProviderBuildRequest"], "LLMProvider"]
+
+BACKEND_BUILDERS: dict[str, ProviderBuilder] = {
+    "openai_codex": _build_openai_codex,
+    "xai_grok": _build_xai_grok,
+    "azure_openai": _build_azure_openai,
+    "github_copilot": _build_github_copilot,
+    "anthropic": _build_anthropic,
+    "bedrock": _build_bedrock,
+    "openai_compat": _build_openai_compat,
+}
+
+
+def builder_for_backend(backend: str) -> ProviderBuilder:
+    """Unknown backends fall back to the OpenAI-compatible builder."""
+    return BACKEND_BUILDERS.get(backend, _build_openai_compat)

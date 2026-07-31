@@ -8,7 +8,13 @@ from pathlib import Path
 from nanobot.config.schema import Config, InlineFallbackConfig, ModelPresetConfig, ProviderConfig
 from nanobot.providers.base import GenerationSettings, LLMProvider
 from nanobot.providers.fallback_provider import FallbackProvider
-from nanobot.providers.registry import ProviderSpec, create_dynamic_spec, find_by_name
+from nanobot.providers.registry import (
+    ProviderBuildRequest,
+    ProviderSpec,
+    builder_for_backend,
+    create_dynamic_spec,
+    find_by_name,
+)
 
 
 @dataclass(frozen=True)
@@ -38,16 +44,6 @@ def _provider_extra_headers(
     if provider_config and provider_config.extra_headers:
         headers.update(provider_config.extra_headers)
     return headers or None
-
-
-def _anthropic_credential(provider_config: ProviderConfig | None, *, oauth: bool) -> str | None:
-    """OAuth 订阅没有 api_key，凭据从本地 token store 取。"""
-    if not oauth:
-        return provider_config.api_key if provider_config else None
-    from nanobot.providers.oauth_store import OAuthCredentialStore
-
-    creds = OAuthCredentialStore().get_token()
-    return creds.access_token if creds else None
 
 
 def _make_provider_core(
@@ -97,70 +93,16 @@ def _make_provider_core(
         if needs_key and not exempt:
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
-    if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-
-        provider = OpenAICodexProvider(
-            default_model=model,
-            proxy=getattr(p, "proxy", None) if p else None,
-            extra_body=p.extra_body if p else None,
-        )
-    elif backend == "xai_grok":
-        from nanobot.providers.xai_grok_provider import XAIGrokProvider
-
-        provider = XAIGrokProvider(
-            default_model=model,
-            proxy=getattr(p, "proxy", None) if p else None,
-            extra_body=p.extra_body if p else None,
-        )
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key or "",
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "github_copilot":
-        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
-
-        provider = GitHubCopilotProvider(default_model=model)
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-
-        oauth = bool(spec and spec.is_oauth)
-        provider = AnthropicProvider(
-            api_key=_anthropic_credential(p, oauth=oauth),
-            api_base=config.get_api_base(model, preset=resolved),
-            default_model=model,
-            extra_headers=_provider_extra_headers(spec, p),
-            product_mode="claude_code" if oauth else "",
-        )
-    elif backend == "bedrock":
-        from nanobot.providers.bedrock_provider import BedrockProvider
-
-        provider = BedrockProvider(
-            api_key=p.api_key if p else None,
-            api_base=p.api_base if p else None,
-            default_model=model,
-            region=getattr(p, "region", None) if p else None,
-            profile=getattr(p, "profile", None) if p else None,
-            extra_body=p.extra_body if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model, preset=resolved),
-            default_model=model,
-            extra_headers=_provider_extra_headers(spec, p),
+    provider = builder_for_backend(backend)(
+        ProviderBuildRequest(
+            model=model,
+            provider_name=provider_name or "",
             spec=spec,
-            extra_body=p.extra_body if p else None,
-            api_type=p.api_type if p and provider_name == "openai" else "auto",
-            extra_query=p.extra_query if p else None,
-            proxy=p.proxy if p else None,
+            provider_config=p,
+            api_base=config.get_api_base(model, preset=resolved),
+            extra_headers=_provider_extra_headers(spec, p),
         )
+    )
 
     provider.generation = resolved.to_generation_settings()
     return provider
