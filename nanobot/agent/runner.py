@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from loguru import logger
 
@@ -61,6 +61,9 @@ _STALL_NOTICE = "[上一轮回复超时中断，未产生内容，请重新作�
 # Phase 2：同模型静默重试的连续上限。Phase 3：一次运行内允许的超时总数。
 _MAX_STALL_RETRIES = 2
 _MAX_TOTAL_STALLS = 4
+# runner 自己掐掉的调用带独立标记，好和 provider 报的超时区分开。
+_WALL_TIMEOUT_KIND = "wall_timeout"
+_STALL_ERROR_KINDS = ("timeout", _WALL_TIMEOUT_KIND)
 
 
 _STALL_GIVE_UP_MESSAGE = "模型连续多次无响应，本轮放弃。已保留上下文，可以直接重试。"
@@ -421,8 +424,7 @@ class AgentRunner:
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
-        consecutive_stalls = 0
-        total_stalls = 0
+        stalls = 0
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -460,7 +462,7 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            request_deadline = deadline if total_stalls else None
+            request_deadline = deadline if stalls else None
             response = await self._request_model(
                 spec, messages_for_model, hook, context, deadline=request_deadline,
             )
@@ -468,8 +470,7 @@ class AgentRunner:
             context.tool_calls = list(response.tool_calls)
             if not self._is_stall(response):
                 # 任何一次有响应的回合都清账，包括只调了工具的回合。
-                consecutive_stalls = 0
-                total_stalls = 0
+                stalls = 0
 
             original_content = response.content
             reasoning_text, cleaned_content = extract_reasoning(
@@ -695,35 +696,26 @@ class AgentRunner:
                 continue
 
             # 预算用尽时不再重试，交给下面的通用错误分支收尾。
-            is_stall = self._is_stall(response)
-            deadline_reached = deadline is not None and self._clock() >= deadline
-            stall_gave_up = (
-                is_stall
-                and iteration + 1 >= spec.max_iterations
-                and not self._is_wall_timeout(response)
-            )
-            if is_stall and iteration + 1 < spec.max_iterations:
-                total_stalls += 1
-                if total_stalls >= _MAX_TOTAL_STALLS or deadline_reached:
-                    # 放弃也走通用错误分支：上下文照常落盘，用户拿到明确文案。
-                    logger.warning("Model stalled {} times in one run; giving up", total_stalls)
-                    stall_gave_up = True
-                else:
-                    consecutive_stalls += 1
-                    if consecutive_stalls > _MAX_STALL_RETRIES:
-                        consecutive_stalls = 0
-                        self._append_stall_notice(messages)
-                    logger.warning(
-                        "Model stalled (consecutive={}, total={}); retrying",
-                        consecutive_stalls,
-                        total_stalls,
-                    )
+            if self._is_stall(response):
+                stalls += 1
+                verdict = self._stall_verdict(
+                    stalls,
+                    out_of_iterations=iteration + 1 >= spec.max_iterations,
+                    out_of_time=deadline is not None and self._clock() >= deadline,
+                )
+                if verdict != "give_up":
+                    if verdict == "notice_retry" and not self._append_stall_notice(messages):
+                        logger.warning("Stall notice could not be attached; model won't see it")
+                    logger.warning("Model stalled {} time(s) in this run; retrying", stalls)
                     await hook.after_iteration(context)
                     continue
+                # 放弃也走通用错误分支：上下文照常落盘，用户拿到明确文案。
+                logger.warning("Model stalled {} time(s) in this run; giving up", stalls)
+                if not self._is_wall_timeout(response):
+                    # 墙钟超时自带具体秒数，比统一文案更能说明是谁掐的。
+                    clean = _STALL_GIVE_UP_MESSAGE
             if response.finish_reason == "error":
-                if stall_gave_up:
-                    final_content = _STALL_GIVE_UP_MESSAGE
-                elif LLMProvider.is_arrearage_response(response):
+                if LLMProvider.is_arrearage_response(response):
                     final_content = _ARREARAGE_ERROR_MESSAGE
                 else:
                     final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
@@ -854,13 +846,21 @@ class AgentRunner:
         if timeout_s is None:
             return None
         attempts = min(2, max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1))))
-        if hook.wants_streaming() or (
-            spec.stream_progress_deltas
-            and spec.progress_callback is not None
-            and getattr(spec.runtime.provider, "supports_progress_deltas", False) is True
-        ):
+        if any(self._streaming_modes(spec, hook)):
             return max(300.0, timeout_s * 2) * attempts
         return timeout_s * attempts
+
+    @staticmethod
+    def _streaming_modes(spec: AgentRunSpec, hook: AgentHook) -> tuple[bool, bool]:
+        """(整段流式, 进度增量流式) —— 预算和发请求共用同一处判定。"""
+        wants_streaming = hook.wants_streaming()
+        wants_progress_streaming = (
+            not wants_streaming
+            and spec.stream_progress_deltas
+            and spec.progress_callback is not None
+            and getattr(spec.runtime.provider, "supports_progress_deltas", False) is True
+        )
+        return wants_streaming, wants_progress_streaming
 
     def _build_request_kwargs(
         self,
@@ -907,20 +907,12 @@ class AgentRunner:
         malformed_retry: bool = False,
         deadline: float | None = None,
     ):
-        timeout_s = self._llm_timeout(spec)
-
         kwargs = self._build_request_kwargs(
             spec,
             messages,
             tools=spec.tools.get_definitions(),
         )
-        wants_streaming = hook.wants_streaming()
-        wants_progress_streaming = (
-            not wants_streaming
-            and spec.stream_progress_deltas
-            and spec.progress_callback is not None
-            and getattr(spec.runtime.provider, "supports_progress_deltas", False) is True
-        )
+        wants_streaming, wants_progress_streaming = self._streaming_modes(spec, hook)
 
         progress_state: dict[str, bool] | None = None
         active_hosted_tools: dict[str, dict[str, Any]] = {}
@@ -1006,18 +998,10 @@ class AgentRunner:
         # very slow deltas can still run forever. Use a more generous wall-clock
         # timeout for streaming while preserving NANOBOT_LLM_TIMEOUT_S=0 as an
         # opt-out for all LLM wall-clock timeouts.
-        is_streaming_request = wants_streaming or wants_progress_streaming
         # 一次调用可能依次试多个模型，墙钟预算要给备用模型留出空间，
         # 否则慢的主模型会把后面的备用模型一起取消掉。
         # 但也只留一个模型的余量：这道墙是保命的，不是给整条链做 SLA 的。
-        attempts = min(2, max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1))))
-        outer_timeout_s = (
-            max(300.0, timeout_s * 2) * attempts
-            if is_streaming_request and timeout_s is not None
-            else timeout_s * attempts
-            if timeout_s is not None
-            else None
-        )
+        outer_timeout_s = self._model_wall_budget(spec, hook)
         if deadline is not None:
             remaining_s = max(0.0, deadline - self._clock())
             outer_timeout_s = min(outer_timeout_s, remaining_s) if outer_timeout_s else remaining_s
@@ -1037,7 +1021,7 @@ class AgentRunner:
                 response = LLMResponse(
                     content=f"Error calling LLM: timed out after {outer_timeout_s:g}s",
                     finish_reason="error",
-                    error_kind="timeout",
+                    error_kind=_WALL_TIMEOUT_KIND,
                 )
         # chat_stream_with_retry may recover internally, so only fail unfinished
         # hosted calls after the provider returns its final error response.
@@ -1581,21 +1565,32 @@ class AgentRunner:
         messages.append(build_assistant_message(content))
 
     @staticmethod
+    def _stall_verdict(
+        stalls: int, *, out_of_iterations: bool, out_of_time: bool
+    ) -> Literal["retry", "notice_retry", "give_up"]:
+        """一个计数器决定三个阶段，调用方不再自己拼状态。"""
+        if stalls >= _MAX_TOTAL_STALLS or out_of_iterations or out_of_time:
+            return "give_up"
+        return "notice_retry" if stalls > _MAX_STALL_RETRIES else "retry"
+
+    @staticmethod
     def _is_stall(response: LLMResponse) -> bool:
-        """Stall 只认 provider 给的 timeout 标记，不做文案匹配。"""
-        return response.finish_reason == "error" and response.error_kind == "timeout"
+        """Stall 只认 timeout 类标记，不做文案匹配。"""
+        return response.finish_reason == "error" and response.error_kind in _STALL_ERROR_KINDS
 
     @staticmethod
     def _is_wall_timeout(response: LLMResponse) -> bool:
-        return response.content.startswith("Error calling LLM: timed out after ")
+        """只有 runner 自己掐掉的调用才算墙钟超时，由标记而非措辞认定。"""
+        return response.error_kind == _WALL_TIMEOUT_KIND
 
     @staticmethod
-    def _append_stall_notice(messages: list[dict[str, Any]]) -> None:
-        """让模型自己看见上一轮超时，而不是静默重来。"""
+    def _append_stall_notice(messages: list[dict[str, Any]]) -> bool:
+        """让模型自己看见上一轮超时。贴不上就说贴不上，别让调用方替它宣称。"""
         last = messages[-1] if messages else {}
         if last.get("role") == "assistant" and not last.get("tool_calls"):
-            return
+            return False
         messages.append(build_assistant_message(_STALL_NOTICE))
+        return True
 
     @staticmethod
     def _append_model_error_placeholder(messages: list[dict[str, Any]]) -> None:
