@@ -9,12 +9,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.context import (
     RequestContext,
     bind_request_context,
     reset_request_context,
 )
+from nanobot.agent.tools.cron import CronTool
 
 
 class _Resolver:
