@@ -142,6 +142,13 @@ if DISCORD_AVAILABLE:
                 self._channel.logger.warning("interaction response failed: {}", e)
                 return False
 
+        async def _followup_ephemeral(self, interaction: discord.Interaction, text: str) -> None:
+            """首次响应已经用掉后，后续消息只能走 followup。"""
+            try:
+                await interaction.followup.send(text, ephemeral=True)
+            except Exception as e:
+                self._channel.logger.warning("interaction followup failed: {}", e)
+
         async def _resolve_interaction_channel(
             self,
             interaction: discord.Interaction,
@@ -210,13 +217,18 @@ if DISCORD_AVAILABLE:
                     metadata["thread_id"] = str(channel_id)
                     session_key = f"{self._channel.name}:{parent_channel_id}:thread:{channel_id}"
 
-            await self._channel._handle_message(
-                sender_id=sender_id,
-                chat_id=str(channel_id),
-                content=command_text,
-                metadata=metadata,
-                session_key=session_key,
-            )
+            try:
+                await self._channel._handle_message(
+                    sender_id=sender_id,
+                    chat_id=str(channel_id),
+                    content=command_text,
+                    metadata=metadata,
+                    session_key=session_key,
+                )
+            except Exception as e:
+                # 回执已经发过 Processing，这里再不说话用户就只能干等。
+                self._channel.logger.warning("slash command '{}' failed: {}", command_text, e)
+                await self._followup_ephemeral(interaction, f"Command {command_text} failed: {e}")
 
         def _register_app_commands(self) -> None:
             for spec in BUILTIN_COMMAND_SPECS:
