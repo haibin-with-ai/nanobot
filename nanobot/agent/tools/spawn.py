@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import current_request_context
+from nanobot.agent.tools.presets import UnknownPresetError, resolve_preset
 from nanobot.agent.tools.schema import (
     BooleanSchema,
     NumberSchema,
@@ -16,10 +17,6 @@ from nanobot.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
-
-
-class _UnknownPresetError(LookupError):
-    """Model asked for a preset that does not exist; surface it as a tool error."""
 
 
 @tool_parameters(
@@ -81,14 +78,7 @@ class SpawnTool(Tool):
 
     def _resolve_runtime(self, model: str | None, default: Any) -> Any:
         """未指定 preset 就沿用父 runtime；resolver 缺席时忽略 model 而不是报错。"""
-        if not model or self._resolver is None:
-            return default
-        try:
-            return self._resolver.resolve_preset(model)
-        except (KeyError, ValueError) as e:
-            # resolver 的报错已经带上可用 preset 列表，原样透出别再拼一遍
-            detail = e.args[0] if e.args else str(e)
-            raise _UnknownPresetError(str(detail)) from None
+        return resolve_preset(self._resolver, model, default)
 
     async def execute(
         self,
@@ -113,7 +103,7 @@ class SpawnTool(Tool):
             return ToolResult.error("Error: spawn requires an active model runtime")
         try:
             runtime = self._resolve_runtime(model, request_ctx.runtime)
-        except _UnknownPresetError as e:
+        except UnknownPresetError as e:
             return ToolResult.error(str(e))
         origin_channel = request_ctx.channel
         origin_chat_id = request_ctx.chat_id

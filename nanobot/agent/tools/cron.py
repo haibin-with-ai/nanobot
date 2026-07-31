@@ -8,6 +8,7 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import current_request_context
+from nanobot.agent.tools.presets import UnknownPresetError, resolve_preset
 from nanobot.agent.tools.schema import (
     IntegerSchema,
     StringSchema,
@@ -59,9 +60,15 @@ _CRON_PARAMETERS = tool_parameters_schema(
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
+    def __init__(
+        self,
+        cron_service: CronService,
+        default_timezone: str = "UTC",
+        runtime_resolver: Any = None,
+    ):
         self._cron = cron_service
         self._default_timezone = default_timezone
+        self._resolver = runtime_resolver
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
     @classmethod
@@ -70,7 +77,11 @@ class CronTool(Tool):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls(cron_service=ctx.cron_service, default_timezone=ctx.timezone)
+        return cls(
+            cron_service=ctx.cron_service,
+            default_timezone=ctx.timezone,
+            runtime_resolver=getattr(ctx, "runtime_resolver", None),
+        )
 
     @staticmethod
     def _request_route() -> tuple[str, str, str, dict[str, Any]]:
@@ -178,6 +189,11 @@ class CronTool(Tool):
             return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
         if tz and not cron_expr:
             return ToolResult.error("Error: tz can only be used with cron_expr")
+        # preset 拼错要当场炸，别等半夜触发时才发现任务跑不起来
+        try:
+            resolve_preset(self._resolver, model)
+        except UnknownPresetError as e:
+            return ToolResult.error(f"Error: {e}")
         if tz:
             if err := self._validate_timezone(tz):
                 return err
