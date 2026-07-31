@@ -145,35 +145,35 @@ def plain(spy_client) -> AnthropicProvider:
 
 
 def test_identity_prepended_to_string_system(claude_code) -> None:
-    system = claude_code._inject_identity("You are Evie.")
+    system = claude_code._credential.decorate_system("You are Evie.")
 
     assert system[0]["text"] == _CLAUDE_CODE_IDENTITY
     assert system[1]["text"] == "You are Evie."
 
 
 def test_identity_prepended_to_list_system(claude_code) -> None:
-    system = claude_code._inject_identity([{"type": "text", "text": "You are Evie."}])
+    system = claude_code._credential.decorate_system([{"type": "text", "text": "You are Evie."}])
 
     assert system[0]["text"] == _CLAUDE_CODE_IDENTITY
     assert len(system) == 2
 
 
 def test_identity_injected_into_empty_system(claude_code) -> None:
-    system = claude_code._inject_identity("")
+    system = claude_code._credential.decorate_system("")
 
     assert system[0]["text"] == _CLAUDE_CODE_IDENTITY
     assert len(system) == 1
 
 
 def test_identity_not_duplicated(claude_code) -> None:
-    once = claude_code._inject_identity("You are Evie.")
-    twice = claude_code._inject_identity(once)
+    once = claude_code._credential.decorate_system("You are Evie.")
+    twice = claude_code._credential.decorate_system(once)
 
     assert [b["text"] for b in twice].count(_CLAUDE_CODE_IDENTITY) == 1
 
 
 def test_identity_absent_in_default_mode(plain) -> None:
-    assert plain._inject_identity("You are Evie.") == "You are Evie."
+    assert plain._credential.decorate_system("You are Evie.") == "You are Evie."
 
 
 def test_identity_text_is_exact(claude_code) -> None:
@@ -185,6 +185,6 @@ def test_cache_control_marker_preserved(claude_code) -> None:
     """注入不能顶掉尾块上的 cache_control。"""
     original = [{"type": "text", "text": "big prompt", "cache_control": {"type": "ephemeral"}}]
 
-    system = claude_code._inject_identity(original)
+    system = claude_code._credential.decorate_system(original)
 
     assert system[-1]["cache_control"] == {"type": "ephemeral"}

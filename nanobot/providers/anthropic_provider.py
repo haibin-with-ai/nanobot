@@ -82,6 +82,61 @@ def _caps_for(model: str) -> _ModelCaps:
 _CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
+# ------------------------------------------------------------------
+# 凭据策略：OAuth 与 API key 的差异只在这里分叉
+# ------------------------------------------------------------------
+
+
+class _ApiKeyCredential:
+    """普通 API key：按 x-api-key 发出去，不装饰 system，也没得刷新。"""
+
+    key_field = "api_key"
+
+    @staticmethod
+    def decorate_system(system: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+        return system
+
+    @staticmethod
+    async def refresh() -> str | None:
+        return None
+
+
+class _OAuthCredential:
+    """Claude Code 订阅令牌：bearer 认证、身份进 system 首块、过期能换新。"""
+
+    key_field = "auth_token"
+
+    @staticmethod
+    def decorate_system(system: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+        """身份必须以 system 首块出现，HTTP 头碰不到请求体。"""
+        blocks = (
+            [{"type": "text", "text": system}]
+            if isinstance(system, str) and system
+            else list(system) if isinstance(system, list) else []
+        )
+        if blocks and blocks[0].get("text") == _CLAUDE_CODE_IDENTITY:
+            return blocks
+        return [{"type": "text", "text": _CLAUDE_CODE_IDENTITY}, *blocks]
+
+    @staticmethod
+    async def refresh() -> str | None:
+        """刷新是同步 httpx 加跨进程文件锁，必须扔进线程，别把事件循环冻住。"""
+        from nanobot.providers.oauth_store import OAuthCredentialStore
+
+        try:
+            creds = await asyncio.to_thread(
+                lambda: OAuthCredentialStore().get_token(force_refresh=True)
+            )
+        except Exception as exc:
+            logger.warning("Claude Code token refresh failed: {}", exc)
+            return None
+        return creds.access_token if creds else None
+
+
+_CREDENTIALS: dict[str, Any] = {"claude_code": _OAuthCredential()}
+_DEFAULT_CREDENTIAL = _ApiKeyCredential()
+
+
 def _sanitize_tool_id(tid: str) -> str:
     """Ensure tool_use/tool_result IDs match Anthropic's required pattern.
 
@@ -118,6 +173,7 @@ class AnthropicProvider(LLMProvider):
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self.product_mode = product_mode
+        self._credential = _CREDENTIALS.get(product_mode, _DEFAULT_CREDENTIAL)
 
         self._client = self._new_client()
 
@@ -128,8 +184,7 @@ class AnthropicProvider(LLMProvider):
         client_kw: dict[str, Any] = {"max_retries": 0}
         if key:
             # OAuth 凭据是 bearer token，走 api_key 会被当成 x-api-key 发出去。
-            key_field = "auth_token" if self.product_mode == "claude_code" else "api_key"
-            client_kw[key_field] = key
+            client_kw[self._credential.key_field] = key
         if self.api_base:
             client_kw["base_url"] = self._normalize_base_url(self.api_base)
         if self.extra_headers:
@@ -554,21 +609,6 @@ class AnthropicProvider(LLMProvider):
                 return {"type": "tool", "name": name}
         return {"type": "auto"}
 
-    def _inject_identity(
-        self, system: str | list[dict[str, Any]]
-    ) -> str | list[dict[str, Any]]:
-        """Claude Code 身份必须以 system 首块出现，HTTP 头碰不到请求体。"""
-        if self.product_mode != "claude_code":
-            return system
-        blocks = (
-            [{"type": "text", "text": system}]
-            if isinstance(system, str) and system
-            else list(system) if isinstance(system, list) else []
-        )
-        if blocks and blocks[0].get("text") == _CLAUDE_CODE_IDENTITY:
-            return blocks
-        return [{"type": "text", "text": _CLAUDE_CODE_IDENTITY}, *blocks]
-
     # ------------------------------------------------------------------
     # Prompt caching
     # ------------------------------------------------------------------
@@ -665,7 +705,7 @@ class AnthropicProvider(LLMProvider):
         }
         kwargs.update(thinking_kwargs)
 
-        system = self._inject_identity(system)
+        system = self._credential.decorate_system(system)
         if system:
             kwargs["system"] = system
 
@@ -778,25 +818,12 @@ class AnthropicProvider(LLMProvider):
         return status in (401, 403)
 
     async def _refresh_credentials(self) -> bool:
-        """OAuth token 过期后换一个并重建 client；API key 模式无事可做。
-
-        刷新是同步 httpx 加跨进程文件锁，必须扔进线程，别把事件循环冻住。
-        """
-        if self.product_mode != "claude_code":
+        """换一个新令牌并重建 client；能不能换由凭据策略说了算。"""
+        token = await self._credential.refresh()
+        if not token:
             return False
-        from nanobot.providers.oauth_store import OAuthCredentialStore
-
-        try:
-            creds = await asyncio.to_thread(
-                lambda: OAuthCredentialStore().get_token(force_refresh=True)
-            )
-        except Exception as exc:
-            logger.warning("Claude Code token refresh failed: {}", exc)
-            return False
-        if not creds or not creds.access_token:
-            return False
-        self.api_key = creds.access_token
-        self._rebuild_client(creds.access_token)
+        self.api_key = token
+        self._rebuild_client(token)
         return True
 
     def _rebuild_client(self, token: str) -> None:
