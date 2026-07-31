@@ -1966,11 +1966,11 @@ async def test_webui_automations_route_lists_all_jobs_and_allows_user_actions(
         origin_channel="websocket",
         origin_chat_id="abc",
     )
-    incomplete_job = cron.add_job(
+    # 完全未绑定会话的任务：WebUI 不该给它编出 origin，运行时每次拿新会话。
+    unbound_job = cron.add_job(
         name="english-quiz",
         schedule=CronSchedule(kind="every", every_ms=3_600_000),
         message="Practice English",
-        session_key="unified:default",
     )
     external_job = cron.add_job(
         name="WeChat quiz",
@@ -2029,10 +2029,10 @@ async def test_webui_automations_route_lists_all_jobs_and_allows_user_actions(
         assert by_id[user_job.id]["state"]["run_history"] == []
         assert by_id[user_job.id]["origin"]["session_key"] == "websocket:abc"
         assert by_id[user_job.id]["origin"]["preview"] == "hi"
-        assert "session_key" not in by_id[incomplete_job.id]["payload"]
-        assert "origin_channel" not in by_id[incomplete_job.id]["payload"]
-        assert "origin_chat_id" not in by_id[incomplete_job.id]["payload"]
-        assert by_id[incomplete_job.id]["origin"] is None
+        assert "session_key" not in by_id[unbound_job.id]["payload"]
+        assert "origin_channel" not in by_id[unbound_job.id]["payload"]
+        assert "origin_chat_id" not in by_id[unbound_job.id]["payload"]
+        assert by_id[unbound_job.id]["origin"] is None
         assert "session_key" not in by_id[external_job.id]["payload"]
         assert "origin_channel" not in by_id[external_job.id]["payload"]
         assert "origin_chat_id" not in by_id[external_job.id]["payload"]
@@ -2149,14 +2149,14 @@ async def test_webui_automations_route_lists_all_jobs_and_allows_user_actions(
         assert disabled_run.status_code == 409
 
         unbound_run = await _http_get(
-            f"{base_url}/api/webui/automations/run?id={incomplete_job.id}",
+            f"{base_url}/api/webui/automations/run?id={unbound_job.id}",
             headers=auth,
         )
         # This fork gives unbound jobs a fresh session per run.
         assert unbound_run.status_code == 200
 
         unbound_enable = await _http_get(
-            f"{base_url}/api/webui/automations/enable?id={incomplete_job.id}",
+            f"{base_url}/api/webui/automations/enable?id={unbound_job.id}",
             headers=auth,
         )
         assert unbound_enable.status_code == 200
