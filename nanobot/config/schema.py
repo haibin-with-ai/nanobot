@@ -164,6 +164,14 @@ class AgentDefaults(Base):
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
+    @field_validator("provider")
+    @classmethod
+    def normalize_provider(cls, value: str) -> str:
+        """Fold Claude Code aliases onto the canonical provider key."""
+        from nanobot.config.claude_credentials import normalize_claude_provider_key
+
+        return normalize_claude_provider_key(value) or value
+
     @field_validator("timezone")
     @classmethod
     def validate_timezone(cls, value: str) -> str:

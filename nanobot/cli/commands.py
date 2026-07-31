@@ -74,6 +74,11 @@ from nanobot.bus.outbound_events import (  # noqa: E402
 )
 from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
+from nanobot.config.claude_credentials import (  # noqa: E402
+    CLAUDE_CODE_DEFAULT_MODEL,
+    CLAUDE_CODE_PROVIDER_KEY,
+    claude_code_oauth_provider_kwargs,
+)
 from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
 from nanobot.config.schema import Config  # noqa: E402
 from nanobot.security.network import is_loopback_host  # noqa: E402
@@ -2714,14 +2719,14 @@ _PROVIDER_DISPLAY: dict[str, str] = {
     "openai_codex": "OpenAI Codex",
     "xai_grok": "xAI Grok",
     "github_copilot": "GitHub Copilot",
-    "anthropic_claude_code": "Anthropic Claude Code",
+    CLAUDE_CODE_PROVIDER_KEY: "Anthropic Claude Code",
 }
 
 _OAUTH_PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "openai_codex": "openai-codex/gpt-5.6-sol",
     "xai_grok": "xai-grok/grok-4.5",
     "github_copilot": "github-copilot/gpt-5.4-mini",
-    "anthropic_claude_code": "anthropic-claude-code/claude-opus-4-6",
+    CLAUDE_CODE_PROVIDER_KEY: CLAUDE_CODE_DEFAULT_MODEL,
 }
 
 
@@ -2755,6 +2760,23 @@ def _resolve_oauth_provider(provider: str):
     return spec
 
 
+def _oauth_agent_defaults(provider_name: str, model: str | None) -> dict[str, Any]:
+    """Agent-default fields a successful OAuth login must persist.
+
+    provider_name 已由 _resolve_oauth_provider 归一成 registry 里的规范名，
+    这里不需要再为某个 provider 开特例。
+    """
+    selected_model = (model or "").strip() or _OAUTH_PROVIDER_DEFAULT_MODELS[provider_name]
+    updates: dict[str, Any] = {
+        "model_preset": None,
+        "provider": provider_name,
+        "model": selected_model,
+    }
+    if provider_name == "xai_grok" and selected_model == "xai-grok/grok-4.5":
+        updates["context_window_tokens"] = 500_000
+    return updates
+
+
 def _set_oauth_provider_as_main(
     provider_name: str,
     *,
@@ -2770,12 +2792,10 @@ def _set_oauth_provider_as_main(
         console.print(f"[dim]Using config: {resolved_config_path}[/dim]")
 
     config = load_config(resolved_config_path)
-    selected_model = (model or "").strip() or _OAUTH_PROVIDER_DEFAULT_MODELS[provider_name]
-    config.agents.defaults.model_preset = None
-    config.agents.defaults.provider = provider_name
-    config.agents.defaults.model = selected_model
-    if provider_name == "xai_grok" and selected_model == "xai-grok/grok-4.5":
-        config.agents.defaults.context_window_tokens = 500_000
+    updates = _oauth_agent_defaults(provider_name, model)
+    for field, value in updates.items():
+        setattr(config.agents.defaults, field, value)
+    selected_model = updates["model"]
     save_config(config, resolved_config_path)
 
     saved_path = resolved_config_path or get_config_path()
@@ -2900,7 +2920,7 @@ def _logout_openai_codex() -> None:
     _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["openai_codex"])
 
 
-@_register_login("anthropic_claude_code")
+@_register_login(CLAUDE_CODE_PROVIDER_KEY)
 def _login_anthropic_claude_code() -> None:
     """Authenticate with Anthropic Claude Code via OAuth."""
     try:
@@ -2913,14 +2933,7 @@ def _login_anthropic_claude_code() -> None:
         raise typer.Exit(1)
 
     console.print("[cyan]Starting Anthropic Claude Code OAuth login...[/cyan]\n")
-    provider = OAuthProviderConfig(
-        client_id=_ANTHROPIC_CLIENT_ID,
-        authorize_url="https://claude.ai/oauth/authorize",
-        token_url="https://platform.claude.com/v1/oauth/token",
-        redirect_uri="https://platform.claude.com/oauth/code/callback",
-        scope="user:inference user:profile user:sessions:claude_code user:mcp_servers",
-        token_filename="claude-code.json",
-    )
+    provider = OAuthProviderConfig(**claude_code_oauth_provider_kwargs(_ANTHROPIC_CLIENT_ID))
     try:
         token = login_oauth_interactive(
             print_fn=lambda s: console.print(s),
@@ -2941,13 +2954,13 @@ def _login_anthropic_claude_code() -> None:
         raise typer.Exit(1) from e
 
 
-@_register_logout("anthropic_claude_code")
+@_register_logout(CLAUDE_CODE_PROVIDER_KEY)
 def _logout_anthropic_claude_code() -> None:
     """Clear local OAuth credentials for Anthropic Claude Code."""
     from nanobot.providers.oauth_store import OAuthCredentialStore
 
     store = OAuthCredentialStore()
-    _delete_oauth_files(store.get_token_path(), _PROVIDER_DISPLAY["anthropic_claude_code"])
+    _delete_oauth_files(store.get_token_path(), _PROVIDER_DISPLAY[CLAUDE_CODE_PROVIDER_KEY])
 
 
 @_register_login("xai_grok")
