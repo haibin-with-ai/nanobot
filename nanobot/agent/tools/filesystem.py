@@ -344,10 +344,11 @@ class ReadFileTool(_FsTool):
                 and entry.limit == limit
             ):
                 if current_mtime != entry.mtime:
-                    # File was modified externally - force full read and mark as not dedupable
-                    entry.can_dedup = False
-                    self._file_states.record_read(fp, offset=offset, limit=limit)  # Update state with new mtime
-                    # Continue to read full content (don't return dedup message)
+                    # File was modified externally - update state with new mtime,
+                    # then continue to read full content (no dedup message)
+                    self._file_states.record_read(
+                        fp, offset=offset, limit=limit, dedupable=not force
+                    )
                 else:
                     # File unchanged - return dedup message
                     # But only if content is actually unchanged (not just mtime)
@@ -356,14 +357,14 @@ class ReadFileTool(_FsTool):
                         return f"[File unchanged since last read: {path}]"
                     else:
                         # Content changed despite same mtime - force full read
-                        entry.can_dedup = False
-                        self._file_states.record_read(fp, offset=offset, limit=limit)
+                        self._file_states.record_read(
+                            fp, offset=offset, limit=limit, dedupable=not force
+                        )
             else:
                 # No previous state or marked as not dedupable - read full content
-                self._file_states.record_read(fp, offset=offset, limit=limit)
-                # Force full read by setting can_dedup to False for this read
-                if entry:
-                    entry.can_dedup = False
+                self._file_states.record_read(
+                    fp, offset=offset, limit=limit, dedupable=not force
+                )
 
             # Read the file content after dedup check
             raw = fp.read_bytes()
@@ -409,7 +410,7 @@ class ReadFileTool(_FsTool):
                 result += f"\n\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
             else:
                 result += f"\n\n(End of file — {total} lines total)"
-            self._file_states.record_read(fp, offset=offset, limit=limit)
+            self._file_states.record_read(fp, offset=offset, limit=limit, dedupable=not force)
             return result
         except PermissionError as e:
             return ToolResult.error(f"Error: {e}")
