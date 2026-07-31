@@ -178,7 +178,15 @@ class OAuthCredentialStore:
         if not force_refresh and creds.fresh_for(min_ttl_ms):
             return creds
         if not creds.refresh_token:
-            return creds
+            if creds.fresh_for(0):
+                # 还没真过期（含环境变量注入那种没有过期信息的凭据），照常返回。
+                return creds
+            logger.warning(
+                "Claude Code OAuth credentials expired and no refresh token is available; "
+                "re-login required (%s)",
+                self.get_token_path(),
+            )
+            return None
         return self._refresh_locked(creds, force_refresh, min_ttl_ms)
 
     def _refresh_locked(
