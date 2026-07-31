@@ -10,6 +10,7 @@ import secrets
 import string
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -32,28 +33,50 @@ def _gen_tool_id() -> str:
 _VALID_TOOL_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 _MAX_TOOL_ID_LEN = 64
 
-# 这些模型直接拒收 temperature 一类旧采样参数，带上就 400。
-_MODELS_WITHOUT_SAMPLING_PARAMS = (
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-fable",
-    "fable",
-)
-# Opus 5 默认就开自适应思考，并把思考过程折成摘要。
-_EFFORT_MODELS = ("claude-opus-5",)
-_DEFAULT_THINKING_ON_MODELS = ("claude-opus-5",)
-_THINKING_SUMMARIZATION_MODELS = ("claude-opus-5",)
+# ------------------------------------------------------------------
+# 模型能力表：一个模型的四个开关只在这里写一次
+# ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ModelCaps:
+    """一个模型族的能力开关。
+
+    omit_sampling      —— 拒收 temperature 一类旧采样参数，带上就 400
+    effort             —— 认 output_config.effort
+    thinking_default   —— 不说也默认开自适应思考
+    thinking_summarize —— 把思考过程折成摘要
+    """
+
+    omit_sampling: bool = False
+    effort: bool = False
+    thinking_default: bool = False
+    thinking_summarize: bool = False
+
+
+_NO_SAMPLING = _ModelCaps(omit_sampling=True)
+_DEFAULT_CAPS = _ModelCaps()
+
+_MODEL_CAPS: dict[str, _ModelCaps] = {
+    "claude-opus-5": _ModelCaps(
+        omit_sampling=True, effort=True, thinking_default=True, thinking_summarize=True,
+    ),
+    "claude-opus-4-7": _NO_SAMPLING,
+    "claude-opus-4-8": _NO_SAMPLING,
+    "claude-sonnet-5": _NO_SAMPLING,
+    "claude-fable": _NO_SAMPLING,
+    "fable": _NO_SAMPLING,
+}
 _ADAPTIVE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
-def _matches_model(model: str, candidates: tuple[str, ...]) -> bool:
+def _caps_for(model: str) -> _ModelCaps:
     """按边界匹配模型族，别让 sonnet-55 撞上 sonnet-5。"""
     model_id = model.rsplit("/", 1)[-1].lower()
-    return any(
-        model_id == name or model_id.startswith(f"{name}-") for name in candidates
-    )
+    for name, caps in _MODEL_CAPS.items():
+        if model_id == name or model_id.startswith(f"{name}-"):
+            return caps
+    return _DEFAULT_CAPS
 
 # Anthropic 按精确字符串识别 Claude Code 客户端，一个字都不能改。
 _CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -588,6 +611,28 @@ class AnthropicProvider(LLMProvider):
     # Build API kwargs
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _thinking_kwargs(
+        caps: _ModelCaps, effort: str | None, max_tokens: int,
+    ) -> tuple[dict[str, Any], float | None]:
+        """返回 (思考相关 kwargs, 强制温度)。强制温度为 None 表示沿用调用方温度。"""
+        if effort in {"none", "disabled"}:
+            return ({"thinking": {"type": "disabled"}} if caps.thinking_default else {}), None
+        if effort == "adaptive" or caps.thinking_default:
+            # 自适应思考：模型自己决定何时想、想多久，并顺带开启工具间的交错思考。
+            thinking: dict[str, Any] = {"type": "adaptive"}
+            if caps.thinking_summarize:
+                thinking["display"] = "summarized"
+            out: dict[str, Any] = {"thinking": thinking}
+            if caps.effort and effort in _ADAPTIVE_EFFORT_LEVELS:
+                out["output_config"] = {"effort": effort}
+            return out, 1.0
+        if effort:
+            budget = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}.get(effort, 4096)
+            thinking = {"type": "enabled", "budget_tokens": budget}
+            return {"thinking": thinking, "max_tokens": max(max_tokens, budget + 4096)}, 1.0
+        return {}, None
+
     def _build_kwargs(
         self,
         messages: list[dict[str, Any]],
@@ -610,44 +655,25 @@ class AnthropicProvider(LLMProvider):
 
         max_tokens = max(1, max_tokens)
         effort = reasoning_effort.lower() if reasoning_effort else None
-        thinking_disabled = effort in {"none", "disabled"}
-        thinking_enabled = bool(effort) and not thinking_disabled
-        thinking_on_by_default = _matches_model(model_name, _DEFAULT_THINKING_ON_MODELS)
-
-        omit_temperature = _matches_model(model_name, _MODELS_WITHOUT_SAMPLING_PARAMS)
+        caps = _caps_for(model_name)
+        thinking_kwargs, forced_temperature = self._thinking_kwargs(caps, effort, max_tokens)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": anthropic_msgs,
             "max_tokens": max_tokens,
         }
+        kwargs.update(thinking_kwargs)
 
         system = self._inject_identity(system)
         if system:
             kwargs["system"] = system
 
-        if thinking_disabled and thinking_on_by_default:
-            kwargs["thinking"] = {"type": "disabled"}
-        elif effort == "adaptive" or thinking_on_by_default:
-            # Adaptive thinking: model decides when and how much to think
-            # Supported on claude-sonnet-4-6 and claude-opus-4-6.
-            # Also auto-enables interleaved thinking between tool calls.
-            kwargs["thinking"] = {"type": "adaptive"}
-            if _matches_model(model_name, _THINKING_SUMMARIZATION_MODELS):
-                kwargs["thinking"]["display"] = "summarized"
-            if effort in _ADAPTIVE_EFFORT_LEVELS and _matches_model(model_name, _EFFORT_MODELS):
-                kwargs["output_config"] = {"effort": effort}
-            if not omit_temperature:
-                kwargs["temperature"] = 1.0
-        elif thinking_enabled:
-            budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
-            budget = budget_map.get(effort, 4096)
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            kwargs["max_tokens"] = max(max_tokens, budget + 4096)
-            if not omit_temperature:
-                kwargs["temperature"] = 1.0
-        elif not omit_temperature:
-            kwargs["temperature"] = temperature
+        # 带不带 temperature 只看模型收不收采样参数，与思考开关无关。
+        if not caps.omit_sampling:
+            kwargs["temperature"] = (
+                temperature if forced_temperature is None else forced_temperature
+            )
 
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
