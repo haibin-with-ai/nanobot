@@ -213,12 +213,18 @@ def make_provider(
     fallback_presets = _resolve_fallback_presets(config, resolved)
 
     if fallback_presets:
+        # 主备的限流冷却要落在同一命名空间，"auto" 必须先解析成真实后端名。
+        def _provider_name(preset: ModelPresetConfig) -> str:
+            return config.get_provider_name(preset.model, preset=preset) or ""
+
         provider = FallbackProvider(
             primary=provider,
             fallback_presets=fallback_presets,
             provider_factory=lambda fb: _make_provider_core(
                 config, preset_name=preset_name, preset=fb
             ),
+            primary_name=config.get_provider_name(model or resolved.model, preset=resolved) or "",
+            provider_name_resolver=_provider_name,
         )
 
     return provider

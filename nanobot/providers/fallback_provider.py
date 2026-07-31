@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -101,6 +101,127 @@ class _Candidate:
     primary: bool = False
 
 
+@dataclass(frozen=True)
+class _ErrorFacts:
+    """一次失败响应里所有参与判定的信号，统一小写。"""
+
+    response: LLMResponse
+    status: int | None
+    kind: str
+    error_type: str
+    code: str
+    text: str
+
+    @classmethod
+    def of(cls, response: LLMResponse) -> _ErrorFacts:
+        return cls(
+            response=response,
+            status=response.error_status_code,
+            kind=(response.error_kind or "").lower(),
+            error_type=(response.error_type or "").lower(),
+            code=(response.error_code or "").lower(),
+            text=(response.content or "").lower(),
+        )
+
+    def structured_has(self, tokens: Iterable[str]) -> bool:
+        """只看结构化字段，不看正文。"""
+        values = (self.kind, self.error_type, self.code)
+        return any(token in value for value in values for token in tokens)
+
+    def anywhere_has(self, tokens: Iterable[str]) -> bool:
+        values = (self.kind, self.error_type, self.code, self.text)
+        return any(token in value for value in values for token in tokens)
+
+
+@dataclass(frozen=True)
+class _FallbackRule:
+    verdict: bool
+    why_here: str
+    matches: Callable[[_ErrorFacts], bool]
+
+
+# 顺序即语义：取第一条命中的规则。分四段，段内顺序也有依赖，见每条的 why_here。
+_FALLBACK_RULES: tuple[_FallbackRule, ...] = (
+    # 第一段：能明确指认「换一家还有救」的强信号。它们的报文里常混着
+    # invalid_request、400 这类特征，排在后面会被第二段直接判死。
+    _FallbackRule(
+        True,
+        "欠费报文常带 400 或 invalid_request，必须抢在状态码与非切换规则之前",
+        lambda f: LLMProvider.is_arrearage_response(f.response),
+    ),
+    _FallbackRule(
+        True,
+        "error_kind 已经点名鉴权，最干净的信号，先用",
+        lambda f: f.kind in _AUTHENTICATION_ERROR_KINDS,
+    ),
+    _FallbackRule(
+        True,
+        "OpenAI 家族把 invalid_api_key 塞进 error_type=invalid_request_error，"
+        "这条若排到下一条之后会被误判成不可切换",
+        lambda f: f.structured_has(_AUTHENTICATION_ERROR_TOKENS),
+    ),
+    # 第二段：明确「换谁都一样」的信号。
+    _FallbackRule(
+        False,
+        "内容过滤、超长、参数非法，换模型解决不了",
+        lambda f: f.kind in _NON_FALLBACK_ERROR_KINDS,
+    ),
+    _FallbackRule(
+        False,
+        "同上，但信号藏在 error_type / error_code 里",
+        lambda f: f.structured_has(_NON_FALLBACK_ERROR_KINDS),
+    ),
+    # 第三段：结构化信号用尽，才落到 HTTP 状态码。
+    _FallbackRule(
+        True,
+        "401/403 视为鉴权问题；排在第二段之后，403 + content_filter 才不会被误切",
+        lambda f: f.status in {401, 403},
+    ),
+    _FallbackRule(
+        True,
+        "正文里的鉴权关键词，可靠性低于结构化字段，所以排在状态码之后",
+        lambda f: any(token in f.text for token in _AUTHENTICATION_ERROR_TOKENS),
+    ),
+    _FallbackRule(
+        False,
+        "provider 显式说了别重试，压过下面所有状态码启发",
+        lambda f: f.response.error_should_retry is False,
+    ),
+    _FallbackRule(
+        False,
+        "400/404/422 是确定性请求错误；排在 should_retry=True 之前，"
+        "不让 SDK 的乐观重试标记把它救活",
+        lambda f: f.status in {400, 404, 422},
+    ),
+    _FallbackRule(
+        True,
+        "排除确定性错误后，provider 说可重试就换一家试",
+        lambda f: f.response.error_should_retry is True,
+    ),
+    _FallbackRule(
+        True,
+        "408/409/429 与 5xx 是典型的瞬时或过载",
+        lambda f: f.status is not None and (f.status in {408, 409, 429} or 500 <= f.status <= 599),
+    ),
+    _FallbackRule(
+        True,
+        "provider 归一化过的瞬时错误类别",
+        lambda f: f.kind in _FALLBACK_ERROR_KINDS,
+    ),
+    # 第四段：兜底的正文子串匹配，最不可靠，只在前面全无结论时生效。
+    _FallbackRule(
+        True,
+        "限流、超时、空返回一类只在文案里露头的情况",
+        lambda f: f.anywhere_has(_FALLBACK_ERROR_TOKENS),
+    ),
+)
+
+
+def _declared_provider_name(preset: Any) -> str:
+    """默认命名空间：配置里写的 provider 字段。调用方可传解析器换成真实后端名。"""
+    return str(getattr(preset, "provider", "") or "")
+
+
 class FallbackProvider(LLMProvider):
     """Wrap a primary provider and transparently failover to fallback models.
 
@@ -112,7 +233,14 @@ class FallbackProvider(LLMProvider):
     callable creates the underlying provider on-the-fly.
 
     Key design:
-    - Failover is request-scoped (the wrapper itself is stateless between turns).
+    - Candidate selection is request-scoped, but the wrapper is NOT stateless:
+      `_primary_failures` / `_primary_tripped_at` drive the primary circuit
+      breaker and `_quota_cooldowns` keeps per-(provider, model) rate-limit
+      deadlines. Both outlive a single turn and only reset in-process — a
+      gateway restart forgets every cooldown.
+    - That state is plain attribute mutation with no lock: it assumes all turns
+      run on one event loop, so mutations never interleave mid-statement. Do not
+      share one instance across threads or loops.
     - Skipped when content was already streamed to avoid duplicate output,
       except timeout recovery can resume in a new stream segment.
     - Recursive failover is prevented by the factory returning plain providers.
@@ -129,6 +257,8 @@ class FallbackProvider(LLMProvider):
         provider_factory: Callable[[Any], LLMProvider],
         fallback_model_observer: FallbackModelObserver | None = None,
         clock: Callable[[], float] | None = None,
+        primary_name: str | None = None,
+        provider_name_resolver: Callable[[Any], str] | None = None,
     ):
         self._primary = primary
         self._fallback_presets = list(fallback_presets)
@@ -139,6 +269,11 @@ class FallbackProvider(LLMProvider):
         self._primary_tripped_at: float | None = None
         self._clock = clock or time.monotonic
         self._quota_cooldowns: dict[tuple[str, str], float] = {}
+        # 冷却身份必须主备同名，否则同一个端点会被记成两个 key，冷却期内照打不误。
+        self._name_of = provider_name_resolver or _declared_provider_name
+        self._primary_name = primary_name or str(
+            getattr(primary, "name", None) or type(primary).__name__
+        )
 
     @property
     def generation(self):
@@ -165,12 +300,10 @@ class FallbackProvider(LLMProvider):
         return 1 + len(self._fallback_presets)
 
     def _primary_key(self, model: str) -> tuple[str, str]:
-        label = getattr(self._primary, "name", None) or type(self._primary).__name__
-        return (str(label), model)
+        return (self._primary_name, model)
 
-    @staticmethod
-    def _preset_key(preset: Any) -> tuple[str, str]:
-        return (str(getattr(preset, "provider", "") or ""), preset.model)
+    def _preset_key(self, preset: Any) -> tuple[str, str]:
+        return (self._name_of(preset), preset.model)
 
     def _cooldown_remaining(self, key: tuple[str, str]) -> float:
         until = self._quota_cooldowns.get(key)
@@ -383,43 +516,9 @@ class FallbackProvider(LLMProvider):
 
     @staticmethod
     def _should_fallback(response: LLMResponse) -> bool:
-        if LLMProvider.is_arrearage_response(response):
-            return True
-        status = response.error_status_code
-        kind = (response.error_kind or "").lower()
-        error_type = (response.error_type or "").lower()
-        code = (response.error_code or "").lower()
-        text = (response.content or "").lower()
-        structured_values = (kind, error_type, code)
-
-        if kind in _AUTHENTICATION_ERROR_KINDS:
-            return True
-        if any(
-            token in value
-            for value in structured_values
-            for token in _AUTHENTICATION_ERROR_TOKENS
-        ):
-            return True
-        if kind in _NON_FALLBACK_ERROR_KINDS:
-            return False
-        if any(
-            token in value
-            for value in structured_values
-            for token in _NON_FALLBACK_ERROR_KINDS
-        ):
-            return False
-        if status in {401, 403}:
-            return True
-        if any(token in text for token in _AUTHENTICATION_ERROR_TOKENS):
-            return True
-        if response.error_should_retry is False:
-            return False
-        if status in {400, 404, 422}:
-            return False
-        if response.error_should_retry is True:
-            return True
-        if status is not None and (status in {408, 409, 429} or 500 <= status <= 599):
-            return True
-        if kind in _FALLBACK_ERROR_KINDS:
-            return True
-        return any(token in value for value in (kind, error_type, code, text) for token in _FALLBACK_ERROR_TOKENS)
+        """按 _FALLBACK_RULES 的顺序取第一条命中的规则，全不命中就不切。"""
+        facts = _ErrorFacts.of(response)
+        for rule in _FALLBACK_RULES:
+            if rule.matches(facts):
+                return rule.verdict
+        return False
