@@ -294,12 +294,30 @@ class FallbackProvider(LLMProvider):
             kwargs["on_content_delta"] = None
         return True
 
-    def _note_primary_failure(self, response: LLMResponse) -> None:
+    def _note_primary_failure(self, model: str, response: LLMResponse) -> None:
         if (response.error_kind or "").lower() == "refusal":
+            # 拒答是内容判断，不是可用性故障：换模型可以，但别推熔断器。
+            logger.info("Primary model '{}' refused; trying another model", model)
             return
         self._primary_failures += 1
         if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
             self._primary_tripped_at = self._clock()
+            logger.warning(
+                "Primary model '{}' circuit open after {} consecutive failures",
+                model, self._primary_failures,
+            )
+
+    @staticmethod
+    def _label(candidate: _Candidate) -> str:
+        kind = "Primary model" if candidate.primary else "Fallback"
+        return f"{kind} '{candidate.model}'"
+
+    def _skip_reason(self, candidate: _Candidate, cooling: set[tuple[str, str]]) -> str | None:
+        if candidate.key in cooling:
+            return "quota cooldown"
+        if candidate.primary and not self._primary_available():
+            return "circuit open"
+        return None
 
     async def _try_with_fallback(
         self,
@@ -312,12 +330,21 @@ class FallbackProvider(LLMProvider):
         primary_model = candidates[0].model
         cooling = self._cooling_down(primary_model)
         last_response: LLMResponse | None = None
+        # 上一个候选为什么没成，留到下一个候选真正开跑时一起写日志，
+        # 这样 journal 里能顺着读完整条降级链。
+        why_here: str | None = None
         for candidate in candidates:
-            if candidate.key in cooling or (candidate.primary and not self._primary_available()):
+            skip = self._skip_reason(candidate, cooling)
+            if skip is not None:
+                why_here = f"{self._label(candidate)} skipped: {skip}"
                 continue
             provider = await self._resolve_provider(candidate)
             if provider is None:
+                why_here = f"{self._label(candidate)} unavailable: provider construction failed"
                 continue
+            if why_here:
+                logger.info("{}; trying fallback '{}'", why_here, candidate.model)
+                why_here = None
             if not candidate.primary:
                 await self._notify_fallback_model(candidate.model)
             response = await call(provider, candidate.kwargs)
@@ -329,13 +356,16 @@ class FallbackProvider(LLMProvider):
             if not await self._recover_stream(response, has_streamed, on_stream_recover, kwargs):
                 return response
             self._note_quota_cooldown(candidate.key, response)
+            last_response = response
+            why_here = f"{self._label(candidate)} failed: {(response.content or '').strip()[:120]}"
             if candidate.primary:
-                last_response = response
                 if not self._should_fallback(response):
+                    logger.warning(
+                        "Primary model '{}' returned non-fallbackable error: {}",
+                        candidate.model, (response.content or "")[:120],
+                    )
                     return response
-                self._note_primary_failure(response)
-            else:
-                last_response = response
+                self._note_primary_failure(candidate.model, response)
         if last_response is not None:
             return last_response
         return LLMResponse(

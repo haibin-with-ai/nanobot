@@ -9,6 +9,20 @@ from collections.abc import Iterator
 
 import certifi
 import pytest
+from loguru import logger
+
+
+@pytest.fixture(autouse=True)
+def _restore_nanobot_log_gate() -> Iterator[None]:
+    """Undo the CLI's process-wide loguru gate after each test.
+
+    ``--logs/--no-logs`` calls ``logger.disable("nanobot")``. A test that runs
+    such a command for real (``plugins enable``, ``run``) silences the whole
+    package for the rest of the pytest process, so any later test asserting on
+    log output sees an empty list.
+    """
+    yield
+    logger.enable("nanobot")
 
 
 @pytest.fixture(scope="session", autouse=True)
