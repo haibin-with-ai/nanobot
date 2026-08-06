@@ -86,6 +86,7 @@ from nanobot.session.model_selection import (
     SESSION_MODEL_PRESET_METADATA_KEY,
     model_preset_from_metadata,
 )
+from nanobot.session.raw_ledger import RawMessageLedger
 from nanobot.triggers.local_turns import LocalTriggerTurnCoordinator
 from nanobot.utils.cancellation import task_is_cancelling
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
@@ -374,6 +375,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
         self.sessions.set_file_cap_archiver(self.context.memory.raw_archive)
+        self.raw_ledger = RawMessageLedger(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
@@ -767,6 +769,33 @@ class AgentLoop:
         blocks.extend(await resolve_runtime_context(providers, request))
         return blocks
 
+    @staticmethod
+    def _raw_ledger_error_message(msg: InboundMessage) -> OutboundMessage:
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="原始消息未归档，请重试。",
+            metadata=dict(msg.metadata or {}),
+        )
+
+    async def _record_raw_user_message(
+        self,
+        msg: InboundMessage,
+        *,
+        publish_error: bool = True,
+    ) -> bool:
+        """Persist a human channel message before any command or agent work."""
+        if not self.raw_ledger.should_record(msg):
+            return True
+        try:
+            self.raw_ledger.append(msg)
+        except (OSError, TypeError, ValueError):
+            logger.exception("Could not archive raw user message")
+            if publish_error:
+                await self.bus.publish_outbound(self._raw_ledger_error_message(msg))
+            return False
+        return True
+
     async def _dispatch_command_inline(
         self,
         msg: InboundMessage,
@@ -1131,6 +1160,8 @@ class AgentLoop:
                 raw = msg.content.strip()
                 effective_key = self._effective_session_key(msg)
                 if await agent_context.handle_runtime_control(self, msg, self.tools):
+                    continue
+                if not await self._record_raw_user_message(msg):
                     continue
                 if self.commands.is_priority(raw):
                     await self._dispatch_command_inline(
@@ -2043,6 +2074,7 @@ class AgentLoop:
         hook_factories: list[AgentTurnHookFactory] | None = None,
         tools: ToolRegistry | None = None,
         persist_user_message: bool = True,
+        record_raw_message: bool = True,
         runtime: LLMRuntime | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
@@ -2057,6 +2089,11 @@ class AgentLoop:
             channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=content, media=media or [], metadata=metadata,
         )
+        if record_raw_message and not await self._record_raw_user_message(
+            msg,
+            publish_error=False,
+        ):
+            return self._raw_ledger_error_message(msg)
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         try:

@@ -458,6 +458,8 @@ async def test_process_direct_accepts_media() -> None:
     loop = AgentLoop.__new__(AgentLoop)
     loop._connect_mcp = AsyncMock()
     loop._session_locks = {}
+    loop.raw_ledger = MagicMock()
+    loop.raw_ledger.should_record.return_value = False
 
     captured_msg = None
 

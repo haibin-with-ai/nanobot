@@ -1839,6 +1839,7 @@ def _run_gateway(
                     tools=store.build_dream_tools(),
                     on_progress=progress,
                     runtime=dream_runtime,
+                    record_raw_message=False,
                 )
                 # The real file delta grounds the audit record; clean completion
                 # decides whether this history batch has finished processing.
@@ -1915,6 +1916,7 @@ def _run_gateway(
                     channel=channel,
                     chat_id=chat_id,
                     on_progress=_silent,
+                    record_raw_message=False,
                 )
             finally:
                 if isinstance(message_tool, MessageTool) and suppress_token is not None:

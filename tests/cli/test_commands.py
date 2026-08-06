@@ -1958,7 +1958,8 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
             self.sessions = kwargs["session_manager"]
             self.tools = {}
 
-        async def process_direct(self, *_args, **_kwargs):
+        async def process_direct(self, *_args, **kwargs):
+            seen["record_raw_message"] = kwargs.get("record_raw_message")
             return SimpleNamespace(content="")
 
         async def close_mcp(self) -> None:
@@ -2000,6 +2001,7 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
     assert seen["session_key"] == "heartbeat"
     assert seen["retained_limit"] == config.gateway.heartbeat.keep_recent_messages
     assert seen["saved_session"] is seen["heartbeat_session"]
+    assert seen["record_raw_message"] is False
 
 
 def test_webui_yes_creates_config_and_enables_local_websocket(

@@ -187,6 +187,7 @@ async def test_dream_internal_run_silences_progress(tmp_path) -> None:
     assert len(calls) == 1
     assert callable(calls[0][1]["on_progress"])
     assert calls[0][1]["runtime"] is dream_runtime
+    assert calls[0][1]["record_raw_message"] is False
 
 
 def _build_runnable_dream(

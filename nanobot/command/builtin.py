@@ -436,6 +436,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 tools=store.build_dream_tools(),
                 on_progress=progress,
                 runtime=dream_runtime,
+                record_raw_message=False,
             )
             elapsed = time.monotonic() - t0
             # The real file delta grounds the audit record; clean completion
