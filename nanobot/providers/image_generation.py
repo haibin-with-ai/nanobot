@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 import httpx
 from loguru import logger
 
+from nanobot.providers.base import compute_backoff
 from nanobot.providers.registry import find_by_name
 from nanobot.security.network import (
     PinnedDNSAsyncTransport,
@@ -1356,20 +1357,24 @@ _CODEX_MAX_RETRY_DELAY_S = 30.0
 _CODEX_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
+def _parse_retry_after_seconds(retry_after: str | None) -> float | None:
+    if not retry_after:
+        return None
+    try:
+        secs = float(retry_after.strip())
+    except ValueError:
+        return None
+    return secs if secs >= 0 else None
+
+
 def _codex_retry_delay(attempt: int, retry_after: str | None) -> float:
     """Delay before the next Codex retry: honor Retry-After, else backoff+jitter."""
-    import random
-
-    if retry_after:
-        trimmed = retry_after.strip()
-        try:
-            secs = float(trimmed)
-        except ValueError:
-            secs = None
-        if secs is not None and secs >= 0:
-            return min(secs * (1 + random.random() * 0.1), _CODEX_MAX_RETRY_DELAY_S)
-    exponential = min(_CODEX_BASE_DELAY_S * 2 ** (attempt - 1), _CODEX_MAX_RETRY_DELAY_S)
-    return exponential * (0.9 + random.random() * 0.2)
+    return compute_backoff(
+        attempt,
+        _parse_retry_after_seconds(retry_after),
+        base=_CODEX_BASE_DELAY_S,
+        cap=_CODEX_MAX_RETRY_DELAY_S,
+    )
 
 
 class CodexImageGenerationClient(ImageGenerationProvider):

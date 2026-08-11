@@ -24,10 +24,13 @@ _FALLBACK_ERROR_KINDS = frozenset({
     # 与上游相反：模型拒答换一个模型再问，不当作终态。
     "refusal",
 })
-# 限流冷却：命中后这一档模型暂时不再排进候选。
-QUOTA_COOLDOWN_DEFAULT_S = 600.0
-QUOTA_COOLDOWN_MIN_S = 60.0
-QUOTA_COOLDOWN_MAX_S = 1800.0
+# 限流冷却：命中后这一档模型暂时不再排进候选。按错误类型分流两档时长。
+# 账号配额/账单耗尽：短期不会恢复，长冷却切走，成本近零（有替补）。本期固定，不加配置口子。
+QUOTA_EXHAUSTED_COOLDOWN_S = 600.0
+# 瞬时限流（rate_limit / overloaded）：秒级恢复，honor Retry-After 并夹在下面区间。
+TRANSIENT_COOLDOWN_DEFAULT_S = 30.0
+TRANSIENT_COOLDOWN_MIN_S = 5.0
+TRANSIENT_COOLDOWN_MAX_S = 120.0
 _AUTHENTICATION_ERROR_KINDS = frozenset({
     "authentication",
     "auth",
@@ -235,7 +238,7 @@ class FallbackProvider(LLMProvider):
     Key design:
     - Candidate selection is request-scoped, but the wrapper is NOT stateless:
       `_primary_failures` / `_primary_tripped_at` drive the primary circuit
-      breaker and `_quota_cooldowns` keeps per-(provider, model) rate-limit
+      breaker and `_cooldowns` keeps per-(provider, model) rate-limit
       deadlines. Both outlive a single turn and only reset in-process — a
       gateway restart forgets every cooldown.
     - That state is plain attribute mutation with no lock: it assumes all turns
@@ -268,7 +271,7 @@ class FallbackProvider(LLMProvider):
         self._primary_failures = 0
         self._primary_tripped_at: float | None = None
         self._clock = clock or time.monotonic
-        self._quota_cooldowns: dict[tuple[str, str], float] = {}
+        self._cooldowns: dict[tuple[str, str], float] = {}
         # 冷却身份必须主备同名，否则同一个端点会被记成两个 key，冷却期内照打不误。
         self._name_of = provider_name_resolver or _declared_provider_name
         self._primary_name = primary_name or str(
@@ -306,12 +309,12 @@ class FallbackProvider(LLMProvider):
         return (self._name_of(preset), preset.model)
 
     def _cooldown_remaining(self, key: tuple[str, str]) -> float:
-        until = self._quota_cooldowns.get(key)
+        until = self._cooldowns.get(key)
         if until is None:
             return 0.0
         remaining = until - self._clock()
         if remaining <= 0:
-            self._quota_cooldowns.pop(key, None)
+            self._cooldowns.pop(key, None)
             return 0.0
         return remaining
 
@@ -339,15 +342,22 @@ class FallbackProvider(LLMProvider):
             for value in values
         )
 
-    def _note_quota_cooldown(self, key: tuple[str, str], response: LLMResponse) -> None:
+    def _note_cooldown(self, key: tuple[str, str], response: LLMResponse) -> None:
         # 只认限流：503 之类也会带 Retry-After，但那是重试提示，不是配额耗尽。
         if not self._is_rate_limited(response):
             return
-        retry_after = LLMProvider._extract_retry_after_from_response(response)
-        wait = min(max(retry_after or QUOTA_COOLDOWN_DEFAULT_S, QUOTA_COOLDOWN_MIN_S), QUOTA_COOLDOWN_MAX_S)
-        self._quota_cooldowns[key] = self._clock() + wait
+        transient = LLMProvider._is_transient_429(response)
+        if transient:
+            retry_after = LLMProvider._extract_retry_after_from_response(response)
+            wait = min(max(retry_after or TRANSIENT_COOLDOWN_DEFAULT_S,
+                           TRANSIENT_COOLDOWN_MIN_S), TRANSIENT_COOLDOWN_MAX_S)
+        else:
+            # 配额型/未知：长冷却，不读 Retry-After 缩短。
+            wait = QUOTA_EXHAUSTED_COOLDOWN_S
+        self._cooldowns[key] = self._clock() + wait
         logger.warning(
-            "Model '{}' rate limited; cooling it down for {}s", key[1], int(wait)
+            "Model '{}' {} 429; cooling it down for {}s",
+            key[1], "transient" if transient else "quota-exhausted", int(wait),
         )
 
     def _primary_available(self) -> bool:
@@ -445,9 +455,8 @@ class FallbackProvider(LLMProvider):
         kind = "Primary model" if candidate.primary else "Fallback"
         return f"{kind} '{candidate.model}'"
 
-    def _skip_reason(self, candidate: _Candidate, cooling: set[tuple[str, str]]) -> str | None:
-        if candidate.key in cooling:
-            return "quota cooldown"
+    def _skip_reason(self, candidate: _Candidate) -> str | None:
+        # 冷却中的候选已在构建阶段剔除，这里只剩熔断这一种回合内跳过。
         if candidate.primary and not self._primary_available():
             return "circuit open"
         return None
@@ -461,13 +470,15 @@ class FallbackProvider(LLMProvider):
     ) -> LLMResponse:
         candidates = self._candidates(kwargs)
         primary_model = candidates[0].model
+        # 冷却中的候选静默剔除，不逐回合排进候选再 skip 刷日志（保留最空闲的一个兜底）。
         cooling = self._cooling_down(primary_model)
+        candidates = [candidate for candidate in candidates if candidate.key not in cooling]
         last_response: LLMResponse | None = None
         # 上一个候选为什么没成，留到下一个候选真正开跑时一起写日志，
         # 这样 journal 里能顺着读完整条降级链。
         why_here: str | None = None
         for candidate in candidates:
-            skip = self._skip_reason(candidate, cooling)
+            skip = self._skip_reason(candidate)
             if skip is not None:
                 why_here = f"{self._label(candidate)} skipped: {skip}"
                 continue
@@ -488,7 +499,7 @@ class FallbackProvider(LLMProvider):
                 return response
             if not await self._recover_stream(response, has_streamed, on_stream_recover, kwargs):
                 return response
-            self._note_quota_cooldown(candidate.key, response)
+            self._note_cooldown(candidate.key, response)
             last_response = response
             why_here = f"{self._label(candidate)} failed: {(response.content or '').strip()[:120]}"
             if candidate.primary:

@@ -477,14 +477,18 @@ async def test_openai_gives_up_after_max_attempts(audio_file: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_openai_backoff_grows_exponentially(audio_file: Path) -> None:
-    """Verify the backoff schedule is exponential (1s, 2s, 4s)."""
+    """退避走指数加抖动：1s/2s/4s 各自落在 ±10% 抖动窗内，逐次递增。"""
     provider = OpenAITranscriptionProvider(api_key="sk-test")
     post = AsyncMock(return_value=_response(503))
     sleep = AsyncMock()
     with patch("httpx.AsyncClient.post", post), patch("asyncio.sleep", sleep):
         await provider.transcribe(audio_file)
     delays = [call.args[0] for call in sleep.await_args_list]
-    assert delays == [1.0, 2.0, 4.0]
+    assert len(delays) == 3
+    assert 0.9 <= delays[0] <= 1.1
+    assert 1.8 <= delays[1] <= 2.2
+    assert 3.6 <= delays[2] <= 4.4
+    assert delays[0] < delays[1] < delays[2]
 
 
 # ---------------------------------------------------------------------------

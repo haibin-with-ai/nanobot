@@ -18,6 +18,8 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from nanobot.providers.base import LLMProvider, compute_backoff
+
 _CHAT_COMPLETIONS_PATH = "chat/completions"
 _TRANSCRIPTIONS_PATH = "audio/transcriptions"
 _STEPFUN_ASR_PATH = "audio/asr/sse"
@@ -99,8 +101,20 @@ def _audio_format(path: Path) -> str:
 # mobile-network transcription callers hit sporadic connect/read errors.
 # Without this, a voice message silently becomes the empty string.
 _MAX_RETRIES = 3
-_BACKOFF_S = (1.0, 2.0, 4.0)
+_BACKOFF_BASE_S = 1.0
+_BACKOFF_CAP_S = 30.0
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def _retry_sleep_s(attempt: int, retry_after: float | None = None) -> float:
+    """本次重试前等待的秒数：0-based attempt 转 1-based，honor Retry-After，否则指数退避加抖动。"""
+    return compute_backoff(attempt + 1, retry_after, base=_BACKOFF_BASE_S, cap=_BACKOFF_CAP_S)
+
+
+def _retry_after_of(headers: Any) -> float | None:
+    return LLMProvider._extract_retry_after_from_headers(headers)
+
+
 _RETRYABLE_EXCEPTIONS = (
     httpx.TimeoutException,
     httpx.ConnectError,
@@ -134,7 +148,7 @@ async def _request_json_with_retry(
                     _MAX_RETRIES + 1,
                     e,
                 )
-                await asyncio.sleep(_BACKOFF_S[attempt])
+                await asyncio.sleep(_retry_sleep_s(attempt))
                 continue
             logger.exception(
                 "{} transcription error after {} attempts: {}",
@@ -155,7 +169,7 @@ async def _request_json_with_retry(
                 attempt + 1,
                 _MAX_RETRIES + 1,
             )
-            await asyncio.sleep(_BACKOFF_S[attempt])
+            await asyncio.sleep(_retry_sleep_s(attempt, _retry_after_of(response.headers)))
             continue
 
         try:
@@ -369,7 +383,7 @@ async def _post_stepfun_asr_with_retry(
                             attempt + 1,
                             _MAX_RETRIES + 1,
                         )
-                        await asyncio.sleep(_BACKOFF_S[attempt])
+                        await asyncio.sleep(_retry_sleep_s(attempt, _retry_after_of(resp.headers)))
                         continue
                     resp.raise_for_status()
                     final_text = None
@@ -401,7 +415,7 @@ async def _post_stepfun_asr_with_retry(
                             attempt + 1,
                             _MAX_RETRIES + 1,
                         )
-                        await asyncio.sleep(_BACKOFF_S[attempt])
+                        await asyncio.sleep(_retry_sleep_s(attempt))
                         continue
                     logger.error(
                         "{} transcription: stream ended without final text after {} attempts",
@@ -411,7 +425,7 @@ async def _post_stepfun_asr_with_retry(
                     return ""
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_BACKOFF_S[attempt])
+                    await asyncio.sleep(_retry_sleep_s(attempt, _retry_after_of(e.response.headers)))
                     continue
                 logger.error(
                     "{} transcription HTTP {}{}",
@@ -422,7 +436,7 @@ async def _post_stepfun_asr_with_retry(
                 return ""
             except (httpx.RequestError, Exception):
                 if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_BACKOFF_S[attempt])
+                    await asyncio.sleep(_retry_sleep_s(attempt))
                     continue
                 logger.exception("{} transcription request error", provider_label)
                 return ""
@@ -447,7 +461,7 @@ async def _post_with_retry(
                         _MAX_RETRIES + 1,
                         e,
                     )
-                    await asyncio.sleep(_BACKOFF_S[attempt])
+                    await asyncio.sleep(_retry_sleep_s(attempt))
                     continue
                 logger.exception(
                     "{} transcription error after {} attempts: {}",
@@ -468,7 +482,7 @@ async def _post_with_retry(
                     attempt + 1,
                     _MAX_RETRIES + 1,
                 )
-                await asyncio.sleep(_BACKOFF_S[attempt])
+                await asyncio.sleep(_retry_sleep_s(attempt, _retry_after_of(response.headers)))
                 continue
 
             try:

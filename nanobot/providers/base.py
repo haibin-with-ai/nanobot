@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,29 @@ STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
 DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
 MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
 RETRY_AFTER_BUFFER = 1
+
+
+def compute_backoff(
+    attempt: int,
+    retry_after: float | None,
+    *,
+    base: float,
+    cap: float,
+) -> float:
+    """下一次重试前等待的秒数：有 Retry-After 就 honor，否则指数退避加抖动，全程封顶。
+
+    纯计算，不做 fail-fast——超封顶的判断留给 retry_after_exceeds_cap，
+    这样 image/transcription 这类不 fail-fast 的调用方拿到的永远是可直接 sleep 的值。
+    """
+    if retry_after is not None and retry_after >= 0:
+        return min(retry_after * (1 + random.random() * 0.1), cap)
+    exponential = base * 2 ** (max(attempt, 1) - 1)
+    return min(exponential * (0.9 + random.random() * 0.2), cap)
+
+
+def retry_after_exceeds_cap(retry_after: float | None, cap: float) -> bool:
+    """服务器要求的 Retry-After 超过封顶——调用方据此 fail-fast，不为单个端点死等。"""
+    return retry_after is not None and retry_after > cap
 
 
 def resolve_stream_idle_timeout_s(
@@ -200,6 +224,7 @@ class LLMProvider(ABC):
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _PERSISTENT_MAX_DELAY = 60
+    _STANDARD_MAX_DELAY = 60
     _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
     _RETRY_HEARTBEAT_CHUNK = 30
     _TRANSIENT_ERROR_MARKERS = (
@@ -487,27 +512,38 @@ class LLMProvider(ABC):
 
         return cls._normalize_error_token(type_value), cls._normalize_error_token(code_value)
 
+    _429_QUOTA = "quota"
+    _429_TRANSIENT = "transient"
+    _429_UNKNOWN = "unknown"
+
     @classmethod
-    def _is_retryable_429_response(cls, response: LLMResponse) -> bool:
-        type_token = cls._normalize_error_token(response.error_type)
-        code_token = cls._normalize_error_token(response.error_code)
-        semantic_tokens = {
-            token for token in (type_token, code_token)
+    def _classify_429(cls, response: LLMResponse) -> str:
+        """把 429 分成 quota（账号配额/账单）、transient（瞬时限流）、unknown 三态，单一真源。"""
+        tokens = {
+            token for token in (
+                cls._normalize_error_token(response.error_type),
+                cls._normalize_error_token(response.error_code),
+            )
             if token is not None
         }
-        if any(token in cls._NON_RETRYABLE_429_ERROR_TOKENS for token in semantic_tokens):
-            return False
-
         content = (response.content or "").lower()
-        if any(marker in content for marker in cls._NON_RETRYABLE_429_TEXT_MARKERS):
-            return False
+        if (any(t in cls._NON_RETRYABLE_429_ERROR_TOKENS for t in tokens)
+                or any(m in content for m in cls._NON_RETRYABLE_429_TEXT_MARKERS)):
+            return cls._429_QUOTA
+        if (any(t in cls._RETRYABLE_429_ERROR_TOKENS for t in tokens)
+                or any(m in content for m in cls._RETRYABLE_429_TEXT_MARKERS)):
+            return cls._429_TRANSIENT
+        return cls._429_UNKNOWN
 
-        if any(token in cls._RETRYABLE_429_ERROR_TOKENS for token in semantic_tokens):
-            return True
-        if any(marker in content for marker in cls._RETRYABLE_429_TEXT_MARKERS):
-            return True
-        # Unknown 429 defaults to WAIT+retry.
-        return True
+    @classmethod
+    def _is_retryable_429_response(cls, response: LLMResponse) -> bool:
+        # 乐观重试语义：未知 429 也 WAIT+retry，只有确认配额耗尽才不重试。
+        return cls._classify_429(response) != cls._429_QUOTA
+
+    @classmethod
+    def _is_transient_429(cls, response: LLMResponse) -> bool:
+        # 冷却语义相反：只有显式瞬时才短冷却，未知一律走长冷却（有替补，宁可误判成长）。
+        return cls._classify_429(response) == cls._429_TRANSIENT
 
     @staticmethod
     def _enforce_role_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -967,10 +1003,16 @@ class LLMProvider(ABC):
                 break
 
             retry_after = self._extract_retry_after_from_response(response)
+            cap = self._PERSISTENT_MAX_DELAY if persistent else self._STANDARD_MAX_DELAY
+            if not persistent and retry_after_exceeds_cap(retry_after, cap):
+                # 标准链路不为单个坏端点死等：交给外层 FallbackProvider 换模型。
+                logger.warning(
+                    "Retry-After {}s exceeds {}s cap; failing fast so the caller can switch: {}",
+                    int(retry_after), cap, (response.content or "")[:120].lower(),
+                )
+                return response
             base_delay = delays[min(attempt - 1, len(delays) - 1)]
-            delay = retry_after + RETRY_AFTER_BUFFER if retry_after else base_delay
-            if persistent:
-                delay = min(delay, self._PERSISTENT_MAX_DELAY)
+            delay = min((retry_after + RETRY_AFTER_BUFFER) if retry_after else base_delay, cap)
 
             logger.warning(
                 "LLM transient error (attempt {}{}), retrying in {}s: {}",

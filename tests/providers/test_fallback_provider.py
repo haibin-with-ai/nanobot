@@ -8,9 +8,9 @@ import pytest
 from nanobot.config.schema import ModelPresetConfig
 from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.fallback_provider import (
-    QUOTA_COOLDOWN_DEFAULT_S,
-    QUOTA_COOLDOWN_MAX_S,
-    QUOTA_COOLDOWN_MIN_S,
+    TRANSIENT_COOLDOWN_DEFAULT_S,
+    TRANSIENT_COOLDOWN_MAX_S,
+    TRANSIENT_COOLDOWN_MIN_S,
     FallbackProvider,
 )
 
@@ -136,33 +136,35 @@ class TestQuotaCooldown:
         provider, _ = _build(primary, fallback, clock=clock)
 
         await _ask(provider)
-        clock.advance(QUOTA_COOLDOWN_DEFAULT_S + 1)
+        clock.advance(TRANSIENT_COOLDOWN_DEFAULT_S + 1)
         result = await _ask(provider)
 
         assert result.content == "primary back"
 
     @pytest.mark.asyncio
     async def test_retry_after_is_clamped_to_the_floor(self) -> None:
+        # 瞬时型 Retry-After=2 被抬到下限 5，冷却期内跳过、过点后放回。
         clock = _Clock()
         primary = _FakeProvider("primary", _rate_limited(retry_after=2), _ok("primary back"))
         fallback = _FakeProvider("fallback", _ok("fallback ok"))
         provider, _ = _build(primary, fallback, clock=clock)
 
         await _ask(provider)
-        clock.advance(QUOTA_COOLDOWN_MIN_S - 1)
+        clock.advance(TRANSIENT_COOLDOWN_MIN_S - 1)
         assert (await _ask(provider)).content == "fallback ok"
         clock.advance(2)
         assert (await _ask(provider)).content == "primary back"
 
     @pytest.mark.asyncio
     async def test_retry_after_is_clamped_to_the_ceiling(self) -> None:
+        # 瞬时型 Retry-After 巨大时被夹到上限 120。
         clock = _Clock()
         primary = _FakeProvider("primary", _rate_limited(retry_after=99_999), _ok("primary back"))
         fallback = _FakeProvider("fallback", _ok("fallback ok"))
         provider, _ = _build(primary, fallback, clock=clock)
 
         await _ask(provider)
-        clock.advance(QUOTA_COOLDOWN_MAX_S + 1)
+        clock.advance(TRANSIENT_COOLDOWN_MAX_S + 1)
 
         assert (await _ask(provider)).content == "primary back"
 
@@ -181,8 +183,8 @@ class TestQuotaCooldown:
     async def test_everything_cooling_still_attempts_the_freest_model(self) -> None:
         """全员冷却时不能直接摆烂，挑冷却剩余最短的那个继续打。"""
         clock = _Clock()
-        primary = _FakeProvider("primary", _rate_limited(retry_after=QUOTA_COOLDOWN_MAX_S))
-        fallback = _FakeProvider("fallback", _rate_limited(retry_after=QUOTA_COOLDOWN_MIN_S), _ok("fallback ok"))
+        primary = _FakeProvider("primary", _rate_limited(retry_after=TRANSIENT_COOLDOWN_MAX_S))
+        fallback = _FakeProvider("fallback", _rate_limited(retry_after=TRANSIENT_COOLDOWN_MIN_S), _ok("fallback ok"))
         provider, _ = _build(primary, fallback, clock=clock)
 
         await _ask(provider)
