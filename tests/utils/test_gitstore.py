@@ -101,6 +101,64 @@ class TestLineAges:
         assert age_by_line["- keep"] == 30
 
 
+class TestPush:
+    """Auto-push after Dream commits so local commits stop piling up unpushed."""
+
+    def _repo_with_remote(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        remote = tmp_path / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "init", "-q", str(work)], check=True)
+        subprocess.run(["git", "-C", str(work), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(work), "config", "user.name", "t"], check=True)
+        subprocess.run(
+            ["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True
+        )
+        g = GitStore(work, tracked_files=["MEMORY.md"])
+        (work / "MEMORY.md").write_text("# Memory\n", encoding="utf-8")
+        # Establish an initial tracked commit + upstream. auto_commit only sees
+        # modifications to already-tracked files, so the first commit is seeded
+        # with system git here.
+        subprocess.run(["git", "-C", str(work), "add", "MEMORY.md"], check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "initial"], check=True)
+        subprocess.run(
+            ["git", "-C", str(work), "push", "-q", "-u", "origin", "HEAD"], check=True
+        )
+        return g, work, remote
+
+    def _head(self, repo):
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_push_sends_new_commit_to_remote(self, tmp_path):
+        g, work, remote = self._repo_with_remote(tmp_path)
+        (work / "MEMORY.md").write_text("# Memory\n- new\n", encoding="utf-8")
+        g.auto_commit("second")
+        assert self._head(work) != self._head(remote)  # remote behind before push
+        assert g.push() is True
+        assert self._head(work) == self._head(remote)
+
+    def test_push_returns_false_without_remote(self, git):
+        assert git.push() is False
+
+    def test_push_returns_false_when_not_initialized(self, tmp_path):
+        g = GitStore(tmp_path, tracked_files=["MEMORY.md"])
+        assert g.push() is False
+
+    def test_push_failure_does_not_raise(self, tmp_path):
+        import shutil
+
+        g, work, remote = self._repo_with_remote(tmp_path)
+        shutil.rmtree(remote)  # break the remote
+        (work / "MEMORY.md").write_text("x\n", encoding="utf-8")
+        g.auto_commit("third")
+        assert g.push() is False
+
+
 class TestSummarizeWorkingTree:
     """Ground-truth diff summary used to keep Dream audit records honest."""
 

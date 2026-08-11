@@ -199,9 +199,11 @@ def test_commit_dream_changes_skips_noop_run(tmp_path) -> None:
     store.git.init()
     store.git.auto_commit("initial")
     store.git.auto_commit = MagicMock(wraps=store.git.auto_commit)
+    store.git.push = MagicMock(wraps=store.git.push)
 
     assert cli_commands._commit_dream_changes(store) is None
     store.git.auto_commit.assert_not_called()
+    store.git.push.assert_not_called()
 
 
 def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
@@ -212,6 +214,7 @@ def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
     store.git.auto_commit("initial")
     store.write_memory("# Memory\n- Research notes")
     store.git.auto_commit = MagicMock(wraps=store.git.auto_commit)
+    store.git.push = MagicMock(return_value=True)
 
     sha = cli_commands._commit_dream_changes(store)
 
@@ -220,6 +223,8 @@ def test_commit_dream_changes_commits_real_edits(tmp_path) -> None:
     message = store.git.auto_commit.call_args.args[0]
     assert message.startswith("dream: periodic memory consolidation\n\n")
     assert "Research notes" in message
+    # Root fix: a successful Dream commit is pushed so local commits stop piling up.
+    store.git.push.assert_called_once()
 
 
 @pytest.fixture

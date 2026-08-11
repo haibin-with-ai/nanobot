@@ -207,7 +207,13 @@ def _commit_dream_changes(memory: Any) -> str | None:
         "dream: periodic memory consolidation",
         diff_body,
     )
-    return memory.git.auto_commit(message)
+    sha = memory.git.auto_commit(message)
+    if sha:
+        # Root fix for local commits piling up unpushed: push right after the
+        # Dream commit. push() swallows and logs its own failures, so a network
+        # hiccup never breaks memory consolidation.
+        memory.git.push()
+    return sha
 
 
 class SafeFileHistory(FileHistory):

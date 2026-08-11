@@ -17,6 +17,7 @@ from loguru import logger
 # record. The structured per-file summary is always emitted in full regardless.
 _WORKING_TREE_DIFF_MAX_CHARS = 6000
 _BLAME_TIMEOUT_SECONDS = 30
+_PUSH_TIMEOUT_SECONDS = 30
 _BLAME_HEADER_RE = re.compile(r"^([0-9a-fA-F]{40}) ([0-9]+) ([0-9]+) ([0-9]+)$")
 
 
@@ -196,6 +197,49 @@ class GitStore:
             return sha
         except Exception as exc:
             raise GitStoreError(f"Git auto-commit failed: {message}") from exc
+
+    def push(self) -> bool:
+        """Push the current branch to its configured remote.
+
+        Returns True on success. Returns False (with a WARNING) when no remote
+        is configured, the push times out, or git reports failure — a failed
+        push must never break the Dream/memory flow. Never force-pushes.
+        """
+        if not self.is_initialized() or not self._has_remote():
+            return False
+        try:
+            result = subprocess.run(
+                ["git", "push"],
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+                timeout=_PUSH_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Git push timed out after {}s", _PUSH_TIMEOUT_SECONDS)
+            return False
+        except OSError as exc:
+            logger.warning("Git push failed to start: {}", exc)
+            return False
+        if result.returncode != 0:
+            logger.warning("Git push failed: {}", result.stderr.strip())
+            return False
+        logger.debug("Git push succeeded")
+        return True
+
+    def _has_remote(self) -> bool:
+        """True if the repo has at least one configured remote."""
+        try:
+            result = subprocess.run(
+                ["git", "remote"],
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+                timeout=_BLAME_TIMEOUT_SECONDS,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0 and bool(result.stdout.strip())
 
     # -- internal helpers ------------------------------------------------------
 
