@@ -1333,12 +1333,17 @@ async def test_codex_payload_and_response(monkeypatch) -> None:
     assert call["headers"]["X-Test"] == "1"
     body = call["json"]
     assert body["model"] == "gpt-5.4"
-    assert body["instructions"] == "Generate an image based on the user's request."
-    assert body["input"] == [{"role": "user", "content": "draw a cat"}]
-    assert body["tools"] == [{"type": "image_generation"}]
+    assert "image_generation tool exactly once" in body["instructions"]
+    assert body["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "draw a cat"}]}
+    ]
+    assert body["tools"] == [{"type": "image_generation", "output_format": "png"}]
     assert body["tool_choice"] == "auto"
+    assert body["parallel_tool_calls"] is False
+    assert body["text"] == {"verbosity": "low"}
     assert body["store"] is False
     assert body["stream"] is True
+    assert call["headers"]["Accept"] == "text/event-stream"
 
 
 @pytest.mark.asyncio
@@ -1573,6 +1578,148 @@ async def test_codex_json_result_format(monkeypatch) -> None:
     response = await client.generate(prompt="draw", model="gpt-5.4")
 
     assert response.images == [PNG_DATA_URL]
+
+
+def _install_fake_codex_token(monkeypatch) -> None:
+    import sys
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    @dataclass
+    class FakeToken:
+        access: str = "oauth-token"
+        account_id: str = "acct-123"
+
+    fake_oauth = SimpleNamespace(get_token=lambda **_: FakeToken())
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+
+
+def test_codex_default_timeout_is_300() -> None:
+    assert CodexImageGenerationClient.default_timeout == 300.0
+    client = CodexImageGenerationClient(api_key=None)
+    assert client.timeout == 300.0
+
+
+@pytest.mark.asyncio
+async def test_codex_reference_images_become_input_image_blocks(
+    monkeypatch, tmp_path
+) -> None:
+    _install_fake_codex_token(monkeypatch)
+
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(PNG_BYTES)
+
+    fake = FakeClient(FakeResponse({}, sse_lines=[
+        f'data: {{"type":"response.output_item.done","item":{{"type":"image_generation_call","result":"{PNG_DATA_URL}"}}}}',
+        "",
+        'data: [DONE]',
+        "",
+    ]))
+    client = CodexImageGenerationClient(
+        api_key=None, client=fake  # type: ignore[arg-type]
+    )
+
+    response = await client.generate(
+        prompt="make it blue",
+        model="gpt-5.4",
+        reference_images=[str(ref)],
+    )
+
+    assert response.images == [PNG_DATA_URL]
+    content = fake.calls[0]["json"]["input"][0]["content"]
+    assert content[0] == {"type": "input_text", "text": "make it blue"}
+    assert content[1]["type"] == "input_image"
+    assert content[1]["image_url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_codex_caps_reference_images_at_five(monkeypatch, tmp_path) -> None:
+    _install_fake_codex_token(monkeypatch)
+
+    refs = []
+    for i in range(7):
+        p = tmp_path / f"ref{i}.png"
+        p.write_bytes(PNG_BYTES)
+        refs.append(str(p))
+
+    fake = FakeClient(FakeResponse({}, sse_lines=[
+        f'data: {{"type":"response.output_item.done","item":{{"type":"image_generation_call","result":"{PNG_DATA_URL}"}}}}',
+        "",
+        'data: [DONE]',
+        "",
+    ]))
+    client = CodexImageGenerationClient(
+        api_key=None, client=fake  # type: ignore[arg-type]
+    )
+
+    await client.generate(prompt="edit", model="gpt-5.4", reference_images=refs)
+
+    content = fake.calls[0]["json"]["input"][0]["content"]
+    image_blocks = [b for b in content if b.get("type") == "input_image"]
+    assert len(image_blocks) == 5
+
+
+class _SequencedCodexResponse(FakeResponse):
+    """FakeResponse carrying a status code + headers for retry tests."""
+
+    def __init__(self, status_code: int, sse_lines: list[str] | None = None) -> None:
+        super().__init__({}, status_code=status_code, sse_lines=sse_lines)
+        self.headers: dict[str, str] = {}
+
+
+class _SequencedCodexClient:
+    """FakeClient that returns queued responses in order per POST call."""
+
+    def __init__(self, responses: list[_SequencedCodexResponse]) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> _SequencedCodexResponse:
+        self.calls.append({"url": url, **kwargs})
+        return self._responses[len(self.calls) - 1]
+
+
+@pytest.mark.asyncio
+async def test_codex_retries_on_429_then_succeeds(monkeypatch) -> None:
+    _install_fake_codex_token(monkeypatch)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    ok = _SequencedCodexResponse(200, sse_lines=[
+        f'data: {{"type":"response.output_item.done","item":{{"type":"image_generation_call","result":"{PNG_DATA_URL}"}}}}',
+        "",
+        'data: [DONE]',
+        "",
+    ])
+    fake = _SequencedCodexClient([_SequencedCodexResponse(429), ok])
+    client = CodexImageGenerationClient(
+        api_key=None, client=fake  # type: ignore[arg-type]
+    )
+
+    response = await client.generate(prompt="draw", model="gpt-5.4")
+
+    assert response.images == [PNG_DATA_URL]
+    assert len(fake.calls) == 2
+    assert len(sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_non_retryable_status_raises_immediately(monkeypatch) -> None:
+    _install_fake_codex_token(monkeypatch)
+
+    fake = _SequencedCodexClient([_SequencedCodexResponse(400)])
+    client = CodexImageGenerationClient(
+        api_key=None, client=fake  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ImageGenerationError, match="HTTP 400"):
+        await client.generate(prompt="draw", model="gpt-5.4")
+    assert len(fake.calls) == 1
 
 
 @pytest.mark.asyncio

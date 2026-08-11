@@ -349,6 +349,7 @@ class OpenRouterImageGenerationClient(ImageGenerationProvider):
 
     provider_name = "openrouter"
     model_options = ("openai/gpt-5.4-image-2",)
+    default_timeout = 300.0
     missing_key_message = (
         "OpenRouter API key is not configured. Set providers.openrouter.apiKey."
     )
@@ -1347,6 +1348,30 @@ class CustomImageGenerationClient(ImageGenerationProvider):
 # ---------------------------------------------------------------------------
 
 
+_CODEX_MAX_EDIT_IMAGES = 5
+_CODEX_OUTPUT_FORMAT = "png"
+_CODEX_MAX_RETRIES = 3
+_CODEX_BASE_DELAY_S = 1.0
+_CODEX_MAX_RETRY_DELAY_S = 30.0
+_CODEX_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _codex_retry_delay(attempt: int, retry_after: str | None) -> float:
+    """Delay before the next Codex retry: honor Retry-After, else backoff+jitter."""
+    import random
+
+    if retry_after:
+        trimmed = retry_after.strip()
+        try:
+            secs = float(trimmed)
+        except ValueError:
+            secs = None
+        if secs is not None and secs >= 0:
+            return min(secs * (1 + random.random() * 0.1), _CODEX_MAX_RETRY_DELAY_S)
+    exponential = min(_CODEX_BASE_DELAY_S * 2 ** (attempt - 1), _CODEX_MAX_RETRY_DELAY_S)
+    return exponential * (0.9 + random.random() * 0.2)
+
+
 class CodexImageGenerationClient(ImageGenerationProvider):
     """OpenAI image generation via Codex subscription OAuth.
 
@@ -1357,6 +1382,7 @@ class CodexImageGenerationClient(ImageGenerationProvider):
 
     provider_name = "openai_codex"
     model_options = ("gpt-5.4",)
+    default_timeout = 300.0
     missing_key_message = (
         "Codex OAuth token is unavailable. "
         "Log in with Codex subscription first."
@@ -1398,11 +1424,11 @@ class CodexImageGenerationClient(ImageGenerationProvider):
             token.account_id,
         )
 
-        if reference_images:
-            logger.warning(
-                "Codex image generation does not support reference images; "
-                "ignoring {} reference image(s)",
-                len(reference_images),
+        references = list(reference_images or [])[:_CODEX_MAX_EDIT_IMAGES]
+        content_blocks: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for path in references:
+            content_blocks.append(
+                {"type": "input_image", "image_url": image_path_to_data_url(path)}
             )
 
         headers = {
@@ -1412,37 +1438,39 @@ class CodexImageGenerationClient(ImageGenerationProvider):
             "originator": "nanobot",
             "User-Agent": "nanobot (python)",
             "Content-Type": "application/json",
+            "Accept": "text/event-stream",
             **self.extra_headers,
         }
 
         body: dict[str, Any] = {
             "model": self._codex_model(model),
-            "instructions": "Generate an image based on the user's request.",
-            "input": [{"role": "user", "content": prompt}],
-            "tools": [{"type": "image_generation"}],
+            "instructions": (
+                "You are generating bitmap image assets. For this request, call "
+                "the image_generation tool exactly once. Do not answer with only "
+                "text unless image generation is unavailable."
+            ),
+            "input": [{"role": "user", "content": content_blocks}],
+            "tools": [{"type": "image_generation", "output_format": _CODEX_OUTPUT_FORMAT}],
             "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "text": {"verbosity": "low"},
             "stream": True,
             "store": False,
         }
         body.update(self.extra_body)
 
-        logger.info("Codex Responses API request: POST {}/codex/responses body={}",
-                       self.api_base, {k: v for k, v in body.items() if k != "input"})
+        logger.info(
+            "Codex Responses API request: POST {}/codex/responses body={} refs={}",
+            self.api_base,
+            {k: v for k, v in body.items() if k != "input"},
+            len(references),
+        )
 
-        response = await self._http_post(
+        response = await self._codex_post_with_retry(
             f"{self.api_base}/codex/responses",
             headers=headers,
             body=body,
         )
-
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            detail = response.text[:1000]
-            logger.error("Codex Responses API error ({}): {}", response.status_code, detail)
-            raise ImageGenerationError(
-                f"Codex image generation failed (HTTP {response.status_code}): {detail}"
-            ) from exc
 
         images, content_text = await _parse_codex_sse_images(response)
 
@@ -1450,6 +1478,59 @@ class CodexImageGenerationClient(ImageGenerationProvider):
         self._require_images(images, raw)
 
         return GeneratedImageResponse(images=images, content=content_text, raw=raw)
+
+    async def _codex_post_with_retry(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        body: dict[str, Any],
+    ) -> httpx.Response:
+        """POST to the Codex endpoint, retrying only on pre-stream 429/5xx.
+
+        Once the SSE stream begins (status < 400) it is never retried, matching
+        the "already streaming content is not retried" rule for the main model.
+        """
+        last_detail = ""
+        for attempt in range(1, _CODEX_MAX_RETRIES + 1):
+            try:
+                response = await self._http_post(url, headers=headers, body=body)
+            except httpx.TimeoutException as exc:
+                raise ImageGenerationError(
+                    "Codex image generation request timed out"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise ImageGenerationError(
+                    f"Codex image generation request failed: {exc}"
+                ) from exc
+
+            if response.status_code < 400:
+                return response
+
+            last_detail = response.text[:1000]
+            logger.error(
+                "Codex Responses API error ({}) attempt {}/{}: {}",
+                response.status_code,
+                attempt,
+                _CODEX_MAX_RETRIES,
+                last_detail,
+            )
+            retryable = response.status_code in _CODEX_RETRYABLE_STATUS
+            if retryable and attempt < _CODEX_MAX_RETRIES:
+                delay = _codex_retry_delay(
+                    attempt, response.headers.get("retry-after")
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise ImageGenerationError(
+                f"Codex image generation failed (HTTP {response.status_code}): "
+                f"{last_detail}"
+            )
+
+        raise ImageGenerationError(
+            f"Codex image generation failed after {_CODEX_MAX_RETRIES} attempts: "
+            f"{last_detail}"
+        )
 
 
 def _openai_size(
