@@ -96,6 +96,7 @@ class SubagentManager:
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         fail_on_tool_error: bool | None = None,
+        image_generation_provider_configs: dict[str, Any] | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
     ):
         if workspace is None:
@@ -126,6 +127,7 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.tools_config = tools_config or ToolsConfig()
+        self._image_gen_provider_configs = dict(image_generation_provider_configs or {})
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
@@ -192,6 +194,7 @@ class SubagentManager:
             exec=self.tools_config.exec,
             web=self.tools_config.web,
             file=self.tools_config.file,
+            image_generation=self.tools_config.image_generation,
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
@@ -209,6 +212,7 @@ class SubagentManager:
             workspace=str(root.resolve()),
             exec_session_manager=self._exec_session_manager,
             file_state_store=FileStates(),
+            image_generation_provider_configs=self._image_gen_provider_configs,
             workspace_sandbox=workspace_sandbox_status(
                 restrict_to_workspace=cfg.restrict_to_workspace,
                 workspace=root,
