@@ -103,8 +103,16 @@ class MemoryStore:
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._dream_prompt_oversize_logged = False
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
+        self.kb_dir = self.memory_dir / "kb"
+        # Cold-store kb files are tracked individually; files created after
+        # startup are picked up on the next process start.
+        kb_tracked = sorted(
+            str(p.relative_to(workspace)) for p in self.kb_dir.glob("*.md")
+        )
+        self._dream_content_paths = [*self._DREAM_CONTENT_PATHS, *kb_tracked]
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
+            *kb_tracked,
         ])
         self._maybe_migrate_legacy_history()
 
@@ -674,7 +682,7 @@ class MemoryStore:
         """
         if not self._git.is_initialized():
             return ""
-        return self._git.summarize_working_tree(list(self._DREAM_CONTENT_PATHS))
+        return self._git.summarize_working_tree(self._dream_content_paths)
 
     def build_dream_tools(self):
         """Build the restricted tool registry used by Dream runs."""
@@ -689,9 +697,11 @@ class MemoryStore:
         workspace = self.workspace
         skills_dir = workspace / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
+        self.kb_dir.mkdir(parents=True, exist_ok=True)
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
         editable_files = [self.memory_file, self.soul_file, self.user_file]
+        editable_dirs = [self.kb_dir]
 
         tools.register(ReadFileTool(
             workspace=workspace,
@@ -702,18 +712,21 @@ class MemoryStore:
         tools.register(EditFileTool(
             workspace=workspace,
             allowed_dir=skills_dir,
+            extra_write_allowed_dirs=editable_dirs,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
         ))
         tools.register(ApplyPatchTool(
             workspace=workspace,
             allowed_dir=skills_dir,
+            extra_write_allowed_dirs=editable_dirs,
             extra_write_allowed_files=editable_files,
             file_states=file_states,
         ))
         tools.register(WriteFileTool(
             workspace=workspace,
             allowed_dir=skills_dir,
+            extra_write_allowed_dirs=editable_dirs,
             file_states=file_states,
         ))
         return tools

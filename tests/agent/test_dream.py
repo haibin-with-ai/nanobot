@@ -280,6 +280,24 @@ class TestDreamTools:
         assert skill_target.read_text(encoding="utf-8").startswith("---\nname: scoped")
 
     @pytest.mark.asyncio
+    async def test_dream_can_write_memory_kb_files(self, store):
+        tools = store.build_dream_tools()
+        target = store.workspace / "memory" / "kb" / "invest.md"
+
+        write_result = await tools.execute(
+            "write_file",
+            {"path": "memory/kb/invest.md", "content": "# invest\n- (2026-08) 网格参数\n"},
+        )
+        edit_result = await tools.execute(
+            "edit_file",
+            {"path": "memory/kb/invest.md", "old_text": "网格参数", "new_text": "网格格距"},
+        )
+
+        assert "Successfully wrote" in write_result
+        assert "Successfully edited" in edit_result
+        assert "网格格距" in target.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
     async def test_dream_cannot_modify_memory_internal_files(self, store):
         tools = store.build_dream_tools()
         store.history_file.write_text("before\n", encoding="utf-8")
@@ -681,6 +699,21 @@ class TestDreamContentDiff:
         store.git.init()
         store.git.auto_commit("initial")
         assert store.dream_content_diff() == ""
+
+    def test_detects_kb_file_changes(self, tmp_path):
+        kb = tmp_path / "memory" / "kb"
+        kb.mkdir(parents=True)
+        (kb / "invest.md").write_text("- old fact\n", encoding="utf-8")
+        store = MemoryStore(tmp_path)
+        store.write_soul("# Soul")
+        store.write_memory("# Memory")
+        store.git.init()
+        store.git.auto_commit("initial")
+
+        (kb / "invest.md").write_text("- new fact\n", encoding="utf-8")
+        diff = store.dream_content_diff()
+        assert "memory/kb/invest.md" in diff
+        assert "new fact" in diff
 
     def test_ignores_platform_line_ending_normalization(self, store, monkeypatch):
         import subprocess
