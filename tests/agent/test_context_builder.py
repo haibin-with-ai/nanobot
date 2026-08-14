@@ -464,55 +464,14 @@ class TestSoulFirstAndAnchor:
         positions = [text.index(f"## {name}") for name in ("SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md")]
         assert positions == sorted(positions)
 
-    def test_soul_anchor_is_appended_once_and_stays_small(self, tmp_path):
+    def test_prompt_has_no_trailing_soul_anchor(self, tmp_path):
+        """SOUL 只在 bootstrap 注入一次，尾部不再重复 Prime Directive。"""
         workspace = self._workspace(tmp_path)
         builder = ContextBuilder(workspace)
         prompt = builder.build_system_prompt(include_memory_recent_history=False)
-        soul = (workspace / "SOUL.md").read_text(encoding="utf-8")
 
-        anchor = builder._build_soul_anchor(workspace)
-        assert anchor, "expected a soul anchor"
-        assert "Prime Directive" in anchor
-        assert "haibin's time is the scarcest resource." in anchor
-        assert len(anchor) <= len(soul) * 0.30
-        assert prompt.rstrip().endswith(anchor.rstrip())
-        # The anchor repeats the directive on purpose; it must not repeat itself.
-        assert prompt.count("# Remember") == 1
-        assert prompt.count("## Prime Directive") == 2
-        assert "persona detail line" not in anchor
-
-    def test_missing_soul_degrades_without_anchor(self, tmp_path):
-        (tmp_path / "AGENTS.md").write_text("# Agents\n\nrules\n", encoding="utf-8")
-        builder = ContextBuilder(tmp_path)
-        assert builder._build_soul_anchor(tmp_path) == ""
-        prompt = builder.build_system_prompt(include_memory_recent_history=False)
-        assert "Prime Directive" not in prompt
-
-    def test_anchor_reads_the_workspace_it_is_given(self, tmp_path):
-        """The override argument must not be silently ignored."""
-        other = self._workspace(tmp_path / "other")
-        builder = ContextBuilder(tmp_path / "empty")
-        assert builder._build_soul_anchor() == ""
-        assert "scarcest resource" in builder._build_soul_anchor(other)
-
-    def test_project_mode_still_anchors_on_the_agent_soul(self, tmp_path):
-        """项目工作区没有 SOUL.md，锚点必须仍取 agent 工作区那一份。"""
-        agent_home = self._workspace(tmp_path / "agent")
-        project = tmp_path / "project"
-        project.mkdir()
-        (project / "AGENTS.md").write_text("# Agents\n\nproject rules\n", encoding="utf-8")
-
-        prompt = ContextBuilder(agent_home).build_system_prompt(
-            workspace=project, include_memory_recent_history=False
-        )
-
-        assert "# Remember" in prompt
-        assert "haibin's time is the scarcest resource." in prompt
-
-    def test_soul_without_prime_directive_yields_no_anchor(self, tmp_path):
-        (tmp_path / "SOUL.md").write_text("# Soul\n\njust a voice section\n", encoding="utf-8")
-        builder = ContextBuilder(tmp_path)
-        assert builder._build_soul_anchor(tmp_path) == ""
+        assert "# Remember" not in prompt
+        assert prompt.count("## Prime Directive") == 1
 
 
 class TestDiscordFormatHint:
