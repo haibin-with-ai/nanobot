@@ -520,10 +520,14 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
-    _PROFILE_FILES = ("SOUL.md", "TOOLS.md")
+    _PROFILE_FILES = ("SOUL.md",)
 
     def _load_profile_files(self) -> str:
-        """Voice and tool constraints the main agent runs under, for subagents too."""
+        """Voice constraints the main agent runs under, for subagents too.
+
+        TOOLS.md is deliberately absent: the real tool contract is bundled with
+        the package, and a workspace copy would silently override it.
+        """
         from nanobot.utils.helpers import load_bundled_template
 
         parts: list[str] = []

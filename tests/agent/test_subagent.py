@@ -197,8 +197,8 @@ def _manager_with_profile(tmp_path, *, soul=None, tools=None):
     )
 
 
-def test_subagent_prompt_carries_soul_and_tools(tmp_path):
-    """Subagents inherit voice and tool constraints, not just the task."""
+def test_subagent_prompt_carries_soul_only(tmp_path):
+    """Subagents inherit voice; workspace TOOLS.md is dead and must be ignored."""
     manager = _manager_with_profile(
         tmp_path,
         soul="# Soul\n\nBlunt, conclusion-first Chinese.\n",
@@ -208,7 +208,8 @@ def test_subagent_prompt_carries_soul_and_tools(tmp_path):
     prompt = manager._build_subagent_prompt()
 
     assert "Blunt, conclusion-first Chinese." in prompt
-    assert "Temp files only under tmp/." in prompt
+    assert "Temp files only under tmp/." not in prompt
+    assert "TOOLS.md" not in prompt
     # Upstream structure must survive.
     assert "You are a subagent spawned by the main agent" in prompt
     assert prompt.index("You are a subagent") < prompt.index("Blunt, conclusion-first")
