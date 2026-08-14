@@ -783,3 +783,44 @@ async def test_runner_passes_reasoning_effort_to_provider():
     ))
 
     assert captured["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_runner_disables_reasoning_for_thinking_only_finalization():
+    """Finalization must change the thinking-only failure condition, not just remove tools."""
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    calls: list[dict] = []
+
+    async def chat_with_retry(*, messages, tools=None, reasoning_effort=None, **kwargs):
+        calls.append({"tools": tools, "reasoning_effort": reasoning_effort})
+        if reasoning_effort != "none":
+            return LLMResponse(
+                content=None,
+                tool_calls=[],
+                thinking_blocks=[{"type": "thinking", "thinking": "still thinking"}],
+                usage={"prompt_tokens": 5, "completion_tokens": 100},
+            )
+        return LLMResponse(content="final answer", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{"name": "noop"}]
+
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "do task"}],
+        tools=tools,
+        model="test-model",
+        reasoning_effort="xhigh",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "final answer"
+    assert calls == [
+        {"tools": [{"name": "noop"}], "reasoning_effort": "xhigh"},
+        {"tools": [{"name": "noop"}], "reasoning_effort": "xhigh"},
+        {"tools": None, "reasoning_effort": "none"},
+    ]

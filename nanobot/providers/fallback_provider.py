@@ -401,13 +401,17 @@ class FallbackProvider(LLMProvider):
     def _candidates(self, kwargs: dict[str, Any]) -> list[_Candidate]:
         model = kwargs.get("model") or self._primary.get_default_model()
         candidates = [_Candidate(self._primary_key(model), model, self._primary, None, kwargs, True)]
+        reasoning_disabled = str(kwargs.get("reasoning_effort") or "").lower() in {
+            "none", "disabled",
+        }
         for preset in self._fallback_presets:
             attempt_kwargs = {**kwargs, "model": preset.model, "max_tokens": preset.max_tokens,
                               "temperature": preset.temperature}
-            if preset.reasoning_effort is None:
-                attempt_kwargs.pop("reasoning_effort", None)
-            else:
-                attempt_kwargs["reasoning_effort"] = preset.reasoning_effort
+            if not reasoning_disabled:
+                if preset.reasoning_effort is None:
+                    attempt_kwargs.pop("reasoning_effort", None)
+                else:
+                    attempt_kwargs["reasoning_effort"] = preset.reasoning_effort
             candidates.append(_Candidate(self._preset_key(preset), preset.model, None, preset,
                                          attempt_kwargs))
         return candidates

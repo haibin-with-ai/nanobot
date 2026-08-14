@@ -331,3 +331,30 @@ class TestStreamedRefusalStaysPut:
         )
 
         assert result.content == "fallback ok"
+
+
+@pytest.mark.asyncio
+async def test_explicit_reasoning_disable_survives_fallback_preset_override() -> None:
+    primary = _FakeProvider("primary", _server_error())
+    fallback = _FakeProvider("fallback", _ok("fallback ok"))
+    preset = ModelPresetConfig(
+        model="fallback-a",
+        provider="backup",
+        reasoning_effort="high",
+    )
+    provider = FallbackProvider(
+        primary=primary,
+        fallback_presets=[preset],
+        provider_factory=MagicMock(return_value=fallback),
+    )
+
+    result = await provider.chat(
+        messages=[{"role": "user", "content": "finish now"}],
+        model="primary-model",
+        tools=None,
+        reasoning_effort="none",
+    )
+
+    assert result.content == "fallback ok"
+    assert fallback.calls[0]["tools"] is None
+    assert fallback.calls[0]["reasoning_effort"] == "none"

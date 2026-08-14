@@ -1131,7 +1131,9 @@ class AgentRunner:
         messages: list[dict[str, Any]],
     ):
         retry_messages = self._finalization_retry_messages(messages)
-        return await self._request_no_tools(spec, retry_messages)
+        kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
+        kwargs["reasoning_effort"] = "none"
+        return await spec.runtime.provider.chat_with_retry(**kwargs)
 
     @staticmethod
     def _finalization_retry_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
