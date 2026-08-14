@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import re
+import shutil
 import time
 from collections import OrderedDict
 from contextlib import suppress
@@ -687,6 +688,7 @@ class SessionManager:
             )
 
         path = self._get_session_path(session.key)
+        self._archive_if_truncating(path, len(session.messages))
         tmp_path = path.with_suffix(".jsonl.tmp")
 
         try:
@@ -727,6 +729,45 @@ class SessionManager:
             raise
 
         self._remember(session)
+
+    def _archive_if_truncating(self, path: Path, new_message_count: int) -> None:
+        """Snapshot the existing session file before a shrinking overwrite.
+
+        Any persist that writes fewer messages than are already on disk
+        (``/new`` clear, idle compaction, pruning, file cap) copies the current
+        file verbatim into ``sessions/archive/<stem>-<n>.jsonl`` so the full
+        transcript is never lost. Normal appends grow the file and skip this.
+        The archive subdirectory is never matched by the top-level
+        ``*.jsonl`` glob used for loading and GC, so backups accumulate
+        untouched.
+        """
+        if not path.exists():
+            return
+        if self._count_persisted_messages(path) <= new_message_count:
+            return
+        target = self._next_archive_path(path.stem)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+
+    @staticmethod
+    def _count_persisted_messages(path: Path) -> int:
+        """Count message records on disk, excluding the single metadata line."""
+        lines = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    lines += 1
+        return max(0, lines - 1)
+
+    def _next_archive_path(self, stem: str) -> Path:
+        """Next monotonically increasing archive path for a session stem."""
+        archive_dir = self.sessions_dir / "archive"
+        highest = 0
+        for existing in archive_dir.glob(f"{stem}-*.jsonl"):
+            suffix = existing.stem[len(stem) + 1:]
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+        return archive_dir / f"{stem}-{highest + 1}.jsonl"
 
     def flush_all(self) -> int:
         """Re-save every cached session with fsync for durable shutdown.
