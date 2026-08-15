@@ -400,6 +400,7 @@ class SubagentManager:
                     hook=_SubagentHook(task_id, status),
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
+                    concurrent_tools=True,
                     error_message=None,
                     fail_on_tool_error=self.fail_on_tool_error,
                     checkpoint_callback=_on_checkpoint,

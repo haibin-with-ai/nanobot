@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,57 @@ async def test_generate_image_tool_stores_artifact_and_source_images(
     assert len(fake.calls) == 2
     assert fake.calls[0]["aspect_ratio"] == "16:9"
     assert fake.calls[0]["image_size"] == "2K"
+
+
+def test_image_generation_tool_is_concurrency_safe(tmp_path: Path) -> None:
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    assert tool.concurrency_safe is True
+
+
+class OverlapImageClient:
+    active = 0
+    max_active = 0
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    async def generate(self, **kwargs: Any) -> GeneratedImageResponse:
+        cls = type(self)
+        cls.active += 1
+        cls.max_active = max(cls.max_active, cls.active)
+        await asyncio.sleep(0.01)
+        cls.active -= 1
+        return GeneratedImageResponse(images=[PNG_DATA_URL], content="", raw={})
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_count_runs_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_config_path(tmp_path / "config.json")
+    OverlapImageClient.active = 0
+    OverlapImageClient.max_active = 0
+    monkeypatch.setattr(
+        "nanobot.agent.tools.image_generation.get_image_gen_provider",
+        lambda name: OverlapImageClient if name == "openrouter" else None,
+    )
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(enabled=True, max_images_per_turn=3),
+        provider_config=ProviderConfig(api_key="sk-or-test"),
+    )
+
+    result = await tool.execute(prompt="three variants", count=3)
+
+    payload = json.loads(result)
+    assert len(payload["artifacts"]) == 3
+    assert OverlapImageClient.max_active == 3
 
 
 @pytest.mark.asyncio

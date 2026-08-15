@@ -174,6 +174,38 @@ async def test_subagent_uses_configured_max_iterations(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_subagent_run_spec_enables_concurrent_tools(tmp_path):
+    """Subagent runs must allow batching of concurrency-safe tools (e.g. generate_image)."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    mgr._announce_result = AsyncMock()
+
+    seen = {}
+
+    async def fake_run(spec):
+        seen["concurrent_tools"] = spec.concurrent_tools
+        return SimpleNamespace(
+            stop_reason="done", final_content="done", error=None, tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+
+    await mgr.spawn(task="do task", runtime=_runtime(provider))
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
+
+    assert seen["concurrent_tools"] is True
+
+
+@pytest.mark.asyncio
 async def test_spawn_forwards_temperature_to_run_spec(tmp_path):
     """A temperature passed to spawn() should reach the AgentRunSpec."""
     from nanobot.agent.subagent import SubagentManager

@@ -120,6 +120,12 @@ class ImageGenerationTool(Tool):
         return "generate_image"
 
     @property
+    def concurrency_safe(self) -> bool:
+        # Each call creates its own provider client and writes uniquely named
+        # artifacts, so parallel generations do not share mutable state.
+        return True
+
+    @property
     def description(self) -> str:
         return (
             "Generate or edit images and store them as persistent artifacts. "
@@ -195,15 +201,22 @@ class ImageGenerationTool(Tool):
 
         try:
             refs = self._resolve_reference_images(reference_images)
-            artifacts: list[dict[str, Any]] = []
-            while len(artifacts) < requested:
-                response = await client.generate(
+
+            async def _generate_one() -> Any:
+                return await client.generate(
                     prompt=prompt,
                     model=self.config.model,
                     reference_images=refs,
                     aspect_ratio=aspect_ratio or self.config.default_aspect_ratio,
                     image_size=image_size or self.config.default_image_size,
                 )
+
+            if requested == 1:
+                responses = [await _generate_one()]
+            else:
+                responses = list(await asyncio.gather(*(_generate_one() for _ in range(requested))))
+            artifacts: list[dict[str, Any]] = []
+            for response in responses:
                 for image_data_url in response.images:
                     artifact = store_generated_image_artifact(
                         image_data_url,
@@ -216,6 +229,8 @@ class ImageGenerationTool(Tool):
                     artifacts.append(artifact)
                     if len(artifacts) >= requested:
                         break
+                if len(artifacts) >= requested:
+                    break
             return generated_image_tool_result(artifacts)
         except (ArtifactError, ImageGenerationError, OSError) as exc:
             return ToolResult.error(f"Error: {exc}")
