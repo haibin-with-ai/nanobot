@@ -277,6 +277,18 @@ if DISCORD_AVAILABLE:
                 command_text = f"/model {preset}" if preset else "/model"
                 await self._forward_slash_command(interaction, command_text)
 
+            @model_command.autocomplete("preset")
+            async def model_preset_autocomplete(
+                interaction: discord.Interaction,
+                current: str,
+            ) -> "list[app_commands.Choice[str]]":
+                names = await asyncio.to_thread(self._channel._model_preset_names)
+                needle = current.strip().lower()
+                if needle:
+                    names = [name for name in names if needle in name.lower()]
+                # Discord caps autocomplete suggestions at 25 choices.
+                return [app_commands.Choice(name=name, value=name) for name in names[:25]]
+
             @self.tree.command(name="trigger", description="Create a named local trigger for this chat")
             @app_commands.describe(name="Trigger name")
             async def trigger_command(
@@ -571,6 +583,18 @@ class DiscordChannel(BaseChannel):
         self._working_emoji_tasks: dict[str, asyncio.Task[None]] = {}
         self._stream_bufs: dict[str, _StreamBuf] = {}
         self._known_channels: dict[str, Any] = {}
+
+    def _model_preset_names(self) -> list[str]:
+        """Read preset names from the config file so WebUI edits stay visible without restart."""
+        from nanobot.agent.model_presets import load_model_preset_catalog
+
+        try:
+            names = set(load_model_preset_catalog())
+        except Exception as e:
+            self.logger.warning("model preset catalog unavailable: {}", e)
+            return []
+        names.add("default")
+        return ["default", *sorted(name for name in names if name != "default")]
 
     def _remember_channel(self, channel: Any) -> None:
         self._known_channels[self._channel_key(channel)] = channel
