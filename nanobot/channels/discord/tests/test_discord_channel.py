@@ -22,6 +22,7 @@ from nanobot.channels.discord.runtime import (
     DiscordBotClient,
     DiscordChannel,
     DiscordConfig,
+    _tool_hint_as_subtext,
 )
 from nanobot.command.builtin import BUILTIN_COMMAND_SPECS, build_help_text
 
@@ -1125,6 +1126,57 @@ async def test_client_send_outbound_reports_failed_attachments_when_no_text(tmp_
     )
 
     assert target.sent_payloads == [{"content": "[attachment: missing.txt - send failed]"}]
+
+
+def test_tool_hint_as_subtext_prefixes_each_line() -> None:
+    # Single-line hints get one subtext marker; multi-line hints get one per line.
+    assert _tool_hint_as_subtext("read src/main.py") == "-# read src/main.py"
+    assert (
+        _tool_hint_as_subtext("read a.py\ngrep \"TODO\"")
+        == "-# read a.py\n-# grep \"TODO\""
+    )
+    # Blank interior lines are preserved as separators, not prefixed.
+    assert _tool_hint_as_subtext("read a.py\n\n$ ls") == "-# read a.py\n\n-# $ ls"
+
+
+@pytest.mark.asyncio
+async def test_client_send_outbound_renders_tool_hint_as_subtext() -> None:
+    # Tool-hint progress events must render as muted subtext, not peer messages.
+    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    client = DiscordBotClient(owner, intents=discord.Intents.none())
+    target = _FakeChannel(channel_id=123)
+    client.get_channel = lambda channel_id: target if channel_id == 123 else None  # type: ignore[method-assign]
+
+    await client.send_outbound(
+        OutboundMessage(
+            channel="discord",
+            chat_id="123",
+            content="read src/main.py",
+            event=ProgressEvent(content="read src/main.py", tool_hint=True),
+        )
+    )
+
+    assert target.sent_payloads == [{"content": "-# read src/main.py"}]
+
+
+@pytest.mark.asyncio
+async def test_client_send_outbound_leaves_non_tool_hint_progress_untouched() -> None:
+    # A plain progress thought is content the user should read normally; no marker.
+    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    client = DiscordBotClient(owner, intents=discord.Intents.none())
+    target = _FakeChannel(channel_id=123)
+    client.get_channel = lambda channel_id: target if channel_id == 123 else None  # type: ignore[method-assign]
+
+    await client.send_outbound(
+        OutboundMessage(
+            channel="discord",
+            chat_id="123",
+            content="取料先行。走 ljg-fetch。",
+            event=ProgressEvent(content="取料先行。走 ljg-fetch。"),
+        )
+    )
+
+    assert target.sent_payloads == [{"content": "取料先行。走 ljg-fetch。"}]
 
 
 @pytest.mark.asyncio

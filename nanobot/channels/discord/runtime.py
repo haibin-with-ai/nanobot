@@ -58,6 +58,25 @@ def _builtin_command_names() -> set[str]:
 
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 
+# Discord renders a line beginning with "-# " as small, muted subtext. Tool
+# hints ride this so progress breadcrumbs stay visually subordinate to the
+# model's actual reply instead of reading as peer messages.
+DISCORD_SUBTEXT_PREFIX = "-# "
+
+
+def _tool_hint_as_subtext(content: str) -> str:
+    """Prefix each tool-hint line with Discord's subtext marker.
+
+    The marker only takes effect at the start of a line, so every non-empty
+    line is prefixed individually; blank lines are preserved as separators.
+    """
+    lines = [ln.rstrip() for ln in content.splitlines()] or [content]
+    rendered = [
+        f"{DISCORD_SUBTEXT_PREFIX}{ln.lstrip()}" if ln.strip() else ""
+        for ln in lines
+    ]
+    return "\n".join(rendered).strip()
+
 # 这三条在下面手写注册（自动补全、参数校验各有特殊处理），派生时跳过。
 _HANDWRITTEN_SLASH_COMMANDS = frozenset({"/model", "/trigger", "/help"})
 # Discord 只收小写字母、数字、连字符和下划线，1-32 字符。
@@ -413,6 +432,11 @@ if DISCORD_AVAILABLE:
             sent_media = False
             failed_media: list[str] = []
 
+            content = msg.content or ""
+            event = msg.event
+            if isinstance(event, ProgressEvent) and event.tool_hint and content.strip():
+                content = _tool_hint_as_subtext(content)
+
             for index, media_path in enumerate(msg.media or []):
                 if await self._send_file(
                     channel,
@@ -425,7 +449,7 @@ if DISCORD_AVAILABLE:
                     failed_media.append(Path(media_path).name)
 
             for index, chunk in enumerate(
-                self._build_chunks(msg.content or "", failed_media, sent_media)
+                self._build_chunks(content, failed_media, sent_media)
             ):
                 kwargs: dict[str, Any] = {"content": chunk}
                 if index == 0 and reference is not None and not sent_media:
