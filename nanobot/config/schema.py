@@ -139,6 +139,13 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("toolHintMaxLength"),
         serialization_alias="toolHintMaxLength",
     )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
+    tool_hint_allow: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("toolHintAllow"),
+        serialization_alias="toolHintAllow",
+    )  # Whitelist of tool names that may emit tool-call hints. Empty = all tools.
+    # Matching is separator-insensitive with prefix aliasing: "read" matches
+    # "read_file", "web-search" matches "web_search". Requires sendToolHints=true.
     reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")

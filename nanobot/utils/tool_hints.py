@@ -29,10 +29,50 @@ _PATH_IN_CMD_RE = re.compile(
 )
 
 
-def format_tool_hints(tool_calls: list, max_length: int = 40) -> str:
-    """Format tool calls as concise hints with smart abbreviation."""
+def normalize_tool_name(name: str) -> str:
+    """Fold a tool name to a comparison token: lowercase, separators unified."""
+    return name.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def build_tool_hint_allow(entries: object) -> frozenset[str]:
+    """Normalize a raw allow-list into a comparison set. Empty means allow all."""
+    if not entries or not isinstance(entries, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(
+        normalize_tool_name(e) for e in entries if isinstance(e, str) and e.strip()
+    )
+
+
+def tool_hint_allowed(name: object, allow: frozenset[str]) -> bool:
+    """Whether *name* may emit a hint. Empty *allow* permits every tool.
+
+    Matching is separator-insensitive with prefix aliasing so a config entry
+    ``read`` covers ``read_file`` and ``web-search`` covers ``web_search``.
+    """
+    if not allow:
+        return True
+    if not isinstance(name, str) or not name:
+        return False
+    token = normalize_tool_name(name)
+    if token in allow:
+        return True
+    return any(token.startswith(f"{entry}_") for entry in allow)
+
+
+def format_tool_hints(
+    tool_calls: list,
+    max_length: int = 40,
+    allow: object = None,
+) -> str:
+    """Format tool calls as concise hints with smart abbreviation.
+
+    When *allow* is a non-empty collection of tool names, calls whose name is
+    not permitted (see :func:`tool_hint_allowed`) are dropped from the output.
+    """
     if not tool_calls:
         return ""
+
+    allow_set = allow if isinstance(allow, frozenset) else build_tool_hint_allow(allow)
 
     formatted = []
     for tc in tool_calls:
@@ -40,6 +80,8 @@ def format_tool_hints(tool_calls: list, max_length: int = 40) -> str:
         if not isinstance(name, str) or not name:
             # Degenerate/malformed tool call (e.g. a model emits name=None);
             # skip it instead of raising AttributeError on the whole turn.
+            continue
+        if not tool_hint_allowed(name, allow_set):
             continue
         fmt = _TOOL_FORMATS.get(name)
         if fmt:

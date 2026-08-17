@@ -17,7 +17,11 @@ from nanobot.utils.progress_events import (
     invoke_on_progress,
     on_progress_accepts_tool_events,
 )
-from nanobot.utils.tool_hints import format_tool_hints
+from nanobot.utils.tool_hints import (
+    build_tool_hint_allow,
+    format_tool_hints,
+    tool_hint_allowed,
+)
 
 
 class AgentProgressHook(AgentHook):
@@ -31,6 +35,7 @@ class AgentProgressHook(AgentHook):
         *,
         session_key: str | None = None,
         tool_hint_max_length: int = 40,
+        tool_hint_allow: list[str] | None = None,
         on_iteration: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__(reraise=True)
@@ -39,6 +44,7 @@ class AgentProgressHook(AgentHook):
         self._on_stream_end = on_stream_end
         self._session_key = session_key
         self._tool_hint_max_length = tool_hint_max_length
+        self._tool_hint_allow = build_tool_hint_allow(tool_hint_allow)
         self._on_iteration = on_iteration
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
@@ -54,7 +60,11 @@ class AgentProgressHook(AgentHook):
         return strip_think(text) or None
 
     def _tool_hint(self, tool_calls: list[Any]) -> str:
-        return format_tool_hints(tool_calls, max_length=self._tool_hint_max_length)
+        return format_tool_hints(
+            tool_calls,
+            max_length=self._tool_hint_max_length,
+            allow=self._tool_hint_allow,
+        )
 
     @staticmethod
     def _on_progress_accepts(cb: Callable[..., Any], name: str) -> bool:
@@ -138,7 +148,10 @@ class AgentProgressHook(AgentHook):
         if phase == "start":
             await self.emit_reasoning_end()
             tool_call = ToolCallRequest(id=str(call_id), name=name, arguments=arguments)
-            tool_hint = self._strip_think(self._tool_hint([tool_call])) or name
+            tool_hint = self._strip_think(self._tool_hint([tool_call]))
+            if not tool_hint and tool_hint_allowed(name, self._tool_hint_allow):
+                # Allowed tool with no formatted args still deserves a bare name.
+                tool_hint = name
             await invoke_on_progress(
                 self._on_progress,
                 tool_hint,

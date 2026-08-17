@@ -1,7 +1,11 @@
 """Tests for tool hint formatting (nanobot.utils.tool_hints)."""
 
 from nanobot.providers.base import ToolCallRequest
-from nanobot.utils.tool_hints import format_tool_hints
+from nanobot.utils.tool_hints import (
+    build_tool_hint_allow,
+    format_tool_hints,
+    tool_hint_allowed,
+)
 
 
 def _tc(name: str, args) -> ToolCallRequest:
@@ -325,3 +329,69 @@ class TestToolHintMalformedCalls:
         """A degenerate call must not suppress hints for the valid calls beside it."""
         result = _hint([_tc(None, None), _tc("read_file", {"path": "foo.txt"})])
         assert result == "read foo.txt"
+
+
+class TestToolHintAllowList:
+    """A non-empty allow-list filters which tools emit hints."""
+
+    def test_empty_allow_shows_all(self):
+        calls = [_tc("read_file", {"path": "a.py"}), _tc("grep", {"pattern": "x"})]
+        assert format_tool_hints(calls, allow=[]) == 'read a.py, grep "x"'
+        assert format_tool_hints(calls, allow=None) == 'read a.py, grep "x"'
+
+    def test_allow_drops_unlisted_tool(self):
+        calls = [_tc("read_file", {"path": "a.py"}), _tc("grep", {"pattern": "x"})]
+        result = format_tool_hints(calls, allow=["read_file"])
+        assert result == "read a.py"
+
+    def test_allow_all_filtered_returns_empty(self):
+        calls = [_tc("grep", {"pattern": "x"}), _tc("list_dir", {"path": "/tmp"})]
+        assert format_tool_hints(calls, allow=["read_file", "spawn"]) == ""
+
+    def test_prefix_alias_matches_suffixed_tool(self):
+        """Config 'read' should cover 'read_file'; 'edit' should cover 'edit_file'."""
+        assert format_tool_hints([_tc("read_file", {"path": "a.py"})], allow=["read"]) == "read a.py"
+        # edit_file isn't a registered format (only "edit" is), so it uses the
+        # fallback formatter — but the point is it's kept, not dropped.
+        assert format_tool_hints([_tc("edit_file", {"path": "a.py"})], allow=["edit"]) == 'edit_file("a.py")'
+
+    def test_separator_insensitive_match(self):
+        """'web-search' in config matches the 'web_search' tool."""
+        calls = [_tc("web_search", {"query": "claude"})]
+        assert format_tool_hints(calls, allow=["web-search"]) == 'search "claude"'
+
+    def test_prefix_does_not_overmatch_bare_name(self):
+        """'read' must not match an unrelated 'readme_tool' by accident of substring."""
+        # startswith("read_") — "readme_tool" normalizes to "readme_tool",
+        # which does NOT start with "read_"; it starts with "readme_".
+        assert format_tool_hints([_tc("readme_tool", {"x": "y"})], allow=["read"]) == ""
+
+    def test_spawn_whitelisted(self):
+        calls = [_tc("spawn", {"task": "do a thing"})]
+        assert format_tool_hints(calls, allow=["spawn"]) == 'spawn("do a thing")'
+
+
+class TestToolHintAllowHelpers:
+    """Unit coverage for the allow-list helpers."""
+
+    def test_build_normalizes_and_dedupes(self):
+        assert build_tool_hint_allow(["Read", "read", "web-search"]) == frozenset(
+            {"read", "web_search"}
+        )
+
+    def test_build_handles_non_list(self):
+        assert build_tool_hint_allow(None) == frozenset()
+        assert build_tool_hint_allow("read") == frozenset()
+
+    def test_allowed_empty_set_permits_all(self):
+        assert tool_hint_allowed("anything", frozenset()) is True
+
+    def test_allowed_rejects_missing(self):
+        assert tool_hint_allowed("grep", frozenset({"read", "spawn"})) is False
+
+    def test_allowed_prefix(self):
+        assert tool_hint_allowed("read_file", frozenset({"read"})) is True
+
+    def test_allowed_rejects_empty_name(self):
+        assert tool_hint_allowed("", frozenset({"read"})) is False
+        assert tool_hint_allowed(None, frozenset({"read"})) is False
