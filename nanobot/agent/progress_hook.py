@@ -161,7 +161,7 @@ class AgentProgressHook(AgentHook):
             logger.info(
                 "Provider-hosted tool call: {}({}) [model={}]",
                 name,
-                json.dumps(arguments, ensure_ascii=False)[:200],
+                json.dumps(arguments, ensure_ascii=False)[:512],
                 context.model or "unknown",
             )
             return
@@ -192,7 +192,7 @@ class AgentProgressHook(AgentHook):
             logger.info(
                 "Tool call: {}({}) [model={}]",
                 tc.name,
-                args_str[:200],
+                args_str[:512],
                 context.model or "unknown",
             )
 
