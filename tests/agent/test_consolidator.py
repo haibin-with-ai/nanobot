@@ -74,6 +74,83 @@ def _tool_round(call_id: str) -> list[dict]:
     ]
 
 
+class TestConsolidatorArchivePromptOverride:
+    async def test_workspace_override_replaces_default_archive_prompt(
+        self, consolidator, mock_provider, store, runtime
+    ):
+        path = store.workspace / "prompts" / "consolidator_archive.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Custom archive prompt.", encoding="utf-8")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Summary.",
+            finish_reason="stop",
+        )
+
+        await consolidator.archive(
+            [{"role": "user", "content": "hello"}],
+            runtime=runtime,
+        )
+
+        system = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert system == "Custom archive prompt."
+        assert "Extract key facts" not in system
+
+    async def test_missing_override_uses_builtin_template(
+        self, consolidator, mock_provider, runtime
+    ):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Summary.",
+            finish_reason="stop",
+        )
+
+        await consolidator.archive(
+            [{"role": "user", "content": "hello"}],
+            runtime=runtime,
+        )
+
+        system = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert "Extract key facts" in system
+
+    async def test_empty_override_falls_back_to_builtin(
+        self, consolidator, mock_provider, store, runtime
+    ):
+        path = store.workspace / "prompts" / "consolidator_archive.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("   \n", encoding="utf-8")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Summary.",
+            finish_reason="stop",
+        )
+
+        await consolidator.archive(
+            [{"role": "user", "content": "hello"}],
+            runtime=runtime,
+        )
+
+        system = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert "Extract key facts" in system
+
+    async def test_oversized_override_is_capped(
+        self, consolidator, mock_provider, store, runtime
+    ):
+        path = store.workspace / "prompts" / "consolidator_archive.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x" * 40_000, encoding="utf-8")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="Summary.",
+            finish_reason="stop",
+        )
+
+        await consolidator.archive(
+            [{"role": "user", "content": "hello"}],
+            runtime=runtime,
+        )
+
+        system = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
+        assert "x" * 40_000 not in system
+        assert "... (truncated)" in system
+
+
 class TestConsolidatorSummarize:
     async def test_archive_excludes_model_only_runtime_context(
         self, consolidator, mock_provider, runtime

@@ -867,6 +867,7 @@ class Consolidator:
         self.unified_session = unified_session
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self._archive_prompt_oversize_logged = False
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -874,6 +875,27 @@ class Consolidator:
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    @property
+    def archive_prompt_file(self) -> Path:
+        return workspace_prompt_file(self.store.workspace, "consolidator_archive")
+
+    def _archive_template(self) -> str:
+        """Workspace override for the archive prompt, mirroring the Dream hook."""
+        text, original_chars = load_workspace_prompt_override(self.archive_prompt_file)
+        if text is not None:
+            if (
+                original_chars > WORKSPACE_PROMPT_MAX_CHARS
+                and not self._archive_prompt_oversize_logged
+            ):
+                self._archive_prompt_oversize_logged = True
+                logger.warning(
+                    "workspace consolidator archive prompt exceeds {} chars ({}); "
+                    "truncating. Further occurrences suppressed.",
+                    WORKSPACE_PROMPT_MAX_CHARS, original_chars,
+                )
+            return text
+        return render_template("agent/consolidator_archive.md", strip=True)
 
     def pick_consolidation_boundary(
         self,
@@ -1047,10 +1069,7 @@ class Consolidator:
         )
         formatted = MemoryStore._format_messages(messages_to_summarize)
         formatted = self._truncate_to_token_budget(formatted, runtime=runtime)
-        system_prompt = render_template(
-            "agent/consolidator_archive.md",
-            strip=True,
-        )
+        system_prompt = self._archive_template()
         try:
             response = await runtime.provider.chat_with_retry(
                 model=runtime.model,
