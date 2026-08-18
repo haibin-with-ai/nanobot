@@ -496,6 +496,7 @@ class FallbackProvider(LLMProvider):
             if not candidate.primary:
                 await self._notify_fallback_model(candidate.model)
             response = await call(provider, candidate.kwargs)
+            response.model = candidate.model
             if response.finish_reason != "error":
                 if candidate.primary:
                     self._primary_failures = 0

@@ -468,6 +468,13 @@ class AgentRunner:
             )
             context.response = response
             context.tool_calls = list(response.tool_calls)
+            context.model = response.model or spec.runtime.model
+            logger.info(
+                "LLM response: model={} finish_reason={} tool_calls={}",
+                context.model,
+                response.finish_reason,
+                len(response.tool_calls),
+            )
             if not self._is_stall(response):
                 # 任何一次有响应的回合都清账，包括只调了工具的回合。
                 stalls = 0

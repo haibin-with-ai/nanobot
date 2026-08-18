@@ -159,9 +159,10 @@ class AgentProgressHook(AgentHook):
                 tool_events=[payload],
             )
             logger.info(
-                "Provider-hosted tool call: {}({})",
+                "Provider-hosted tool call: {}({}) [model={}]",
                 name,
                 json.dumps(arguments, ensure_ascii=False)[:200],
+                context.model or "unknown",
             )
             return
         if on_progress_accepts_tool_events(self._on_progress):
@@ -188,7 +189,12 @@ class AgentProgressHook(AgentHook):
             )
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
-            logger.info("Tool call: {}({})", tc.name, args_str[:200])
+            logger.info(
+                "Tool call: {}({}) [model={}]",
+                tc.name,
+                args_str[:200],
+                context.model or "unknown",
+            )
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
         """Publish a reasoning chunk; channel plugins decide whether to render."""

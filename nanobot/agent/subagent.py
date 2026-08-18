@@ -356,7 +356,9 @@ class SubagentManager:
         announce: bool = True,
     ) -> str:
         """Execute the subagent task and announce the result."""
-        logger.info("Subagent [{}] starting task: {}", task_id, label)
+        logger.info(
+            "Subagent [{}] starting task [model={}]: {}", task_id, runtime.model, label,
+        )
 
         async def _on_checkpoint(payload: dict) -> None:
             status.phase = payload.get("phase", status.phase)
