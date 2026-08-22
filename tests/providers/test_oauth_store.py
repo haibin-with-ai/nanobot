@@ -15,8 +15,10 @@ import pytest
 from filelock import FileLock, Timeout
 
 from nanobot.providers.oauth_store import (
+    InvalidGrantError,
     OAuthCredentials,
     OAuthCredentialStore,
+    TokenRefreshError,
     refresh_anthropic_token,
 )
 
@@ -300,6 +302,104 @@ def test_refresh_failure_preserves_original_error(
 
 
 # ---------------------------------------------------------------------------
+# refresh token 被判死后回源：指纹闸只认「有人重登过」
+# ---------------------------------------------------------------------------
+
+
+def _fail_with(exc: Exception):
+    def _raise(refresh_token: str) -> OAuthCredentials:
+        raise exc
+
+    return _raise
+
+
+def test_dead_refresh_remigrates_when_source_has_new_login(
+    store: OAuthCredentialStore, monkeypatch, tmp_path: Path
+) -> None:
+    """refresh token 被吊销、而 CLI 凭据文件已换新 refresh token → 自动收编。"""
+    store.save(_creds("stale", expires_at=_future_ms(60)))
+    cred_file = tmp_path / "credentials.json"
+    cred_file.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "relogged-access",
+                    "refreshToken": "relogged-refresh",
+                    "expiresAt": _future_ms(3600),
+                    "accountUuid": "uuid-new",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store._CLAUDE_CLI_CREDENTIALS_PATH", cred_file
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.refresh_anthropic_token",
+        _fail_with(InvalidGrantError("Token refresh rejected: 400 invalid_grant")),
+    )
+
+    token = store.get_token(force_refresh=True)
+
+    assert token is not None
+    assert token.access_token == "relogged-access"
+    assert store.load().refresh_token == "relogged-refresh"
+
+
+def test_dead_refresh_does_not_remigrate_same_refresh_token(
+    store: OAuthCredentialStore, monkeypatch, tmp_path: Path
+) -> None:
+    """来源里还是同一个死 refresh token（没人重登）→ 不迁移，如实抛错。"""
+    store.save(_creds("stale", expires_at=_future_ms(60)))
+    cred_file = tmp_path / "credentials.json"
+    cred_file.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "same-access",
+                    "refreshToken": "refresh",  # 与 store 里那份相同
+                    "expiresAt": _future_ms(3600),
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store._CLAUDE_CLI_CREDENTIALS_PATH", cred_file
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.refresh_anthropic_token",
+        _fail_with(InvalidGrantError("Token refresh rejected: 400 invalid_grant")),
+    )
+
+    with pytest.raises(InvalidGrantError):
+        store.get_token(force_refresh=True)
+
+
+def test_transient_refresh_error_preserves_store_without_remigrating(
+    store: OAuthCredentialStore, monkeypatch, tmp_path: Path
+) -> None:
+    """瞬时失败（网络/5xx）绝不能回源，也不能动 store 里的好 refresh token。"""
+    store.save(_creds("stale", expires_at=_future_ms(60)))
+    cred_file = tmp_path / "credentials.json"
+    cred_file.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "x", "refreshToken": "other-refresh"}})
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store._CLAUDE_CLI_CREDENTIALS_PATH", cred_file
+    )
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.refresh_anthropic_token",
+        _fail_with(TokenRefreshError("Token refresh failed: 503 upstream")),
+    )
+
+    with pytest.raises(TokenRefreshError):
+        store.get_token(force_refresh=True)
+
+    # store 未被回源覆盖，原 refresh token 原封不动。
+    assert store.load().refresh_token == "refresh"
+
+
+# ---------------------------------------------------------------------------
 # 并发刷新：拿锁后重查，别人刷过就用别人的
 # ---------------------------------------------------------------------------
 
@@ -437,6 +537,69 @@ def test_refresh_raises_on_non_200(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="401"):
         refresh_anthropic_token("refresh-token")
+
+
+def _client_returning(status: int, text: str):
+    class _Response:
+        status_code = status
+
+    _Response.text = text
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, *args, **kwargs):
+            return _Response()
+
+    return lambda **kw: _Client()
+
+
+def test_invalid_grant_body_raises_invalid_grant_error(monkeypatch) -> None:
+    """400/401 且带 invalid_grant → 真死，抛 InvalidGrantError 触发回源。"""
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.httpx.Client",
+        _client_returning(400, '{"error":"invalid_grant"}'),
+    )
+
+    with pytest.raises(InvalidGrantError):
+        refresh_anthropic_token("refresh-token")
+
+
+def test_401_without_invalid_grant_is_transient(monkeypatch) -> None:
+    """401 但不是 invalid_grant（如临时鉴权抖动）→ 归为瞬时，不回源。"""
+    monkeypatch.setattr(
+        "nanobot.providers.oauth_store.httpx.Client",
+        _client_returning(401, "unauthorized"),
+    )
+
+    with pytest.raises(TokenRefreshError) as excinfo:
+        refresh_anthropic_token("refresh-token")
+    assert not isinstance(excinfo.value, InvalidGrantError)
+
+
+def test_network_error_is_transient(monkeypatch) -> None:
+    """httpx 网络异常 → TokenRefreshError（瞬时），绝不误判为凭据死亡。"""
+    import httpx as _httpx
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, *args, **kwargs):
+            raise _httpx.ConnectError("dial tcp: connection refused")
+
+    monkeypatch.setattr("nanobot.providers.oauth_store.httpx.Client", lambda **kw: _Client())
+
+    with pytest.raises(TokenRefreshError) as excinfo:
+        refresh_anthropic_token("refresh-token")
+    assert not isinstance(excinfo.value, InvalidGrantError)
 
 
 def test_refresh_raises_on_missing_fields(monkeypatch) -> None:

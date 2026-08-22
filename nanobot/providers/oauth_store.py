@@ -22,6 +22,23 @@ from oauth_cli_kit.storage import FileTokenStorage
 
 logger = logging.getLogger(__name__)
 
+
+class TokenRefreshError(RuntimeError):
+    """刷新失败，但可能是瞬时的（网络、超时、5xx）。
+
+    收到这个错误必须保留现有凭据文件——它也许下一次就成功了，
+    删掉等于拿一次瞬时抖动烧掉唯一可用的 refresh token。
+    """
+
+
+class InvalidGrantError(TokenRefreshError):
+    """服务端明确判定 refresh token 已死（invalid_grant / 400 / 401）。
+
+    只有这个错误才允许回源重新迁移：refresh token 真被吊销了，
+    再重试同一个也没用，唯一出路是看外部来源有没有人重登过。
+    """
+
+
 _ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _CLAUDE_CLI_CONFIG_PATH = Path.home() / ".claude.json"
@@ -199,7 +216,15 @@ class OAuthCredentialStore:
                 return latest
             if not force_refresh and latest.fresh_for(min_ttl_ms):
                 return latest
-            refreshed = refresh_anthropic_token(latest.refresh_token or creds.refresh_token)
+            dead_refresh = latest.refresh_token or creds.refresh_token
+            try:
+                refreshed = refresh_anthropic_token(dead_refresh)
+            except InvalidGrantError:
+                # refresh token 被服务端判死：不删文件，改看外部来源是否已有人重登。
+                recovered = self._remigrate_after_dead_refresh(dead_refresh)
+                if recovered is not None:
+                    return recovered
+                raise
             known_account = latest.account_id or creds.account_id
             if not refreshed.account_id and known_account:
                 # 刷新响应经常不带 account，别让它把已知的账号信息抹掉。
@@ -207,19 +232,54 @@ class OAuthCredentialStore:
             self.save(refreshed)
             return refreshed
 
+    def _remigrate_after_dead_refresh(
+        self, dead_refresh_token: str
+    ) -> OAuthCredentials | None:
+        """refresh token 被判死后，若外部来源已换新（有人重登过），收编之。
+
+        指纹闸：只认 refresh_token 与刚刷废那个**不同**的来源。相同 = 没人重登，
+        迁进来还是死的，直接放弃并报「需重新登录」，绝不空转刷废凭据。
+        """
+        for source in self._sources():
+            creds = source()
+            if creds and creds.refresh_token and creds.refresh_token != dead_refresh_token:
+                self.save(creds)
+                logger.info(
+                    "Re-migrated Claude Code OAuth credentials from external source "
+                    "after the stored refresh token was rejected (%s)",
+                    self.get_token_path(),
+                )
+                return creds
+        logger.warning(
+            "Claude Code refresh token rejected (invalid_grant) and no fresher external "
+            "credential was found; re-login required (%s)",
+            self.get_token_path(),
+        )
+        return None
+
 
 def refresh_anthropic_token(refresh_token: str) -> OAuthCredentials:
-    """用 refresh token 换新 access token；失败保留真实错误文本。"""
+    """用 refresh token 换新 access token；失败保留真实错误文本。
+
+    区分两类失败：网络/超时/5xx 抛 TokenRefreshError（瞬时，保留凭据重试）；
+    400/401 且 invalid_grant 抛 InvalidGrantError（真死，允许回源）。
+    """
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": _ANTHROPIC_CLIENT_ID,
     }
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(_ANTHROPIC_TOKEN_URL, json=payload)
-    if response.status_code != 200:
-        raise RuntimeError(f"Token refresh failed: {response.status_code} {response.text}")
-    return _parse_refresh_response(response.json(), refresh_token)
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(_ANTHROPIC_TOKEN_URL, json=payload)
+    except httpx.HTTPError as exc:
+        raise TokenRefreshError(f"Token refresh request failed: {exc}") from exc
+    if response.status_code == 200:
+        return _parse_refresh_response(response.json(), refresh_token)
+    detail = f"{response.status_code} {response.text}"
+    if response.status_code in (400, 401) and "invalid_grant" in response.text.lower():
+        raise InvalidGrantError(f"Token refresh rejected: {detail}")
+    raise TokenRefreshError(f"Token refresh failed: {detail}")
 
 
 def _parse_refresh_response(data: dict, previous_refresh_token: str = "") -> OAuthCredentials:
