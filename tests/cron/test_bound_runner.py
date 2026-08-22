@@ -55,6 +55,7 @@ class _Agent:
         self.bound_calls: list = []
         self._response = response
         self.sessions = _Sessions()
+        self.reject_preset: str | None = None
 
     async def process_direct(self, content, **kw):
         self.direct_calls.append({"content": content, **kw})
@@ -67,9 +68,9 @@ class _Agent:
         return _Resp(self._response)
 
     def set_session_model_preset(self, session_key, name):
-        self.sessions.presets[session_key] = name
-        if name == "nonexistent":
+        if name == "nonexistent" or name == self.reject_preset:
             raise KeyError(name)
+        self.sessions.presets[session_key] = name
         return _Runtime(name)
 
 
@@ -172,6 +173,22 @@ class TestUnboundRunsInItsOwnSession:
             await run_cron_job(_job(model="nonexistent"), agent=agent, cron=cron)
         assert cron.last["status"] == "error"
         assert agent.direct_calls == []
+
+    @pytest.mark.asyncio
+    async def test_missing_default_preset_falls_back_instead_of_crashing(self):
+        """A deployment whose modelPresets drops the built-in cron default must
+        still run no-model jobs, on the deployment default preset."""
+        agent, cron = _Agent(), _Recorder()
+        # Reject the built-in cron default as if this deployment never defined it.
+        agent.reject_preset = "deep"
+        await run_cron_job(_job(), agent=agent, cron=cron)
+        # The run still happened...
+        assert len(agent.direct_calls) == 1
+        # ...on the deployment default (no explicit preset forced on the session).
+        key = agent.direct_calls[0]["session_key"]
+        assert key not in agent.sessions.presets
+        assert cron.last["status"] == "ok"
+        assert cron.last["model"] is None
 
     @pytest.mark.asyncio
     async def test_turn_failure_is_recorded_as_error(self):

@@ -8,6 +8,8 @@ import time
 import uuid
 from typing import Any, Protocol
 
+from loguru import logger
+
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
@@ -135,8 +137,27 @@ async def run_unbound_cron_job(
         cron_token = cron_tool.set_cron_context(True)
     try:
         # Reuse the session preset path so cron resolves models exactly the way
-        # an interactive /model does, including unknown-preset errors.
-        agent.set_session_model_preset(session_key, model)
+        # an interactive /model does, including unknown-preset errors for an
+        # explicitly named model.
+        try:
+            agent.set_session_model_preset(session_key, model)
+        except (LookupError, ValueError):
+            if job.payload.model:
+                # An explicitly named model must resolve; fail loudly like the
+                # cron tool does at creation time.
+                raise
+            # DEFAULT_CRON_MODEL_PRESET names a preset that ships with nanobot
+            # but a deployment's custom modelPresets can drop it. When the
+            # built-in default is absent, fall back to the deployment default
+            # preset instead of crashing every no-model cron run.
+            logger.warning(
+                "Cron default preset {!r} is not defined; job {} falls back to "
+                "the deployment default preset.",
+                model,
+                job.id,
+            )
+            model = None
+            record_base["model"] = model
         resp = await agent.process_direct(
             prompt,
             session_key=session_key,
