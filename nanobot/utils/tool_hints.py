@@ -84,7 +84,9 @@ def format_tool_hints(
         if not tool_hint_allowed(name, allow_set):
             continue
         fmt = _TOOL_FORMATS.get(name)
-        if fmt:
+        if name == "spawn":
+            formatted.append(_fmt_spawn(tc, max_length))
+        elif fmt:
             formatted.append(_fmt_known(tc, fmt, max_length))
         elif name.startswith("mcp_"):
             formatted.append(_fmt_mcp(tc, max_length))
@@ -158,6 +160,27 @@ def _abbreviate_command(cmd: str, max_len: int = 40) -> str:
     if len(abbreviated) <= max_len:
         return abbreviated
     return abbreviated[:max_len - 1] + "\u2026"
+
+
+def _fmt_spawn(tc, max_length: int = 40) -> str:
+    """Format a spawn call as ``spawn[model] "label or task"``.
+
+    Surfaces the target model (cost-relevant) and the label/task so the hint
+    carries more than just the task text.
+    """
+    args = _get_args(tc)
+    if not isinstance(args, dict):
+        return "spawn"
+    model = args.get("model")
+    label = args.get("label")
+    task = args.get("task")
+    desc = label if isinstance(label, str) and label else task
+    prefix = f"spawn[{model}]" if isinstance(model, str) and model else "spawn"
+    if not isinstance(desc, str) or not desc:
+        return prefix
+    if len(desc) > max_length:
+        desc = desc[:max_length - 1] + "\u2026"
+    return f'{prefix} "{desc}"'
 
 
 def _fmt_mcp(tc, max_length: int = 40) -> str:
