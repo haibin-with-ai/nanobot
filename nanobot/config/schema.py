@@ -424,6 +424,17 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class WriteGateConfig(Base):
+    """Publish-path write gate: force a real `write` skill rewrite before publishing.
+
+    When enabled, khb-givemeurl's publish.sh only releases files whose sha256
+    matches the latest polish-log stamp produced by the write rewrite step.
+    """
+
+    enabled: bool = False
+    model: str = ""  # model preset name for the combined write+publish subagent
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -438,6 +449,11 @@ class Config(BaseSettings):
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
         serialization_alias="modelPresets",
+    )
+    write_gate: WriteGateConfig = Field(
+        default_factory=WriteGateConfig,
+        validation_alias=AliasChoices("writeGate", "write_gate"),
+        serialization_alias="writeGate",
     )
 
     def __init__(self, **values: Any) -> None:
@@ -458,6 +474,9 @@ class Config(BaseSettings):
         for fallback in self.agents.defaults.fallback_models:
             if isinstance(fallback, str) and fallback not in self.model_presets:
                 raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
+        gate_model = self.write_gate.model
+        if gate_model and gate_model != "default" and gate_model not in self.model_presets:
+            raise ValueError(f"writeGate.model preset {gate_model!r} not found in model_presets")
         return self
 
     def resolve_default_preset(self) -> ModelPresetConfig:
