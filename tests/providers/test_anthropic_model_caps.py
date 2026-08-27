@@ -68,7 +68,7 @@ class TestCapsLookup:
         )
 
     def test_unknown_model_falls_back_to_plain_caps(self) -> None:
-        caps = ap._caps_for("claude-sonnet-4-6-20260101")
+        caps = ap._caps_for("claude-sonnet-4-5-20260101")
 
         assert (caps.omit_sampling, caps.effort, caps.thinking_default, caps.thinking_summarize) == (
             False,

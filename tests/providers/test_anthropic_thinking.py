@@ -48,14 +48,15 @@ def test_adaptive_no_budget_tokens() -> None:
 
 
 def test_high_uses_enabled_with_budget() -> None:
-    kw = _build(_make_provider(), "high", max_tokens=4096)
+    # Pre-4.6 models have no adaptive support and must use the legacy budget path.
+    kw = _build(_make_provider("claude-sonnet-4-5"), "high", max_tokens=4096)
     assert kw["thinking"]["type"] == "enabled"
     assert kw["thinking"]["budget_tokens"] == max(8192, 4096)
     assert kw["max_tokens"] >= kw["thinking"]["budget_tokens"] + 4096
 
 
 def test_low_uses_small_budget() -> None:
-    kw = _build(_make_provider(), "low")
+    kw = _build(_make_provider("claude-sonnet-4-5"), "low")
     assert kw["thinking"] == {"type": "enabled", "budget_tokens": 1024}
 
 
@@ -134,7 +135,30 @@ def test_sonnet_5_omits_temperature_none() -> None:
 
 
 def test_ordinary_model_sends_temperature() -> None:
-    kw = _build(_make_provider("claude-sonnet-4-6"), None)
+    kw = _build(_make_provider("claude-sonnet-4-5"), None)
+    assert kw["temperature"] == 0.7
+
+
+def test_opus_4_6_uses_adaptive_not_enabled() -> None:
+    """4.6 supports adaptive; a numeric effort must NOT emit the deprecated
+    thinking.type=enabled (Anthropic warns and it is removed on later models)."""
+    kw = _build(_make_provider("claude-opus-4-6"), "xhigh", max_tokens=4096)
+    assert kw["thinking"]["type"] == "adaptive"
+    assert "budget_tokens" not in kw["thinking"]
+    assert kw["output_config"] == {"effort": "xhigh"}
+
+
+def test_sonnet_4_6_uses_adaptive_not_enabled() -> None:
+    kw = _build(_make_provider("claude-sonnet-4-6"), "high", max_tokens=4096)
+    assert kw["thinking"]["type"] == "adaptive"
+    assert "budget_tokens" not in kw["thinking"]
+    assert kw["output_config"] == {"effort": "high"}
+
+
+def test_opus_4_6_none_keeps_temperature_no_thinking() -> None:
+    """Without an effort, 4.6 does not force thinking and still accepts sampling."""
+    kw = _build(_make_provider("claude-opus-4-6"), None)
+    assert "thinking" not in kw
     assert kw["temperature"] == 0.7
 
 

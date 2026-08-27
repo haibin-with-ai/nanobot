@@ -46,12 +46,15 @@ class _ModelCaps:
     effort             —— 认 output_config.effort
     thinking_default   —— 不说也默认开自适应思考
     thinking_summarize —— 把思考过程折成摘要
+    adaptive           —— 支持自适应思考：给了数值 effort 也走 adaptive，
+                          不再发已弃用的 thinking.type=enabled + budget_tokens
     """
 
     omit_sampling: bool = False
     effort: bool = False
     thinking_default: bool = False
     thinking_summarize: bool = False
+    adaptive: bool = False
 
 
 _NO_SAMPLING = _ModelCaps(omit_sampling=True)
@@ -61,6 +64,10 @@ _MODEL_CAPS: dict[str, _ModelCaps] = {
     "claude-opus-5": _ModelCaps(
         omit_sampling=True, effort=True, thinking_default=True, thinking_summarize=True,
     ),
+    # 4.6 一代支持自适应思考：仍收 temperature，但数值 effort 必须走 adaptive，
+    # 否则 thinking.type=enabled 会触发 Anthropic 的弃用警告（后续模型直接 400）。
+    "claude-opus-4-6": _ModelCaps(effort=True, adaptive=True),
+    "claude-sonnet-4-6": _ModelCaps(effort=True, adaptive=True),
     "claude-opus-4-7": _NO_SAMPLING,
     "claude-opus-4-8": _NO_SAMPLING,
     "claude-sonnet-5": _NO_SAMPLING,
@@ -658,7 +665,7 @@ class AnthropicProvider(LLMProvider):
         """返回 (思考相关 kwargs, 强制温度)。强制温度为 None 表示沿用调用方温度。"""
         if effort in {"none", "disabled"}:
             return ({"thinking": {"type": "disabled"}} if caps.thinking_default else {}), None
-        if effort == "adaptive" or caps.thinking_default:
+        if effort == "adaptive" or caps.thinking_default or (effort and caps.adaptive):
             # 自适应思考：模型自己决定何时想、想多久，并顺带开启工具间的交错思考。
             thinking: dict[str, Any] = {"type": "adaptive"}
             if caps.thinking_summarize:
