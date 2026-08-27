@@ -1,16 +1,18 @@
 """Tests for SubagentManager."""
 
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.hook import AgentHookContext
 from nanobot.agent.runner import AgentRunResult
-from nanobot.agent.subagent import SubagentManager, SubagentStatus
+from nanobot.agent.subagent import SubagentManager, SubagentStatus, _SubagentHook
 from nanobot.agent.tools.filesystem import FileToolsConfig
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ToolsConfig
-from nanobot.providers.base import GenerationSettings, LLMProvider
+from nanobot.providers.base import GenerationSettings, LLMProvider, ToolCallRequest
 from nanobot.security.workspace_access import build_workspace_scope
 from nanobot.utils.llm_runtime import LLMRuntime
 
@@ -232,3 +234,35 @@ def test_subagent_prompt_skips_unmodified_template_profile(tmp_path):
     manager = _manager_with_profile(tmp_path, soul=pristine)
     prompt = manager._build_subagent_prompt()
     assert "## SOUL.md" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_subagent_hook_logs_tool_call_at_info(capsys):
+    """Subagent tool calls must log at INFO with the main-agent format + task id.
+
+    Regression: they used to log at DEBUG with a divergent string, so the
+    gateway's INFO journal dropped them entirely (invisible in Tool call logs).
+    """
+    from loguru import logger
+
+    sink_id = logger.add(sys.stderr, level="INFO", format="{level}|{message}")
+    try:
+        hook = _SubagentHook(task_id="abcd1234")
+        context = AgentHookContext(
+            iteration=1,
+            messages=[],
+            model="claude-sonnet-5",
+            tool_calls=[
+                ToolCallRequest(id="c1", name="read_file", arguments={"path": "note.txt"}),
+            ],
+        )
+        await hook.before_execute_tools(context)
+    finally:
+        logger.remove(sink_id)
+
+    err = capsys.readouterr().err
+    assert "INFO|" in err
+    assert "Tool call: read_file(" in err
+    assert '"path": "note.txt"' in err
+    assert "[model=claude-sonnet-5]" in err
+    assert "[subagent=abcd1234]" in err

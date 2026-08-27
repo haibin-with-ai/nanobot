@@ -63,11 +63,11 @@ class _SubagentHook(AgentHook):
         self._status = status
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
-        for tool_call in context.tool_calls:
-            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-            logger.debug(
-                "Subagent [{}] executing: {} with arguments: {}",
-                self._task_id, tool_call.name, args_str,
+        for tc in context.tool_calls:
+            args_str = json.dumps(tc.arguments, ensure_ascii=False)
+            logger.info(
+                "Tool call: {}({}) [model={}] [subagent={}]",
+                tc.name, args_str[:512], context.model or "unknown", self._task_id,
             )
 
     async def after_iteration(self, context: AgentHookContext) -> None:
