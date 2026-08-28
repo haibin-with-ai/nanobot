@@ -1171,6 +1171,16 @@ class AgentLoop:
                     continue
                 if not await self._record_raw_user_message(msg):
                     continue
+                # A multi-line message whose first line is exactly "/new" means:
+                # reset the session first, then process the rest as a fresh prompt.
+                first_line, _, new_rest = raw.partition("\n")
+                if first_line.strip().lower() == "/new" and new_rest.strip():
+                    await self._dispatch_command_inline(
+                        msg, effective_key, "/new",
+                        self.commands.dispatch,
+                    )
+                    msg = dataclasses.replace(msg, content=new_rest.strip())
+                    raw = msg.content.strip()
                 if self.commands.is_priority(raw):
                     await self._dispatch_command_inline(
                         msg, effective_key, raw,
