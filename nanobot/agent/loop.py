@@ -1171,16 +1171,26 @@ class AgentLoop:
                     continue
                 if not await self._record_raw_user_message(msg):
                     continue
-                # A multi-line message whose first line is exactly "/new" means:
-                # reset the session first, then process the rest as a fresh prompt.
-                first_line, _, new_rest = raw.partition("\n")
-                if first_line.strip().lower() == "/new" and new_rest.strip():
-                    await self._dispatch_command_inline(
-                        msg, effective_key, "/new",
-                        self.commands.dispatch,
+                # A message whose first line begins with "/new" means: reset the
+                # session first, then process the remainder as a fresh prompt.
+                # Two accepted forms, treated identically:
+                #   "/new\n<rest>"  — rest is the following line(s)
+                #   "/new <rest>"   — rest follows on the same line (later lines kept)
+                first_line, _, after_newline = raw.partition("\n")
+                head, _, same_line_rest = first_line.strip().partition(" ")
+                if head.lower() == "/new":
+                    new_rest = "\n".join(
+                        part
+                        for part in (same_line_rest.strip(), after_newline.strip())
+                        if part
                     )
-                    msg = dataclasses.replace(msg, content=new_rest.strip())
-                    raw = msg.content.strip()
+                    if new_rest:
+                        await self._dispatch_command_inline(
+                            msg, effective_key, "/new",
+                            self.commands.dispatch,
+                        )
+                        msg = dataclasses.replace(msg, content=new_rest)
+                        raw = msg.content.strip()
                 if self.commands.is_priority(raw):
                     await self._dispatch_command_inline(
                         msg, effective_key, raw,

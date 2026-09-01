@@ -93,6 +93,60 @@ async def test_new_prefix_clears_session_then_dispatches_rest(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_new_inline_same_line_clears_then_dispatches_rest(tmp_path):
+    """同行形态：'/new <rest>' 与多行形态等价，先清 session 再处理余文。"""
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("discord:c1")
+    session.add_message("user", "old context")
+    loop.sessions.save(session)
+    loop._schedule_background = lambda coro: coro.close()
+
+    dispatched: list[InboundMessage] = []
+
+    async def dispatch(msg):
+        assert loop.sessions.get_or_create("discord:c1").messages == []
+        dispatched.append(msg)
+
+    loop._dispatch = dispatch
+    await _run_loop_with(loop, _human_msg("/new /khb-intake https://example.com"))
+
+    assert [m.content for m in dispatched] == ["/khb-intake https://example.com"]
+    assert [r["content"] for r in _ledger_records(loop)] == [
+        "/new /khb-intake https://example.com"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_inline_is_case_insensitive(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop._schedule_background = lambda coro: coro.close()
+    dispatched: list[str] = []
+
+    async def dispatch(msg):
+        dispatched.append(msg.content)
+
+    loop._dispatch = dispatch
+    await _run_loop_with(loop, _human_msg("/NEW do the thing"))
+
+    assert dispatched == ["do the thing"]
+
+
+@pytest.mark.asyncio
+async def test_new_inline_prefix_word_is_not_split(tmp_path):
+    """'/newsletter' 等以 /new 开头的词不触发拆分。"""
+    loop = _make_loop(tmp_path)
+    dispatched: list[str] = []
+
+    async def dispatch(msg):
+        dispatched.append(msg.content)
+
+    loop._dispatch = dispatch
+    await _run_loop_with(loop, _human_msg("/newsletter about ai"))
+
+    assert dispatched == ["/newsletter about ai"]
+
+
+@pytest.mark.asyncio
 async def test_new_prefix_is_case_insensitive(tmp_path):
     loop = _make_loop(tmp_path)
     loop._schedule_background = lambda coro: coro.close()
