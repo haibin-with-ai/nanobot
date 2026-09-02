@@ -71,8 +71,14 @@ _MODEL_CAPS: dict[str, _ModelCaps] = {
     "claude-opus-4-7": _NO_SAMPLING,
     "claude-opus-4-8": _NO_SAMPLING,
     "claude-sonnet-5": _NO_SAMPLING,
-    "claude-fable": _NO_SAMPLING,
-    "fable": _NO_SAMPLING,
+    # fable 一代始终开自适应思考：数值 effort 必须走 adaptive+output_config，
+    # 旧的 thinking.type=enabled+budget_tokens 在 fable-5-1 上直接 400。
+    "claude-fable": _ModelCaps(
+        omit_sampling=True, effort=True, thinking_default=True, thinking_summarize=True,
+    ),
+    "fable": _ModelCaps(
+        omit_sampling=True, effort=True, thinking_default=True, thinking_summarize=True,
+    ),
 }
 _ADAPTIVE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
