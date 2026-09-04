@@ -372,7 +372,7 @@ class SubagentManager:
                 cfg.restrict_to_workspace = workspace_scope.restrict_to_workspace
             # Construct from the agent workspace; the bound scope below supplies the project cwd.
             tools = self._build_tools(tools_config=cfg)
-            system_prompt = self._build_subagent_prompt(workspace=root)
+            system_prompt = self._build_subagent_prompt(workspace=root, model=runtime.model)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -550,8 +550,15 @@ class SubagentManager:
             parts.append(f"## {filename}\n\n{content}")
         return "\n\n".join(parts)
 
-    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
-        """Build a focused system prompt for the subagent."""
+    def _build_subagent_prompt(
+        self, workspace: Path | None = None, model: str | None = None
+    ) -> str:
+        """Build a focused system prompt for the subagent.
+
+        `model` is the LLM id actually serving this subagent. Subagents lack the
+        `my` tool, so the prompt is the only channel through which they can learn
+        it (skills stamp it into product frontmatter).
+        """
         from nanobot.agent.skills import SkillsLoader
 
         agent_workspace = self.workspace.expanduser().resolve()
@@ -566,6 +573,7 @@ class SubagentManager:
             agent_workspace=str(agent_workspace),
             history_log=str(agent_workspace / "memory" / "history.jsonl"),
             skills_summary=skills_summary or "",
+            model=model or "",
         )
         profile = self._load_profile_files()
         return f"{prompt}\n\n---\n\n{profile}" if profile else prompt

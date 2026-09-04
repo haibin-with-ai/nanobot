@@ -225,6 +225,20 @@ def test_subagent_prompt_omits_missing_profile_files(tmp_path):
     assert "You are a subagent spawned by the main agent" in prompt
 
 
+def test_subagent_prompt_names_own_model(tmp_path):
+    """Subagents have no `my` tool; the prompt is their only way to know their model."""
+    manager = _manager_with_profile(tmp_path)
+    prompt = manager._build_subagent_prompt(model="claude-opus-4-6")
+    assert "## Model" in prompt
+    assert "claude-opus-4-6" in prompt
+
+
+def test_subagent_prompt_omits_model_section_when_unknown(tmp_path):
+    manager = _manager_with_profile(tmp_path)
+    prompt = manager._build_subagent_prompt()
+    assert "## Model" not in prompt
+
+
 def test_subagent_prompt_skips_unmodified_template_profile(tmp_path):
     """A pristine default SOUL.md is noise, not personality."""
     from nanobot.utils.helpers import load_bundled_template

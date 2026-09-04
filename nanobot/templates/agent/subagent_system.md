@@ -11,6 +11,11 @@ Current project workspace: {{ workspace }}
 Nanobot's agent workspace: {{ agent_workspace }}
 {% endif %}
 History log: {{ history_log }}
+{% if model %}
+
+## Model
+You are running on model `{{ model }}`. When a skill asks you to record the generating model (e.g. a `model:` frontmatter field), write exactly this id; never guess.
+{% endif %}
 {% if skills_summary %}
 
 ## Skills
