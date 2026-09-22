@@ -227,6 +227,51 @@ class GitStore:
         logger.debug("Git push succeeded")
         return True
 
+    def sync_and_push(self) -> bool:
+        """Rebase onto the configured upstream, then push without forcing.
+
+        Uses --autostash so uncommitted tracked changes (runtime files that
+        are almost always dirty in the live workspace) are set aside for the
+        rebase and reapplied after. Returns False on any failure. If the
+        rebase conflicts, abort it so the local commit and worktree are
+        restored before returning.
+        """
+        if not self.is_initialized() or not self._has_remote():
+            return False
+        try:
+            sync = subprocess.run(
+                ["git", "pull", "--rebase", "--autostash"],
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+                timeout=_PUSH_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Git sync timed out after {}s", _PUSH_TIMEOUT_SECONDS)
+            self._abort_rebase()
+            return False
+        except OSError as exc:
+            logger.warning("Git sync failed to start: {}", exc)
+            return False
+        if sync.returncode != 0:
+            self._abort_rebase()
+            logger.warning("Git sync failed: {}", sync.stderr.strip())
+            return False
+        return self.push()
+
+    def _abort_rebase(self) -> None:
+        """Abort an in-progress rebase, if any."""
+        try:
+            subprocess.run(
+                ["git", "rebase", "--abort"],
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+                timeout=_PUSH_TIMEOUT_SECONDS,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            logger.warning("Git rebase abort failed; inspect {}", self._workspace)
+
     def _has_remote(self) -> bool:
         """True if the repo has at least one configured remote."""
         try:

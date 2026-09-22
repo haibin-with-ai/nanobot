@@ -158,6 +158,83 @@ class TestPush:
         g.auto_commit("third")
         assert g.push() is False
 
+    def test_sync_and_push_rebases_with_dirty_tracked_file(self, tmp_path):
+        g, work, remote = self._repo_with_remote(tmp_path)
+        runtime = work / "runtime.bin"
+        runtime.write_bytes(b"committed runtime\n")
+        subprocess.run(["git", "-C", str(work), "add", "runtime.bin"], check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "runtime"], check=True)
+        subprocess.run(["git", "-C", str(work), "push", "-q"], check=True)
+
+        peer = tmp_path / "peer"
+        subprocess.run(["git", "clone", "-q", str(remote), str(peer)], check=True)
+        subprocess.run(["git", "-C", str(peer), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(peer), "config", "user.name", "t"], check=True)
+        (peer / "REMOTE.md").write_text("remote first\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(peer), "add", "REMOTE.md"], check=True)
+        subprocess.run(["git", "-C", str(peer), "commit", "-q", "-m", "remote"], check=True)
+        subprocess.run(["git", "-C", str(peer), "push", "-q"], check=True)
+        remote_commit = self._head(peer)
+
+        (work / "MEMORY.md").write_text("# Memory\n- dream\n", encoding="utf-8")
+        local_commit = g.auto_commit("dream")
+        dirty_bytes = b"\x00runtime state\xff\n"
+        runtime.write_bytes(dirty_bytes)
+        (work / "untracked.state").write_bytes(b"leave me alone\n")
+
+        assert g.sync_and_push() is True
+        assert self._head(work) == self._head(remote)
+        assert subprocess.run(
+            ["git", "-C", str(work), "merge-base", "--is-ancestor", remote_commit, "HEAD"]
+        ).returncode == 0
+        assert local_commit != self._head(work)[:8]
+        assert runtime.read_bytes() == dirty_bytes
+        assert (work / "untracked.state").read_bytes() == b"leave me alone\n"
+
+    def test_sync_and_push_aborts_conflict_and_restores_dirty_file(self, tmp_path):
+        g, work, remote = self._repo_with_remote(tmp_path)
+        runtime = work / "runtime.bin"
+        runtime.write_bytes(b"committed runtime\n")
+        subprocess.run(["git", "-C", str(work), "add", "runtime.bin"], check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "-q", "-m", "runtime"], check=True)
+        subprocess.run(["git", "-C", str(work), "push", "-q"], check=True)
+
+        peer = tmp_path / "peer"
+        subprocess.run(["git", "clone", "-q", str(remote), str(peer)], check=True)
+        subprocess.run(["git", "-C", str(peer), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(peer), "config", "user.name", "t"], check=True)
+        (peer / "MEMORY.md").write_text("remote version\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(peer), "commit", "-qam", "remote"], check=True)
+        subprocess.run(["git", "-C", str(peer), "push", "-q"], check=True)
+        remote_head = self._head(peer)
+
+        (work / "MEMORY.md").write_text("local dream version\n", encoding="utf-8")
+        g.auto_commit("dream")
+        local_head = self._head(work)
+        dirty_bytes = b"\x00runtime state\xff\n"
+        runtime.write_bytes(dirty_bytes)
+
+        assert g.sync_and_push() is False
+        assert self._head(work) == local_head
+        assert self._head(work) != self._head(remote)
+        assert g.log()[0].message == "dream"
+        assert (work / "MEMORY.md").read_text(encoding="utf-8") == "local dream version\n"
+        assert runtime.read_bytes() == dirty_bytes
+        assert subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "@{upstream}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip() == remote_head
+        for state in ("rebase-merge", "rebase-apply"):
+            path = subprocess.run(
+                ["git", "-C", str(work), "rev-parse", "--git-path", state],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            assert not Path(path).exists()
+
 
 class TestSummarizeWorkingTree:
     """Ground-truth diff summary used to keep Dream audit records honest."""

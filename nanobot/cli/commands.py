@@ -209,10 +209,9 @@ def _commit_dream_changes(memory: Any) -> str | None:
     )
     sha = memory.git.auto_commit(message)
     if sha:
-        # Root fix for local commits piling up unpushed: push right after the
-        # Dream commit. push() swallows and logs its own failures, so a network
-        # hiccup never breaks memory consolidation.
-        memory.git.push()
+        # Dream publishing explicitly integrates upstream changes first. The
+        # generic push() remains a plain push and never rewrites local history.
+        memory.git.sync_and_push()
     return sha
 
 
