@@ -112,3 +112,74 @@ def test_write_text_atomic_propagates_replace_failure_without_replacing_target(
 
     assert target.read_text(encoding="utf-8") == '{"original": true}'
     assert list(tmp_path.iterdir()) == [target]
+
+
+# --- image payload shrinking (2026-09-28: a dozen 2.5 MB PNGs in one subagent
+# history pushed the request past Anthropic's 32 MB cap and killed the run) ---
+
+def _png(size, mode="RGB"):
+    import io
+    import os as _os
+
+    from PIL import Image
+
+    w, h = size
+    channels = len(mode)
+    im = Image.frombytes(mode, size, _os.urandom(w * h * channels))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _decode(url):
+    import base64
+    import io
+
+    from PIL import Image
+
+    header, b64 = url.split(",", 1)
+    return header, Image.open(io.BytesIO(base64.b64decode(b64)))
+
+
+def test_image_blocks_shrink_large_panel_to_model_resolution():
+    raw = _png((1672, 941))
+    assert len(raw) > 4_000_000
+
+    block = helpers.build_image_content_blocks(raw, "image/png", "/p.png", "(p)")[0]
+    header, im = _decode(block["image_url"]["url"])
+
+    assert header == "data:image/jpeg;base64"
+    assert max(im.size) == helpers.MODEL_IMAGE_MAX_EDGE
+    assert len(block["image_url"]["url"]) < len(raw) / 3
+    assert block["_meta"]["path"] == "/p.png"
+
+
+def test_image_blocks_reencode_heavy_png_already_within_edge():
+    raw = _png((1254, 1254))
+
+    block = helpers.build_image_content_blocks(raw, "image/png", "/q.png", "(q)")[0]
+    header, im = _decode(block["image_url"]["url"])
+
+    assert header == "data:image/jpeg;base64"
+    assert im.size == (1254, 1254)
+    assert len(block["image_url"]["url"]) < len(raw) / 2
+
+
+def test_image_blocks_keep_alpha_as_png():
+    raw = _png((2400, 1200), mode="RGBA")
+
+    block = helpers.build_image_content_blocks(raw, "image/png", "/a.png", "(a)")[0]
+    header, im = _decode(block["image_url"]["url"])
+
+    assert header == "data:image/png;base64"
+    assert im.size == (helpers.MODEL_IMAGE_MAX_EDGE, 784)
+
+
+def test_image_blocks_leave_small_and_undecodable_images_untouched():
+    import base64
+
+    small = _png((64, 64))
+    junk = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    for raw in (small, junk):
+        block = helpers.build_image_content_blocks(raw, "image/png", "/s.png", "(s)")[0]
+        assert block["image_url"]["url"] == "data:image/png;base64," + base64.b64encode(raw).decode()

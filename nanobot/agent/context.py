@@ -24,6 +24,7 @@ from nanobot.runtime_context import (
 from nanobot.utils.helpers import (
     detect_image_mime,
     load_bundled_template,
+    shrink_image_for_model,
     truncate_text_to_tokens,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -273,6 +274,7 @@ class ContextBuilder:
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
                 continue
+            raw, mime = shrink_image_for_model(raw, mime)
             b64 = base64.b64encode(raw).decode()
             images.append({
                 "type": "image_url",

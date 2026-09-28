@@ -305,6 +305,28 @@ class TestBuildUserContent:
         assert result[1]["type"] == "text"
         assert result[1]["text"] == "hello"
 
+    def test_large_attached_image_is_shrunk(self, tmp_path):
+        import io
+        import os
+
+        from PIL import Image
+
+        from nanobot.utils.helpers import MODEL_IMAGE_MAX_EDGE
+
+        buf = io.BytesIO()
+        Image.frombytes("RGB", (3000, 2000), os.urandom(3000 * 2000 * 3)).save(buf, "PNG")
+        png = tmp_path / "photo.png"
+        png.write_bytes(buf.getvalue())
+        builder = _builder(tmp_path)
+
+        url = builder._build_user_content("hello", [str(png)])[0]["image_url"]["url"]
+
+        assert url.startswith("data:image/jpeg;base64,")
+        assert len(url) < png.stat().st_size / 3
+        import base64
+        im = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+        assert max(im.size) == MODEL_IMAGE_MAX_EDGE
+
     def test_image_meta_includes_path(self, tmp_path):
         png = tmp_path / "test.png"
         png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)

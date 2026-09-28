@@ -1,6 +1,7 @@
 """Utility functions for nanobot."""
 
 import base64
+import io
 import json
 import os
 import re
@@ -311,10 +312,48 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
+# Vision models downscale anything with a longer edge past ~1568 px server-side,
+# so larger uploads only burn request bytes. Images stay in the conversation and
+# get re-sent every turn: on 2026-09-28 a dozen 2.5 MB comic panels pushed one
+# subagent request past Anthropic's 32 MB cap and killed the run twice. Most of
+# those panels were already under 1568 px; the bytes came from PNG encoding.
+MODEL_IMAGE_MAX_EDGE = 1568
+_KEEP_ORIGINAL_BYTES = 512 * 1024
+_JPEG_QUALITY = 85
+
+
+def shrink_image_for_model(raw: bytes, mime: str) -> tuple[bytes, str]:
+    """Return (bytes, mime) no larger than the model will actually look at."""
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(raw))
+        oversized = max(im.size) > MODEL_IMAGE_MAX_EDGE
+        if getattr(im, "is_animated", False) or (
+            not oversized and len(raw) <= _KEEP_ORIGINAL_BYTES
+        ):
+            return raw, mime
+        im.thumbnail((MODEL_IMAGE_MAX_EDGE, MODEL_IMAGE_MAX_EDGE), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+            im.save(buf, "PNG", optimize=True)
+            out, out_mime = buf.getvalue(), "image/png"
+        else:
+            im.convert("RGB").save(buf, "JPEG", quality=_JPEG_QUALITY)
+            out, out_mime = buf.getvalue(), "image/jpeg"
+        if not oversized and len(out) >= len(raw):
+            return raw, mime
+        return out, out_mime
+    except Exception as exc:  # no Pillow, truncated file, exotic format
+        logger.debug("Image left at original size: {}", exc)
+        return raw, mime
+
+
 def build_image_content_blocks(
     raw: bytes, mime: str, path: str, label: str
 ) -> list[dict[str, Any]]:
     """Build native image blocks plus a short text label."""
+    raw, mime = shrink_image_for_model(raw, mime)
     b64 = base64.b64encode(raw).decode()
     return [
         {
