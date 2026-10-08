@@ -39,11 +39,20 @@ def sampling_thinker(monkeypatch) -> str:
 
 
 class TestTemperatureFollowsSamplingCapabilityOnly:
-    def test_thinking_disabled_keeps_temperature(self, provider, sampling_thinker) -> None:
+    def test_none_on_default_thinker_is_adaptive_low(self, provider, sampling_thinker) -> None:
         kwargs = _kwargs(provider, sampling_thinker, "none")
 
-        assert kwargs["thinking"] == {"type": "disabled"}
-        assert kwargs["temperature"] == 0.3
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "low"}
+        assert kwargs["temperature"] == 1.0
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"])
+    @pytest.mark.parametrize("effort", ["none", "disabled"])
+    def test_none_on_non_default_thinker_sends_no_thinking(self, provider, model, effort) -> None:
+        kwargs = _kwargs(provider, model, effort)
+
+        assert "thinking" not in kwargs
+        assert "output_config" not in kwargs
 
     def test_adaptive_default_pins_temperature_to_one(self, provider, sampling_thinker) -> None:
         kwargs = _kwargs(provider, sampling_thinker)

@@ -670,7 +670,10 @@ class AnthropicProvider(LLMProvider):
     ) -> tuple[dict[str, Any], float | None]:
         """返回 (思考相关 kwargs, 强制温度)。强制温度为 None 表示沿用调用方温度。"""
         if effort in {"none", "disabled"}:
-            return ({"thinking": {"type": "disabled"}} if caps.thinking_default else {}), None
+            if not caps.thinking_default:
+                return {}, None
+            # 默认思考的模型拒收 thinking.disabled，“关思考”只能降到最低档 adaptive。
+            effort = "low"
         if effort == "adaptive" or caps.thinking_default or (effort and caps.adaptive):
             # 自适应思考：模型自己决定何时想、想多久，并顺带开启工具间的交错思考。
             thinking: dict[str, Any] = {"type": "adaptive"}

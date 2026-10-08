@@ -52,7 +52,8 @@ class TestToolChoiceKnowsThinkingIsOn:
         assert kwargs["thinking"]["type"] == "adaptive"
         assert kwargs["tool_choice"] == {"type": "auto"}
 
-    def test_thinking_off_still_honours_required(self) -> None:
+    def test_none_on_default_thinking_model_still_forces_auto(self) -> None:
+        """none 在默认思考模型上译成 adaptive low，thinking 仍开着，tool_choice 只能 auto。"""
         provider = AnthropicProvider(api_key="k")
 
         kwargs = _kwargs(
@@ -63,8 +64,8 @@ class TestToolChoiceKnowsThinkingIsOn:
             tool_choice="required",
         )
 
-        assert kwargs["thinking"] == {"type": "disabled"}
-        assert kwargs["tool_choice"] == {"type": "any"}
+        assert kwargs["thinking"]["type"] == "adaptive"
+        assert kwargs["tool_choice"] == {"type": "auto"}
 
 
 class TestOpus5Defaults:
@@ -85,11 +86,15 @@ class TestOpus5Defaults:
     def test_unknown_effort_is_not_forwarded(self, provider) -> None:
         assert "output_config" not in _kwargs(provider, "claude-opus-5-20260901", "turbo")
 
-    def test_explicit_disable_wins(self, provider) -> None:
-        for effort in ("none", "disabled"):
-            kwargs = _kwargs(provider, "claude-opus-5-20260901", effort)
-            assert kwargs["thinking"] == {"type": "disabled"}, effort
-            assert "output_config" not in kwargs
+    @pytest.mark.parametrize("model", ["claude-opus-5-20260901", "claude-fable-5-1"])
+    @pytest.mark.parametrize("effort", ["none", "disabled"])
+    def test_disable_becomes_adaptive_low(self, provider, model, effort) -> None:
+        """默认思考模型拒收 thinking.disabled：关思考只能降到 adaptive + effort low。"""
+        kwargs = _kwargs(provider, model, effort)
+
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "low"}
+        assert "temperature" not in kwargs
 
 
 class TestModelMatchingHasBoundaries:
