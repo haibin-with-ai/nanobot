@@ -359,11 +359,10 @@ class AgentRunner:
         timing_token = _llm_timing.set(timing)
         started_at = perf_counter()
         wall_budget_s = self._model_wall_budget(spec, hook)
-        deadline = self._clock() + wall_budget_s if wall_budget_s is not None else None
 
         try:
             await hook.before_run(context)
-            result = await self._run_core(spec, hook, messages, deadline)
+            result = await self._run_core(spec, hook, messages, wall_budget_s)
         except asyncio.CancelledError as exc:
             context.messages = deepcopy(messages)
             context.stop_reason = "cancelled"
@@ -412,7 +411,7 @@ class AgentRunner:
         spec: AgentRunSpec,
         hook: AgentHook,
         messages: list[dict[str, Any]],
-        deadline: float | None,
+        wall_budget_s: float | None,
     ) -> AgentRunResult:
         final_content: str | None = None
         tools_used: list[str] = []
@@ -425,6 +424,9 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
         stalls = 0
+        # stall 重试共用一份墙钟预算，从本轮第一次 stall 起算；从 run 开头算会让跑了很久的
+        # 健康 run 一遇 stall 就零重试放弃。
+        stall_deadline: float | None = None
         # Segments from one uninterrupted length-recovery chain. Tool work or
         # injected user input starts a new logical answer and clears the chain.
         length_recovery_parts: list[str] = []
@@ -462,9 +464,8 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            request_deadline = deadline if stalls else None
             response = await self._request_model(
-                spec, messages_for_model, hook, context, deadline=request_deadline,
+                spec, messages_for_model, hook, context, deadline=stall_deadline,
             )
             context.response = response
             context.tool_calls = list(response.tool_calls)
@@ -478,6 +479,7 @@ class AgentRunner:
             if not self._is_stall(response):
                 # 任何一次有响应的回合都清账，包括只调了工具的回合。
                 stalls = 0
+                stall_deadline = None
 
             original_content = response.content
             reasoning_text, cleaned_content = extract_reasoning(
@@ -705,10 +707,12 @@ class AgentRunner:
             # 预算用尽时不再重试，交给下面的通用错误分支收尾。
             if self._is_stall(response):
                 stalls += 1
+                if stall_deadline is None and wall_budget_s is not None:
+                    stall_deadline = self._clock() + wall_budget_s
                 verdict = self._stall_verdict(
                     stalls,
                     out_of_iterations=iteration + 1 >= spec.max_iterations,
-                    out_of_time=deadline is not None and self._clock() >= deadline,
+                    out_of_time=stall_deadline is not None and self._clock() >= stall_deadline,
                 )
                 if verdict != "give_up":
                     if verdict == "notice_retry" and not self._append_stall_notice(messages):
@@ -853,9 +857,12 @@ class AgentRunner:
         if timeout_s is None:
             return None
         attempts = min(2, max(1, int(getattr(spec.runtime.provider, "model_attempt_budget", 1))))
+        # 非流式也给 2 倍：Anthropic SDK 会把大 max_tokens 的非流式请求悄悄改走流式，
+        # runner 看不到这次切换，按 1 倍给会把正常的长输出提前掐断。
+        per_attempt = timeout_s * 2
         if any(self._streaming_modes(spec, hook)):
-            return max(300.0, timeout_s * 2) * attempts
-        return timeout_s * attempts
+            per_attempt = max(300.0, per_attempt)
+        return per_attempt * attempts
 
     @staticmethod
     def _streaming_modes(spec: AgentRunSpec, hook: AgentHook) -> tuple[bool, bool]:

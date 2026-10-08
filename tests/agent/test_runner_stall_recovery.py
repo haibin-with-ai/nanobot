@@ -205,8 +205,8 @@ class TestOuterTimeoutCoversTheWholeModelChain:
         assert result.final_content == "primary late"
 
     @pytest.mark.asyncio
-    async def test_run_deadline_caps_repeated_stall_retries(self) -> None:
-        """A run gets one wall-clock budget, not timeout multiplied by stalls."""
+    async def test_stall_retries_share_one_budget(self) -> None:
+        """stall 重试共用一份墙钟预算，从第一次 stall 起算，不随 stall 次数相乘。"""
         from nanobot.agent.runner import AgentRunner
 
         now = [0.0]
@@ -219,7 +219,7 @@ class TestOuterTimeoutCoversTheWholeModelChain:
 
             async def chat_with_retry(self, *, messages, **_kwargs) -> LLMResponse:
                 self.calls += 1
-                now[0] += 0.11
+                now[0] += 0.21
                 return _stall()
 
         provider = _SlowStalls()
@@ -229,8 +229,88 @@ class TestOuterTimeoutCoversTheWholeModelChain:
 
         assert result.stop_reason == "error"
         assert "放弃" in result.final_content
-        assert provider.calls == 1
+        assert provider.calls == 2
         assert result.messages[-1]["role"] == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_long_healthy_run_still_gets_stall_retries(self) -> None:
+        """跑了很久的子代理第一次 stall 也要重试；死线从 run 开头算会零重试直接放弃。"""
+        from nanobot.agent.runner import AgentRunner
+
+        now = [0.0]
+
+        class _LateStall:
+            model_attempt_budget = 1
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat_with_retry(self, *, messages, **_kwargs) -> LLMResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    now[0] += 10.0
+                    return _tool_call()
+                if self.calls == 2:
+                    return _stall()
+                return _ok("recovered")
+
+        provider = _LateStall()
+        result = await AgentRunner(clock=lambda: now[0]).run(
+            _spec(provider, llm_timeout_s=0.1)
+        )
+
+        assert result.final_content == "recovered"
+        assert provider.calls == 3
+
+    @pytest.mark.asyncio
+    async def test_recovery_clears_the_stall_budget(self) -> None:
+        """恢复后再 stall 是新的一轮，不能沿用上一轮早已过期的死线。"""
+        from nanobot.agent.runner import AgentRunner
+
+        now = [0.0]
+        script = ["stall", "tool_slow", "stall", "ok"]
+
+        class _TwoEpisodes:
+            model_attempt_budget = 1
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def chat_with_retry(self, *, messages, **_kwargs) -> LLMResponse:
+                step = script[self.calls]
+                self.calls += 1
+                if step == "stall":
+                    return _stall()
+                if step == "tool_slow":
+                    now[0] += 10.0
+                    return _tool_call()
+                return _ok("recovered")
+
+        provider = _TwoEpisodes()
+        result = await AgentRunner(clock=lambda: now[0]).run(
+            _spec(provider, llm_timeout_s=0.1)
+        )
+
+        assert result.final_content == "recovered"
+        assert provider.calls == 4
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_call_gets_the_streaming_wall(self) -> None:
+        """Anthropic SDK 会把大 max_tokens 的非流式请求悄悄改走流式，墙钟要按流式给。"""
+        from unittest.mock import patch
+
+        from nanobot.agent.runner import AgentRunner
+
+        seen: list[float] = []
+
+        async def fake_wait_for(coro, *, timeout):
+            seen.append(timeout)
+            return await coro
+
+        with patch("nanobot.agent.runner.asyncio.wait_for", fake_wait_for):
+            await AgentRunner().run(_spec(_Provider(_ok()), llm_timeout_s=300))
+
+        assert seen == [600.0]
 
     @pytest.mark.asyncio
     async def test_a_long_chain_does_not_multiply_the_wall(self) -> None:
