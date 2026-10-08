@@ -384,6 +384,36 @@ class TestRunSubagent:
             assert mock_announce.call_args.args[-2] == "error"
 
     @pytest.mark.asyncio
+    async def test_error_run_leaves_a_warning(self, tmp_path):
+        """失败的子代理要在日志里留下怎么死的，否则事后无从排查。"""
+        from loguru import logger
+
+        lines: list[str] = []
+        sink = logger.add(lambda m: lines.append(str(m)), level="WARNING", format="{message}")
+        try:
+            sm = _manager(tmp_path)
+            sm.runner.run = AsyncMock(return_value=AgentRunResult(
+                final_content=None, messages=[], stop_reason="error",
+                error="Error calling LLM: timed out after 600s",
+            ))
+            status = SubagentStatus(
+                task_id="t1", label="label", task_description="do task",
+                started_at=time.monotonic(),
+            )
+            with patch.object(sm, "_announce_result", new_callable=AsyncMock):
+                await sm._run_subagent(
+                    "t1", "do task", "label",
+                    {"channel": "cli", "chat_id": "direct"}, status, _runtime(),
+                )
+        finally:
+            logger.remove(sink)
+
+        assert any(
+            "[t1]" in line and "stop_reason=error" in line and "timed out after 600s" in line
+            for line in lines
+        ), lines
+
+    @pytest.mark.asyncio
     async def test_exception_run(self, tmp_path):
         sm = _manager(tmp_path)
         sm.runner.run = AsyncMock(side_effect=RuntimeError("LLM down"))

@@ -428,6 +428,12 @@ class SubagentManager:
                 final_result = result.final_content or "Task completed but no final response was generated."
                 final_status = "ok"
                 logger.info("Subagent [{}] completed successfully", task_id)
+            if final_status == "error":
+                logger.warning(
+                    "Subagent [{}] failed: stop_reason={} after {:.0f}s: {}",
+                    task_id, result.stop_reason,
+                    time.monotonic() - status.started_at, final_result[:300],
+                )
             if announce:
                 await self._announce_result(
                     task_id,
