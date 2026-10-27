@@ -10,8 +10,13 @@ from typing import Any
 import pytest
 
 from nanobot.config.schema import Config
-from nanobot.providers.factory import _make_provider_core
-from nanobot.providers.oauth_store import OAuthCredentials
+from nanobot.providers.factory import _make_provider_core, build_provider_snapshot
+from nanobot.providers.oauth_store import (
+    InvalidGrantError,
+    OAuthCredentials,
+    OAuthCredentialStore,
+    TokenRefreshError,
+)
 
 
 @pytest.fixture
@@ -109,6 +114,64 @@ def test_no_credentials_leaves_token_empty(config, monkeypatch, spy_client) -> N
     _make_provider_core(config, preset_name="main")
 
     assert not spy_client.get("auth_token")
+
+
+@pytest.mark.parametrize("error_type", [InvalidGrantError, TokenRefreshError])
+async def test_expired_oauth_does_not_abort_gateway_provider_snapshot(
+    config, monkeypatch, tmp_path, error_type
+) -> None:
+    """刷新失败只能让模型不可用，不能在 fallback 建立前杀掉 gateway。"""
+    from nanobot.providers import oauth_store
+    from nanobot.providers.fallback_provider import FallbackProvider
+
+    store = OAuthCredentialStore(data_dir=tmp_path)
+    stale = OAuthCredentials("expired-access", "invalid-refresh", 1, "acct")
+    store.save(stale)
+    monkeypatch.setattr(store, "_sources", lambda: [])
+    monkeypatch.setattr(oauth_store, "OAuthCredentialStore", lambda: store)
+
+    def fail_refresh(_refresh):
+        raise error_type("refresh unavailable")
+
+    monkeypatch.setattr(oauth_store, "refresh_anthropic_token", fail_refresh)
+    config.agents.defaults.model_preset = "main"
+    config.agents.defaults.fallback_models = ["backup"]
+    config.model_presets["backup"] = config.model_presets["main"].model_copy(
+        update={"provider": "openai_codex", "model": "backup-model"}
+    )
+
+    snapshot = build_provider_snapshot(config)
+
+    assert isinstance(snapshot.provider, FallbackProvider)
+    assert snapshot.provider.get_default_model() == "claude-opus-4-6"
+    assert store.load() == stale
+
+
+async def test_provider_created_during_refresh_failure_can_recover(
+    config, monkeypatch, tmp_path, spy_client
+) -> None:
+    """启动时没刷新成功，重登后仍走现有 401 刷新链，不永久锁死 provider。"""
+    from nanobot.providers import oauth_store
+
+    store = OAuthCredentialStore(data_dir=tmp_path)
+    store.save(OAuthCredentials("expired-access", "invalid-refresh", 1, "acct"))
+    monkeypatch.setattr(store, "_sources", lambda: [])
+    monkeypatch.setattr(oauth_store, "OAuthCredentialStore", lambda: store)
+
+    def fail_refresh(_refresh):
+        raise InvalidGrantError("refresh unavailable")
+
+    monkeypatch.setattr(oauth_store, "refresh_anthropic_token", fail_refresh)
+    provider = _make_provider_core(config, preset_name="main")
+    fresh = OAuthCredentials("fresh-access", "fresh-refresh", 0, "acct")
+    monkeypatch.setattr(store, "_sources", lambda: [lambda: fresh])
+    _attach(provider, spy_client, [_AuthError("401 unauthorized"), _stub_response()])
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.content == "ok"
+    assert provider.api_key == "fresh-access"
+    assert store.load() == fresh
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ Every entry writes out all fields so you can copy-paste as a template.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -793,9 +794,19 @@ def _anthropic_credential(provider_config: ProviderConfig | None, *, oauth: bool
     """OAuth 订阅没有 api_key，凭据从本地 token store 取。"""
     if not oauth:
         return provider_config.api_key if provider_config else None
-    from nanobot.providers.oauth_store import OAuthCredentialStore
+    from nanobot.providers.oauth_store import OAuthCredentialStore, TokenRefreshError
 
-    creds = OAuthCredentialStore().get_token()
+    store = OAuthCredentialStore()
+    try:
+        creds = store.get_token()
+    except TokenRefreshError as exc:
+        logging.getLogger(__name__).warning(
+            "Claude OAuth refresh unavailable at startup (%s); "
+            "deferring authentication failure to requests so fallback can run",
+            type(exc).__name__,
+        )
+        # 保留旧令牌让请求走既有 401 刷新链，重登后也能回源恢复。
+        creds = store.load()
     return creds.access_token if creds else None
 
 
