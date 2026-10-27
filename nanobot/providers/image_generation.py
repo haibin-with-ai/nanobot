@@ -1412,7 +1412,7 @@ class CodexImageGenerationClient(ImageGenerationProvider):
         image_size: str | None = None,
     ) -> GeneratedImageResponse:
         try:
-            from oauth_cli_kit import get_token as get_codex_token
+            from nanobot.providers.openai_codex_provider import get_codex_token
         except ImportError:
             raise ImageGenerationError(self.missing_key_message)
 

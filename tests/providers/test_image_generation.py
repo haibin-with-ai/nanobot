@@ -1286,7 +1286,6 @@ async def test_custom_generate_http_error() -> None:
 
 @pytest.mark.asyncio
 async def test_codex_payload_and_response(monkeypatch) -> None:
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1300,7 +1299,7 @@ async def test_codex_payload_and_response(monkeypatch) -> None:
 
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
     fake_oauth = SimpleNamespace(get_token=lambda: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     sse_lines = [
         'data: {"type":"response.output_item.added","item":{"id":"ig_1","type":"image_generation_call","status":"in_progress"}}',
@@ -1348,7 +1347,6 @@ async def test_codex_payload_and_response(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_codex_proxy_applies_to_oauth_and_http(monkeypatch) -> None:
-    import sys
     from types import SimpleNamespace
 
     proxy = "http://127.0.0.1:23458"
@@ -1363,7 +1361,7 @@ async def test_codex_proxy_applies_to_oauth_and_http(monkeypatch) -> None:
 
     fake_oauth = SimpleNamespace(get_token=fake_get_token)
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     class FakeAsyncClient:
         def __init__(self, **kwargs: Any) -> None:
@@ -1403,7 +1401,6 @@ async def test_codex_proxy_applies_to_oauth_and_http(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_codex_stops_reading_after_completed_event(monkeypatch) -> None:
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1417,7 +1414,7 @@ async def test_codex_stops_reading_after_completed_event(monkeypatch) -> None:
 
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
     fake_oauth = SimpleNamespace(get_token=lambda: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     fake = FakeClient(CodexStreamingCompleteThenErrorResponse({}, sse_lines=[]))
     client = CodexImageGenerationClient(
@@ -1432,7 +1429,6 @@ async def test_codex_stops_reading_after_completed_event(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_codex_strips_model_prefix(monkeypatch) -> None:
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1446,7 +1442,7 @@ async def test_codex_strips_model_prefix(monkeypatch) -> None:
 
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
     fake_oauth = SimpleNamespace(get_token=lambda: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     fake = FakeClient(FakeResponse({}, sse_lines=[
         f'data: {{"type":"response.output_item.done","item":{{"type":"image_generation_call","result":"{PNG_DATA_URL}"}}}}',
@@ -1478,7 +1474,6 @@ async def test_codex_requires_oauth(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_codex_no_images_raises(monkeypatch) -> None:
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1492,7 +1487,7 @@ async def test_codex_no_images_raises(monkeypatch) -> None:
 
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
     fake_oauth = SimpleNamespace(get_token=lambda: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     fake = FakeClient(FakeResponse({}, sse_lines=[
         'data: {"type":"response.completed","response":{"status":"completed"}}',
@@ -1510,7 +1505,6 @@ async def test_codex_no_images_raises(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_codex_extracts_text_content(monkeypatch) -> None:
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1524,7 +1518,7 @@ async def test_codex_extracts_text_content(monkeypatch) -> None:
 
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
     fake_oauth = SimpleNamespace(get_token=lambda: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     fake = FakeClient(FakeResponse({}, sse_lines=[
         'data: {"type":"response.output_text.delta","delta":"Here "}',
@@ -1549,7 +1543,6 @@ async def test_codex_extracts_text_content(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_codex_json_result_format(monkeypatch) -> None:
     """image_generation_call result can be a dict with image_url key."""
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1563,7 +1556,7 @@ async def test_codex_json_result_format(monkeypatch) -> None:
 
     monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
     fake_oauth = SimpleNamespace(get_token=lambda: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
     fake = FakeClient(FakeResponse({}, sse_lines=[
         f'data: {{"type":"response.output_item.done","item":{{"type":"image_generation_call","result":{{"image_url":"{PNG_DATA_URL}"}}}}}}',
@@ -1581,7 +1574,6 @@ async def test_codex_json_result_format(monkeypatch) -> None:
 
 
 def _install_fake_codex_token(monkeypatch) -> None:
-    import sys
     from dataclasses import dataclass
     from types import SimpleNamespace
 
@@ -1591,7 +1583,7 @@ def _install_fake_codex_token(monkeypatch) -> None:
         account_id: str = "acct-123"
 
     fake_oauth = SimpleNamespace(get_token=lambda **_: FakeToken())
-    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_oauth.get_token)
 
 
 def test_codex_default_timeout_is_300() -> None:
@@ -2096,3 +2088,38 @@ def test_image_provider_http_client_kwargs_include_explicit_proxy() -> None:
         "proxy": proxy,
         "trust_env": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_codex_image_reads_cli_login_not_shadow_cache(monkeypatch, tmp_path):
+    import base64
+    import json
+    import time
+
+    from oauth_cli_kit.models import OAuthToken
+    from oauth_cli_kit.storage import FileTokenStorage
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("OAUTH_CLI_KIT_TOKEN_PATH", raising=False)
+    auth = tmp_path / "codex/auth.json"
+    auth.parent.mkdir()
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 3600}).encode()).decode()
+    access = f"header.{payload}.cli-login"
+    auth.write_text(json.dumps({"tokens": {
+        "access_token": access, "refresh_token": "cli-refresh", "account_id": "cli-acct",
+    }}))
+    FileTokenStorage(token_filename="codex.json").save(
+        OAuthToken("revoked-cache", "old-refresh", int(time.time() * 1000) + 3600000, "old-acct")
+    )
+    fake = FakeClient(FakeResponse({}, sse_lines=[
+        f'data: {{"type":"response.output_item.done","item":{{"type":"image_generation_call","result":"{PNG_DATA_URL}"}}}}',
+        "", "data: [DONE]", "",
+    ]))
+    client = CodexImageGenerationClient(api_key=None, client=fake)
+
+    response = await client.generate(prompt="draw", model="test-model")
+
+    assert response.images == [PNG_DATA_URL]
+    assert fake.calls[0]["headers"]["Authorization"] == f"Bearer {access}"
+    assert fake.calls[0]["headers"]["chatgpt-account-id"] == "cli-acct"

@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 from loguru import logger
-from oauth_cli_kit import get_token as get_codex_token
+from oauth_cli_kit.models import OAuthToken
 
 from nanobot.providers.base import (
     LLMProvider,
@@ -26,6 +31,71 @@ from nanobot.providers.openai_responses import (
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
+
+
+class _CodexCliTokenStorage:
+    """CLI 登录存在时直接共用 auth.json，不再维护第二条刷新链。"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._loaded_refresh: str | None = None
+
+    def get_token_path(self) -> Path:
+        return self.path
+
+    def load(self) -> OAuthToken | None:
+        try:
+            tokens = json.loads(self.path.read_text())["tokens"]
+            access = tokens["access_token"]
+            payload = access.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            token = OAuthToken(
+                access=access, refresh=tokens["refresh_token"],
+                expires=int(claims["exp"]) * 1000, account_id=tokens["account_id"],
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            raise RuntimeError("Codex CLI OAuth credentials are unreadable or invalid; run codex login") from None
+        self._loaded_refresh = token.refresh
+        return token
+
+    def save(self, token: OAuthToken) -> None:
+        data = json.loads(self.path.read_text())
+        tokens = data["tokens"]
+        if tokens.get("refresh_token") != self._loaded_refresh:
+            # 刷新期间发生重登：让 get_token 回读新登录，不能覆盖它。
+            raise RuntimeError("Codex CLI OAuth credentials changed during refresh")
+        tokens.update(access_token=token.access, refresh_token=token.refresh)
+        if token.account_id:
+            tokens["account_id"] = token.account_id
+        data["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self._write_atomic(data)
+
+    def _write_atomic(self, data: dict[str, Any]) -> None:
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent, delete=False) as f:
+                temporary = Path(f.name)
+                os.chmod(temporary, 0o600)
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+def get_codex_token(*, proxy: str | None = None) -> OAuthToken:
+    """每次请求重新读取 CLI 登录；显式存储覆盖和旧版独立登录仍沿用原路径。"""
+    from oauth_cli_kit import get_token
+
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    path = home / "auth.json"
+    if path.exists() and not os.environ.get("OAUTH_CLI_KIT_TOKEN_PATH"):
+        return get_token(storage=_CodexCliTokenStorage(path), proxy=proxy)
+    return get_token(proxy=proxy)
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -281,6 +351,15 @@ def _codex_error_response(exc: Exception) -> LLMResponse:
         error_kind = "connection"
         default_detail = "network connection failed"
         should_retry = True if should_retry is None else should_retry
+    elif isinstance(exc, RuntimeError) and any(
+        marker in detail.lower() for marker in (
+            "refresh_token_invalidated", "refresh_token_reused", "invalid_refresh_token",
+            "invalid_grant", "token_revoked", "oauth credentials not found",
+            "codex cli oauth credentials",
+        )
+    ):
+        error_kind = "authentication"
+        should_retry = False
     elif isinstance(exc, _CodexHTTPError):
         error_kind = "http"
         default_detail = "HTTP request failed"

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import base64
 import io
+import json
+import os
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +24,7 @@ from nanobot.providers.openai_codex_provider import (
     _friendly_error,
     _request_codex,
     _should_retry_status,
+    get_codex_token,
 )
 from nanobot.providers.registry import find_by_name
 
@@ -583,3 +589,135 @@ async def test_codex_stream_surfaces_reasoning_summary(monkeypatch) -> None:
 
 async def _append(target: list[str], value: str) -> None:
     target.append(value)
+
+
+def _cli_auth(path, label, expires):
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires}).encode()).decode().rstrip("=")
+    access = f"header.{payload}.{label}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "auth_mode": "chatgpt", "last_refresh": "before-test", "metadata": "preserve",
+        "tokens": {"access_token": access, "refresh_token": f"refresh-{label}",
+                   "account_id": "acct", "id_token": "preserve-id-token"},
+    }))
+    return access
+
+
+@pytest.fixture
+def codex_auth_files(monkeypatch, tmp_path):
+    from oauth_cli_kit.models import OAuthToken
+    from oauth_cli_kit.storage import FileTokenStorage
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("OAUTH_CLI_KIT_TOKEN_PATH", raising=False)
+    cache = FileTokenStorage(token_filename="codex.json")
+    cache.save(OAuthToken("revoked-cache-access", "revoked-cache-refresh",
+                         int(time.time() * 1000) + 3600000, "acct"))
+    return tmp_path / ".codex/auth.json", cache.get_token_path()
+
+
+def test_codex_relogin_uses_cli_instead_of_existing_cache(codex_auth_files):
+    auth, cache = codex_auth_files
+    access = _cli_auth(auth, "new-login", int(time.time()) + 3600)
+    old_cache = cache.read_bytes()
+
+    token = get_codex_token()
+
+    assert token.access == access
+    assert token.refresh == "refresh-new-login"
+    assert cache.read_bytes() == old_cache
+
+
+def test_codex_next_request_observes_another_cli_login(codex_auth_files):
+    auth, _ = codex_auth_files
+    _cli_auth(auth, "first", int(time.time()) + 3600)
+    get_codex_token()
+    access = _cli_auth(auth, "second", int(time.time()) + 3600)
+
+    assert get_codex_token().access == access
+
+
+def test_codex_cli_expiry_comes_from_jwt_not_file_mtime(codex_auth_files, monkeypatch):
+    auth, cache = codex_auth_files
+    cache.unlink()
+    expires = int(time.time()) + 3600
+    access = _cli_auth(auth, "fresh-jwt", expires)
+    os.utime(auth, (1, 1))
+
+    def forbid_refresh(*args, **kwargs):
+        raise AssertionError("fresh JWT must not refresh")
+
+    monkeypatch.setattr("oauth_cli_kit.flow._refresh_token", forbid_refresh)
+    token = get_codex_token()
+
+    assert token.access == access
+    assert token.expires == expires * 1000
+
+
+def test_codex_refresh_writes_back_cli_auth_atomically(codex_auth_files, monkeypatch):
+    from oauth_cli_kit.models import OAuthToken
+
+    auth, cache = codex_auth_files
+    old_cache = cache.read_bytes()
+    _cli_auth(auth, "expired", int(time.time()) - 3600)
+    expires = int(time.time()) + 3600
+    fresh = OAuthToken("new-access", "new-refresh", expires * 1000, "acct")
+    monkeypatch.setattr("oauth_cli_kit.flow._refresh_token", lambda *a, **kw: fresh)
+
+    assert get_codex_token() == fresh
+
+    saved = json.loads(auth.read_text())
+    assert saved["tokens"]["refresh_token"] == "new-refresh"
+    assert saved["tokens"]["access_token"] == "new-access"
+    assert saved["tokens"]["id_token"] == "preserve-id-token"
+    assert saved["metadata"] == "preserve"
+    assert saved["last_refresh"] != "before-test"
+    assert auth.stat().st_mode & 0o777 == 0o600
+    assert cache.read_bytes() == old_cache
+
+
+def test_codex_refresh_does_not_overwrite_concurrent_cli_login(codex_auth_files, monkeypatch):
+    from oauth_cli_kit.models import OAuthToken
+
+    auth, _ = codex_auth_files
+    _cli_auth(auth, "expired", int(time.time()) - 3600)
+    new_login = []
+
+    def refresh_during_login(*args, **kwargs):
+        new_login.append(_cli_auth(auth, "concurrent-login", int(time.time()) + 3600))
+        return OAuthToken("stale-refresh-result", "stale-refresh", 9999999999999, "acct")
+
+    monkeypatch.setattr("oauth_cli_kit.flow._refresh_token", refresh_during_login)
+    token = get_codex_token()
+
+    assert token.access == new_login[0]
+    assert json.loads(auth.read_text())["tokens"]["access_token"] == new_login[0]
+
+
+def test_codex_explicit_token_override_still_wins(codex_auth_files, monkeypatch):
+    auth, cache = codex_auth_files
+    _cli_auth(auth, "cli", int(time.time()) + 3600)
+    monkeypatch.setenv("OAUTH_CLI_KIT_TOKEN_PATH", str(cache))
+
+    assert get_codex_token().access == "revoked-cache-access"
+
+
+def test_codex_legacy_login_without_cli_auth_still_works(codex_auth_files):
+    assert get_codex_token().access == "revoked-cache-access"
+
+
+@pytest.mark.parametrize("code", [
+    "refresh_token_invalidated", "refresh_token_reused", "invalid_refresh_token", "invalid_grant",
+])
+def test_codex_oauth_rejection_is_fallbackable(code):
+    from nanobot.providers.fallback_provider import FallbackProvider
+
+    response = _codex_error_response(RuntimeError(
+        'Token refresh failed: 401 {"error": {"code": "' + code + '"}}'
+    ))
+
+    assert response.error_kind == "authentication"
+    assert response.error_should_retry is False
+    assert FallbackProvider._should_fallback(response) is True
